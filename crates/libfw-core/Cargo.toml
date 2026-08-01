@@ -1,0 +1,17 @@
+[package]
+name = "libfw-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared data structures, traits and protocol constants for libfw"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zrip.workspace = true
+sha2.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+zstd = "0.13"

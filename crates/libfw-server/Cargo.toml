@@ -1,0 +1,24 @@
+[package]
+name = "libfw-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embeddable libfw server handlers/middleware (axum integration)"
+
+[dependencies]
+libfw-core.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+http.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+sha2.workspace = true
+time.workspace = true
+
+[dev-dependencies]

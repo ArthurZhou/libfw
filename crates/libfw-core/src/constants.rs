@@ -1,0 +1,38 @@
+//! Protocol constants shared between server and client.
+
+/// Fixed chunk size for fragmented transfers (2 MiB).
+pub const CHUNK_SIZE: u64 = 2 * 1024 * 1024;
+
+/// Constant sliding-window size for streaming (64 KiB).
+pub const STREAM_BUF_SIZE: usize = 64 * 1024;
+
+/// Maximum default concurrent connections in the WASM engine.
+pub const DEFAULT_CONCURRENCY: usize = 4;
+
+/// Default maximum retry count for a failed chunk before failing the task.
+pub const MAX_RETRIES: u32 = 3;
+
+/// Default cap for a single upload (100 GiB, configurable by the server).
+pub const DEFAULT_MAX_UPLOAD_SIZE: u64 = 100 * 1024 * 1024 * 1024;
+
+/// HTTP header advertising the compression algorithm on a body stream.
+///
+/// Value is a [`CompressionFormat`](crate::compress::CompressionFormat)
+/// name (e.g. `zrip`). Mirrored by `Content-Encoding` when applicable.
+pub const HEADER_COMPRESS: &str = "x-libfw-compress";
+
+/// HTTP header carrying JSON-encoded [`FileMeta`](crate::metadata::FileMeta)
+/// for an upload or download.
+pub const HEADER_FILE_META: &str = "x-libfw-file-meta";
+
+/// HTTP header carrying the byte offset to resume an interrupted upload.
+pub const HEADER_OFFSET: &str = "x-libfw-offset";
+
+/// HTTP header carrying the (optional) transfer version handshake.
+pub const HEADER_PROTOCOL: &str = "x-libfw-protocol";
+
+/// Protocol name used in the handshake header.
+pub const PROTOCOL_NAME: &str = "libfw";
+
+/// Protocol version used in the handshake header.
+pub const PROTOCOL_VERSION: &str = "1";

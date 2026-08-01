@@ -1,0 +1,20 @@
+[package]
+name = "libfw-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WASM engine + JS SDK for libfw browser clients"
+
+[dependencies]
+libfw-core.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zrip.workspace = true
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
