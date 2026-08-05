@@ -1,0 +1,46 @@
+{
+  "name": "libfw-client",
+  "version": "0.1.0",
+  "description": "High-performance streaming file & folder transfer SDK for the browser (libfw WASM engine + File System Access API + IndexedDB resume).",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "main": "index.js",
+  "module": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "default": "./index.js"
+    },
+    "./pkg/*": "./pkg/*"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "pkg/libfw_client.js",
+    "pkg/libfw_client_bg.wasm",
+    "pkg/libfw_client.d.ts",
+    "pkg/libfw_client_bg.wasm.d.ts",
+    "pkg/package.json"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build:wasm": "wasm-pack build ../crates/libfw-client --target web --out-dir ../sdk/pkg --release",
+    "build:umd": "rollup -c rollup.config.mjs",
+    "build": "npm run build:wasm && npm run build:umd"
+  },
+  "keywords": [
+    "libfw",
+    "transfer",
+    "upload",
+    "download",
+    "wasm",
+    "file-system-access",
+    "resumable"
+  ],
+  "devDependencies": {
+    "@rollup/plugin-node-resolve": "^15.0.0",
+    "rollup": "^4.0.0"
+  }
+}

@@ -517,7 +517,7 @@ mod tests {
         // Feed sizes cycling 1KiB..16KiB until the whole input is consumed.
         let mut feed = Vec::new();
         let mut consumed = 0;
-        for (i, &size) in [1024usize, 2048, 4096, 8192, 16384].iter().cycle().enumerate() {
+        for (_, &size) in [1024usize, 2048, 4096, 8192, 16384].iter().cycle().enumerate() {
             feed.push(size);
             consumed += size;
             if consumed >= data.len() {

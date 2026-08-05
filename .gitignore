@@ -1,1 +1,21 @@
+# Target directory for build artifacts
 /target
+
+# Generated wasm-bindgen output (rebuilt via `wasm-pack build`)
+/sdk/pkg
+
+# Node
+/node_modules
+/sdk/dist
+
+# Dev-mode launcher data
+/dev-data/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+PROGRESS.md
+GUIDE.md

@@ -8,6 +8,7 @@
 use std::io::Read;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::error::StorageError;
 use crate::metadata::FileMeta;
@@ -26,7 +27,7 @@ pub enum WriteMode {
 }
 
 /// A directory listing entry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirEntry {
     /// Full virtual path (relative to the mounted root).
     pub path: String,

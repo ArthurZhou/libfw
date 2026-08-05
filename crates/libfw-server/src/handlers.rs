@@ -1,0 +1,494 @@
+//! HTTP handlers: download (Range/ETag/compression), upload, listing.
+
+use std::io::{self, Read};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use futures::stream::{BoxStream, Stream, StreamExt};
+use libfw_core::auth::{Action, AuthError};
+use libfw_core::claims::TokenClaims;
+use libfw_core::compress::{decompressor, CompressionFormat, Compressor};
+use libfw_core::metadata::{decode_file_meta, FileMeta};
+use libfw_core::storage::WriteMode;
+use libfw_core::{RangeSpec, StorageError, STREAM_BUF_SIZE};
+use serde::Serialize;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::auth::{AuthRejection, BearerClaims};
+use crate::http::{
+    content_range_none_value, content_range_value, etag_matches_if_none_match, if_range_matches,
+    parse_range_header, ParsedRange,
+};
+use crate::{validate_rel_path, ServerState, HEADER_COMPRESS, HEADER_FILE_META, HEADER_OFFSET};
+
+/// Errors surfaced by handlers, mapped to HTTP responses.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ApiError {
+    #[error("bad request: {0}")]
+    BadRequest(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("conflict: {0}")]
+    #[allow(dead_code)] // part of the error API surface, mapped to 409
+    Conflict(String),
+    #[error("upload exceeds limit of {0} bytes")]
+    PayloadTooLarge(u64),
+    #[error("malformed range header")]
+    RangeMalformed,
+    #[error("range not satisfiable")]
+    RangeUnsatisfiable(u64),
+    #[error("not modified")]
+    NotModified,
+    #[error("authentication failed")]
+    Auth(#[from] AuthRejection),
+    #[error("storage error")]
+    Storage(#[from] StorageError),
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        match self {
+            // Delegate to AuthRejection's own 401/403 conversion.
+            ApiError::Auth(rej) => return rej.into_response(),
+            // 416 must carry a `Content-Range: bytes */<total>` header and no body.
+            ApiError::RangeUnsatisfiable(total) => {
+                let mut r = Response::new(Body::empty());
+                *r.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+                r.headers_mut().insert(
+                    header::CONTENT_RANGE,
+                    content_range_none_value(total).parse().unwrap(),
+                );
+                return r;
+            }
+            // 304 must not carry a body.
+            ApiError::NotModified => {
+                let mut r = Response::new(Body::empty());
+                *r.status_mut() = StatusCode::NOT_MODIFIED;
+                return r;
+            }
+            ApiError::Storage(StorageError::NotFound(p)) => {
+                return (StatusCode::NOT_FOUND, p).into_response();
+            }
+            ApiError::Storage(StorageError::AlreadyExists(p)) => {
+                return (StatusCode::CONFLICT, p).into_response();
+            }
+            ApiError::Storage(StorageError::TooLarge(_)) => {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "upload exceeds configured limit".to_string(),
+                )
+                    .into_response();
+            }
+            // A resume offset that no longer matches tells the client to
+            // reset its local progress (RFC 7232 / libfw protocol).
+            ApiError::Storage(StorageError::WriteFailed { .. }) => {
+                return (
+                    StatusCode::PRECONDITION_FAILED,
+                    "resume offset mismatch; reset client state".to_string(),
+                )
+                    .into_response();
+            }
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            ApiError::PayloadTooLarge(limit) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("upload exceeds limit of {limit} bytes"),
+            ),
+            ApiError::RangeMalformed => {
+                (StatusCode::BAD_REQUEST, "malformed range header".to_string())
+            }
+            ApiError::Storage(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            ApiError::Io(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+        .into_response()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Download
+// ---------------------------------------------------------------------------
+
+/// Everything needed to build the download response.
+struct DownloadPlan {
+    status: StatusCode,
+    headers: Vec<(&'static str, String)>,
+    format: CompressionFormat,
+    reader: Option<Box<dyn Read + Send>>,
+}
+
+fn authorize_request(
+    state: &ServerState,
+    claims: &TokenClaims,
+    path: &str,
+    action: Action,
+) -> Result<(), ApiError> {
+    state
+        .authorize(claims, path, action)
+        .map_err(|err| match err {
+            AuthError::Forbidden { path, action } => ApiError::Auth(AuthRejection::Forbidden {
+                path,
+                action: action.to_string(),
+            }),
+            other => ApiError::Auth(AuthRejection::Unauthorized(other.to_string())),
+        })
+}
+
+async fn plan_download(
+    state: &ServerState,
+    path: &str,
+    req_headers: &HeaderMap,
+    with_reader: bool,
+) -> Result<DownloadPlan, ApiError> {
+    let path = validate_rel_path(path).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let meta = state
+        .storage
+        .file_meta(&path)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(path.clone()))?;
+
+    // If-None-Match → 304.
+    if let Some(v) = req_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        if etag_matches_if_none_match(v, &meta.etag) {
+            return Err(ApiError::NotModified);
+        }
+    }
+
+    // Range negotiation.
+    let mut range = None;
+    if let Some(raw) = req_headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+        range = parse_range_header(raw).map_err(|_| ApiError::RangeMalformed)?;
+    }
+    if let Some(if_range) = req_headers
+        .get(header::IF_RANGE)
+        .and_then(|v| v.to_str().ok())
+    {
+        if !if_range_matches(if_range, &meta.etag) {
+            range = None; // ignore Range → full body
+        }
+    }
+
+    let is_partial = range.is_some();
+    let spec = match range {
+        Some(ParsedRange::Bytes(r)) => r
+            .clamp(meta.size)
+            .ok_or(ApiError::RangeUnsatisfiable(meta.size))?,
+        Some(ParsedRange::Suffix(n)) => {
+            if n == 0 || meta.size == 0 {
+                return Err(ApiError::RangeUnsatisfiable(meta.size));
+            }
+            RangeSpec {
+                start: meta.size.saturating_sub(n),
+                end: meta.size,
+            }
+        }
+        None => RangeSpec::full(meta.size),
+    };
+
+    let format = negotiate_download_format(state, req_headers);
+    let reader = if with_reader {
+        Some(state.storage.read_stream(&path, spec).await?)
+    } else {
+        None
+    };
+
+    let mut headers = vec![
+        (header::ACCEPT_RANGES.as_str(), "bytes".to_string()),
+        (header::CONTENT_TYPE.as_str(), "application/octet-stream".to_string()),
+        (header::ETAG.as_str(), meta.etag),
+        (HEADER_COMPRESS, format.as_str().to_string()),
+    ];
+    if is_partial {
+        headers.push((
+            header::CONTENT_RANGE.as_str(),
+            content_range_value(&spec, meta.size),
+        ));
+    }
+    if format == CompressionFormat::None {
+        headers.push((header::CONTENT_LENGTH.as_str(), spec.len().to_string()));
+    }
+
+    Ok(DownloadPlan {
+        status: if is_partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        },
+        headers,
+        format,
+        reader,
+    })
+}
+
+fn negotiate_download_format(state: &ServerState, req_headers: &HeaderMap) -> CompressionFormat {
+    let wants_zrip = req_headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .any(|e| CompressionFormat::parse_header(e.trim()) == Some(CompressionFormat::Zrip))
+        })
+        .unwrap_or(false);
+    if wants_zrip && state.compression == CompressionFormat::Zrip {
+        CompressionFormat::Zrip
+    } else {
+        CompressionFormat::None
+    }
+}
+
+pub(crate) async fn download(
+    State(state): State<Arc<ServerState>>,
+    Path(path): Path<String>,
+    BearerClaims(claims): BearerClaims,
+    req_headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize_request(&state, &claims, &path, Action::Read)?;
+    let plan = plan_download(&state, &path, &req_headers, true).await?;
+
+    let reader = plan.reader.expect("reader requested");
+    let stream = body_stream(reader, plan.format);
+    let mut builder = Response::builder().status(plan.status);
+    for (name, value) in plan.headers {
+        builder = builder.header(name, value);
+    }
+    Ok(builder.body(Body::from_stream(stream)).expect("valid response"))
+}
+
+pub(crate) async fn head_file(
+    State(state): State<Arc<ServerState>>,
+    Path(path): Path<String>,
+    BearerClaims(claims): BearerClaims,
+    req_headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    authorize_request(&state, &claims, &path, Action::Read)?;
+    let plan = plan_download(&state, &path, &req_headers, false).await?;
+    let mut builder = Response::builder().status(plan.status);
+    for (name, value) in plan.headers {
+        builder = builder.header(name, value);
+    }
+    Ok(builder.body(Body::empty()).expect("valid response"))
+}
+
+// ---------------------------------------------------------------------------
+// Upload
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct UploadOk {
+    file: FileMeta,
+}
+
+pub(crate) async fn upload(
+    State(state): State<Arc<ServerState>>,
+    Path(path): Path<String>,
+    BearerClaims(claims): BearerClaims,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    authorize_request(&state, &claims, &path, Action::Write)?;
+    let path = validate_rel_path(path.as_str()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let meta_header = headers
+        .get(HEADER_FILE_META)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::BadRequest(format!("missing `{HEADER_FILE_META}` header")))?;
+    let meta: FileMeta = decode_file_meta(meta_header)
+        .map_err(|e| ApiError::BadRequest(format!("invalid file meta: {e}")))?;
+    if meta.size > state.max_upload_size {
+        return Err(ApiError::PayloadTooLarge(state.max_upload_size));
+    }
+
+    let format = headers
+        .get(HEADER_COMPRESS)
+        .and_then(|v| v.to_str().ok())
+        .and_then(CompressionFormat::parse_header)
+        .unwrap_or(CompressionFormat::None);
+
+    // Absent offset → Create (409 if exists); `0` → Overwrite; `N>0` → Resume.
+    let mode = match headers.get(HEADER_OFFSET).and_then(|v| v.to_str().ok()) {
+        None => WriteMode::Create,
+        Some(off) if off.trim().parse::<u64>().map(|n| n == 0).unwrap_or(false) => {
+            WriteMode::Overwrite
+        }
+        Some(off) => {
+            let offset = off
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| ApiError::BadRequest(format!("invalid `{HEADER_OFFSET}`")))?;
+            WriteMode::Resume { offset }
+        }
+    };
+
+    let mut sink = state.storage.write_stream(&path, mode).await?;
+    let mut decomp = decompressor(format);
+    let mut out: Vec<u8> = Vec::new();
+    let mut written = 0u64;
+    let mut stream = body.into_data_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ApiError::Io(std::io::Error::other(e)))?;
+        written = written.saturating_add(chunk.len() as u64);
+        if written > state.max_upload_size {
+            sink.abort().await?;
+            return Err(ApiError::PayloadTooLarge(state.max_upload_size));
+        }
+        decomp
+            .decompress(&chunk, &mut out)
+            .map_err(|e| ApiError::BadRequest(format!("compressed stream invalid: {e}")))?;
+        let data = std::mem::take(&mut out);
+        if !data.is_empty() {
+            sink.write(&data).await?;
+        }
+    }
+    // Flush any final decompressed frames.
+    decomp
+        .finish(&mut out)
+        .map_err(|e| ApiError::BadRequest(format!("compressed stream truncated: {e}")))?;
+    if !out.is_empty() {
+        sink.write(&out).await?;
+    }
+
+    let committed = sink.commit().await?;
+    Ok((StatusCode::CREATED, Json(UploadOk { file: committed })).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Directory listing
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn list_dir(
+    State(state): State<Arc<ServerState>>,
+    Path(path): Path<String>,
+    BearerClaims(claims): BearerClaims,
+) -> Result<Response, ApiError> {
+    authorize_request(&state, &claims, &path, Action::Read)?;
+    let path = validate_rel_path(path.as_str()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let entries = state.storage.list_dir(&path).await?;
+    Ok(Json(entries).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Body stream helpers
+// ---------------------------------------------------------------------------
+
+/// Turn a blocking reader into an async byte stream (reads run on
+/// `spawn_blocking` so the runtime thread stays free).
+fn reader_stream(reader: Box<dyn Read + Send>) -> BoxStream<'static, Result<Bytes, io::Error>> {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+    tokio::task::spawn_blocking(move || {
+        let mut reader = reader;
+        let mut buf = vec![0u8; STREAM_BUF_SIZE];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.blocking_send(Ok(Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                        break; // consumer dropped
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    break;
+                }
+            }
+        }
+    });
+    ReceiverStream::new(rx).boxed()
+}
+
+/// Wrap a byte stream through the streaming compressor.
+struct CompressedStream<S> {
+    inner: S,
+    compressor: Box<dyn Compressor>,
+    finished: bool,
+}
+
+impl<S> Stream for CompressedStream<S>
+where
+    S: Stream<Item = Result<Bytes, io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => {
+                    if !this.finished {
+                        this.finished = true;
+                        let mut tail = Vec::new();
+                        match this.compressor.finish(&mut tail) {
+                            Ok(()) => {
+                                if tail.is_empty() {
+                                    return Poll::Ready(None);
+                                }
+                                return Poll::Ready(Some(Ok(Bytes::from(tail))));
+                            }
+                            Err(e) => {
+                                return Poll::Ready(Some(Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    e,
+                                ))))
+                            }
+                        }
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let mut out = Vec::new();
+                    match this.compressor.compress(&chunk, &mut out) {
+                        Ok(()) => {
+                            if out.is_empty() {
+                                continue;
+                            }
+                            return Poll::Ready(Some(Ok(Bytes::from(out))));
+                        }
+                        Err(e) => {
+                            return Poll::Ready(Some(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                e,
+                            ))))
+                        }
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+            }
+        }
+    }
+}
+
+fn body_stream(
+    reader: Box<dyn Read + Send>,
+    format: CompressionFormat,
+) -> BoxStream<'static, Result<Bytes, io::Error>> {
+    let raw = reader_stream(reader);
+    match format {
+        CompressionFormat::None => raw,
+        CompressionFormat::Zrip => {
+            let compressor = libfw_core::compress::compressor(CompressionFormat::Zrip)
+                .expect("zrip compressor available");
+            CompressedStream {
+                inner: raw,
+                compressor,
+                finished: false,
+            }
+            .boxed()
+        }
+    }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "libfw-actix-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "libfw integration example: an actix-web based file server"
+
+[dependencies]
+libfw-core = { path = "../../crates/libfw-core" }
+libfw-server = { path = "../../crates/libfw-server" }
+actix-web = "4"
+actix-cors = "0.7"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

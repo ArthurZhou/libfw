@@ -97,7 +97,8 @@ pub trait Validator: Send + Sync + 'static {
 ///
 /// Paths are compared on a segment boundary: `allowed_paths = ["/docs"]`
 /// matches `/docs`, `/docs/a.txt` and `/docs/` but **not** `/docshop/x`.
-/// An empty `allowed_paths` list denies everything.
+/// The root prefix `"/"` (or `""`) grants access to the whole tree. An
+/// empty `allowed_paths` list denies everything.
 #[derive(Debug, Clone, Default)]
 pub struct PathValidator {
     /// When true, `allowed_paths` are treated as raw string prefixes
@@ -149,13 +150,15 @@ impl Validator for PathValidator {
 /// Segment-boundary prefix match for a path against a list of prefixes.
 ///
 /// Normalizes a leading `/` so `/docs`, `docs` and `docs/` are equivalent.
+/// A root prefix (`""`, `"/"`, `"/"`-like) matches **everything**, which is
+/// how `allowed_paths: ["/"]` is conventionally used to grant full access.
 fn path_matches_any(path: &str, prefixes: &[String]) -> bool {
     let p = path.trim_start_matches('/');
     prefixes.iter().any(|prefix| {
         let q = prefix.trim_matches('/');
         if q.is_empty() {
-            // An empty allowed path means "root only".
-            return p.is_empty();
+            // Root prefix → grant access to the whole tree.
+            return true;
         }
         if p == q {
             return true;
@@ -229,6 +232,20 @@ mod tests {
             v.validate(&c, "/anything", Action::Read),
             Err(AuthError::Forbidden { .. })
         ));
+    }
+
+    #[test]
+    fn root_prefix_grants_full_access() {
+        let v = PathValidator::new();
+        for root in ["/", "", "/ "] {
+            let c = claims(&[Permission::Read], &[root.trim()], None);
+            for path in ["/a.txt", "/deep/nested/file.bin", "/"] {
+                assert!(
+                    v.validate(&c, path, Action::Read).is_ok(),
+                    "root {root:?} should allow {path}"
+                );
+            }
+        }
     }
 
     #[test]
