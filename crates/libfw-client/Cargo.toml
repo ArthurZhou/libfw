@@ -3,7 +3,10 @@ name = "libfw-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "WASM engine + JS SDK for libfw browser clients"
+keywords = ["wasm", "browser", "upload", "download", "resumable"]
+categories = ["wasm", "web-programming"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

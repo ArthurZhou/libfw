@@ -11,14 +11,16 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/libfw"
+license = "MIT"
+repository = "https://github.com/ArthurZhou/libfw"
 description = "High-performance streaming file & folder transfer library for Rust"
 
 [workspace.dependencies]
-libfw-core = { path = "crates/libfw-core" }
-libfw-server = { path = "crates/libfw-server" }
-libfw-client = { path = "crates/libfw-client" }
+# NB: `version` is required so `cargo publish` can rewrite the path to a
+# crates.io dependency when publishing libfw-server / libfw-client.
+libfw-core = { path = "crates/libfw-core", version = "0.1.0" }
+libfw-server = { path = "crates/libfw-server", version = "0.1.0" }
+libfw-client = { path = "crates/libfw-client", version = "0.1.0" }
 
 # Core / shared
 serde = { version = "1", features = ["derive"] }

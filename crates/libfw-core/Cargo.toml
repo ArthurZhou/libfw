@@ -3,7 +3,10 @@ name = "libfw-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Shared data structures, traits and protocol constants for libfw"
+keywords = ["transfer", "streaming", "storage", "http", "range"]
+categories = ["network-programming", "compression"]
 
 [dependencies]
 serde.workspace = true

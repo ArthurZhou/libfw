@@ -126,4 +126,4 @@ wasm-pack test crates/libfw-client --node   # WASM-side tests (Node)
 
 ## License
 
-MIT OR Apache-2.0
+MIT

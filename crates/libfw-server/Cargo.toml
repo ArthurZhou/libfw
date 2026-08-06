@@ -3,7 +3,10 @@ name = "libfw-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Embeddable libfw server handlers/middleware (axum integration)"
+keywords = ["server", "axum", "http", "streaming", "transfer"]
+categories = ["network-programming", "web-programming"]
 
 [dependencies]
 libfw-core.workspace = true
