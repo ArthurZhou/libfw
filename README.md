@@ -34,7 +34,20 @@ sdk/              libfw-client npm package (ESM + TS types + wasm)
 - **Pluggable storage**: implement `StorageBackend` to target the local
   filesystem (shipped `FsStorage`), object storage, etc.
 
-## Quick start (server)
+## Table of contents
+
+- [Quick start: run a server](#quick-start-run-a-server)
+- [Browser demo](#browser-demo)
+- [Embedding in a Rust app](#embedding-in-a-rust-app)
+- [Authorization](#authorization)
+- [Storage backends](#storage-backends)
+- [Browser SDK guide](#browser-sdk-guide)
+- [HTTP protocol](#http-protocol)
+- [Building from source](#building-from-source)
+- [Testing](#testing)
+- [License](#license)
+
+## Quick start: run a server
 
 ```bash
 # axum example (storage root `data`, port 8080)
@@ -61,47 +74,301 @@ curl -H "Authorization: Bearer dev-token" -H "Range: bytes=0-4" \
 curl -H "Authorization: Bearer dev-token" http://127.0.0.1:8080/dir/dir
 ```
 
-### Embedding in axum
+## Browser demo
+
+A one-click dev script starts the axum server, serves the demo page, and opens
+the browser:
+
+```bash
+# Windows
+dev-test.bat
+
+# Linux / macOS
+./dev-test.sh
+```
+
+It runs `cargo test --workspace`, boots the API on `:8080` and a static server
+for `examples/web/` on `:5173`. Override with `PORT_API`, `PORT_WEB` and
+`TOKEN` env vars. The demo page (`examples/web/index.html`) can also be opened
+manually from any static server once the SDK is built (see
+[Building the SDK](#building-the-sdk)).
+
+> The demo relies on the **File System Access API** (`showDirectoryPicker`,
+> `createWritable`) and therefore needs a Chromium-based browser.
+
+## Embedding in a Rust app
+
+### axum
+
+`libfw-server` ships a ready-made `Router`. Build a `ServerState`, mount it,
+and go:
 
 ```rust,no_run
 use std::sync::Arc;
 use axum::Router;
-use libfw_core::auth::{PathValidator, TokenVerifier, Validator};
-use libfw_server::{router, ServerState};
+use libfw_core::auth::{AuthError, PathValidator, TokenVerifier};
+use libfw_core::claims::{Permission, TokenClaims};
+use libfw_server::{router, FsStorage, ServerState};
 
+// 1. Your token verifier: parse & verify bearer tokens into claims.
+#[derive(Clone)]
+struct MyVerifier;
+impl TokenVerifier for MyVerifier {
+    fn verify(&self, token: &str) -> Result<TokenClaims, AuthError> {
+        Ok(TokenClaims {
+            sub: token.to_string(),
+            exp: None,
+            permissions: vec![Permission::Read, Permission::Write],
+            allowed_paths: vec!["/".to_string()],
+        })
+    }
+}
+
+// 2. Assemble the state and mount the router.
 let state = Arc::new(
     ServerState::builder()
-        .storage(libfw_server::FsStorage::new("/srv/files"))
-        .verifier(my_verifier)          // your TokenVerifier
+        .storage(FsStorage::new("/srv/files"))
+        .verifier(MyVerifier)
         .validator(PathValidator::new())
+        // optional tweaks:
+        // .compression(CompressionFormat::Zrip)
+        // .max_upload_size(100 * 1024 * 1024 * 1024)
         .build(),
 );
+
 let app: Router = router(state);        // /file/{*path}, /dir/{*path}
 ```
 
-## Browser SDK
+`ServerState::builder()` requires `storage`, `verifier` and `validator`
+(panics if missing) and defaults compression to `zrip` and the upload cap to
+100 GiB.
 
-Build the WASM engine + web glue, then serve the demo:
+To host libfw under a path prefix (e.g. `/api`), `nest` it in your own router:
+
+```rust,no_run
+let app = Router::new()
+    .nest("/api", router(state))        // → /api/file/{*path}, /api/dir/{*path}
+    .route("/", get(|| async { "hello" }));
+```
+
+### actix-web
+
+libfw's core contracts are framework-agnostic, so actix-web is supported too
+(the runnable `examples/actix-server` shows a full implementation):
 
 ```bash
-wasm-pack build crates/libfw-client --target web --out-dir ../../sdk/pkg --release
-# then open examples/web/index.html from any static server
+cargo run -p libfw-actix-server -- data 8081
 ```
+
+The example reuses `libfw_core` (`TokenVerifier`, `PathValidator`,
+`StorageBackend`, compression) plus `libfw_server` helpers
+(`FsStorage`, `ServerState`, `parse_range_header`, `content_range_value`, …)
+to implement the same `/file/{path}` and `/dir/{path}` routes.
+
+## Authorization
+
+The server flow is: extract `Authorization: Bearer <token>` → verify it into
+claims → validate the requested `path` + `action`. libfw never issues tokens —
+it only parses and validates.
+
+### Token claims
+
+```rust
+pub struct TokenClaims {
+    pub sub: String,                      // subject (user / client)
+    pub exp: Option<i64>,                 // unix expiry, None = never
+    pub permissions: Vec<Permission>,     // Read | Write
+    pub allowed_paths: Vec<String>,       // path prefixes the token may access
+}
+```
+
+### Token verifier
+
+Implement `TokenVerifier::verify(&self, token) -> Result<TokenClaims, AuthError>`.
+This is where you plug in a JWT library or an external validation service:
+
+- empty/malformed token → `AuthError::MissingToken`
+- unverifiable token → `AuthError::Invalid(msg)`
+- expired token → `AuthError::Expired`
+- no permission for path/action → `AuthError::Forbidden`
+
+### Path validation
+
+The bundled `PathValidator` (an implementation of the `Validator` trait)
+allows a request when all of these hold:
+
+1. the token is not expired (`exp`),
+2. it carries the `Permission` required by the action (`Read` for downloads,
+   `Write` for uploads),
+3. the requested path matches one of `allowed_paths`.
+
+Paths are compared on a **segment boundary**: `allowed_paths = ["/docs"]`
+matches `/docs`, `/docs/a.txt` and `/docs/` but **not** `/docshop/x`. The
+root prefix `"/"` (or `""`) grants access to the whole tree; an empty
+`allowed_paths` list denies everything. Set `PathValidator { raw_prefix_match:
+true }` to fall back to raw string-prefix matching.
+
+Need different rules (group-based ACLs, regex, per-file permissions)? Implement
+the `Validator` trait yourself and pass it to `.validator(..)`.
+
+### HTTP status mapping
+
+| AuthError | Status |
+| --------- | ------ |
+| `MissingToken`, `Invalid`, `Expired` | `401 Unauthorized` |
+| `Forbidden` | `403 Forbidden` |
+
+## Storage backends
+
+### Filesystem (`FsStorage`)
+
+`FsStorage::new(root)` serves files under a directory. Uploads are streamed
+into a temp file and **atomically renamed** on commit, so an aborted upload
+never leaves a partial target behind. Paths are normalized and validated
+(`..`/absolute/NUL are rejected) to prevent traversal.
+
+### Custom backends
+
+Implement the `StorageBackend` trait to target object storage, S3, an
+in-memory fixture, etc. — the rest of the server (range handling, ETag,
+compression) stays identical:
+
+```rust,no_run
+#[async_trait]
+pub trait StorageBackend: Send + Sync + 'static {
+    async fn file_meta(&self, path: &str) -> Result<Option<FileMeta>, StorageError>;
+    async fn read_stream(&self, path: &str, range: RangeSpec)
+        -> Result<Box<dyn Read + Send>, StorageError>;
+    async fn write_stream(&self, path: &str, mode: WriteMode)
+        -> Result<Box<dyn UploadSink>, StorageError>;
+    async fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, StorageError>;
+    async fn mkdir_all(&self, path: &str) -> Result<(), StorageError>;
+    async fn remove(&self, path: &str) -> Result<(), StorageError>;
+}
+```
+
+`write_stream` receives a `WriteMode`:
+
+- `Create` — fail with `AlreadyExists` if present,
+- `Overwrite` — create or truncate,
+- `Resume { offset }` — continue at `offset`, fail if the target isn't exactly
+  `offset` bytes yet.
+
+The returned `UploadSink` exposes `write(buf)`, `commit()` (atomic finalize,
+returns `FileMeta`) and `abort()` (discard temp data).
+
+## Browser SDK guide
+
+The SDK (`sdk/`) is a zero-config ESM wrapper around the WASM engine. It owns
+WASM instantiation, the File System Access API, IndexedDB resume state and the
+`createWritable` byte sink — you only ever touch the `LibfwClient` class and
+its `Promise`-based methods. Full API docs: [`sdk/README.md`](sdk/README.md).
+
+### Building the SDK
+
+```bash
+# 1. Compile the WASM engine + generate the web glue (requires wasm-pack)
+wasm-pack build crates/libfw-client --target web --out-dir ../../sdk/pkg --release
+
+# 2. (optional) bundle a UMD build
+npm --prefix sdk run build:umd
+```
+
+### Constructor options
 
 ```js
-import { LibfwClient } from 'libfw-client';
-
-const client = new LibfwClient({ baseUrl: '/api', concurrency: 4, compress: true });
-
-await client.downloadFolder('your_token_here');              // showDirectoryPicker
-await client.upload('your_token_here', fileInput.files);     // FileList upload
-client.pause(); client.resume(); client.cancel();            // state machine control
+const client = new LibfwClient({
+  baseUrl: '/api',            // where libfw-server routes are mounted
+  concurrency: 4,             // max parallel file transfers (default 4)
+  compress: true,             // negotiate zrip compression (default true)
+  chunkSize: 2 * 1024 * 1024, // upload chunk size (default 2 MiB)
+  maxRetries: 3,              // retries per chunk/file (default 3)
+  baseRetryDelayMs: 500,      // initial exponential backoff (default 500)
+  maxRetryDelayMs: 30000,     // backoff ceiling (default 30 s)
+  timeoutMs: 60000,           // per-request timeout (default 60 s)
+  onEvent: (e) => {},         // progress / lifecycle listener
+});
 ```
 
-The SDK owns WASM instantiation, the File System Access API, IndexedDB resume
-state and `createWritable` writes. See [`sdk/README.md`](sdk/README.md).
+### Downloading
+
+```js
+// Download the whole server folder (empty dirPath = root) into a local
+// directory chosen via showDirectoryPicker(). Structure is preserved.
+const bytes = await client.downloadFolder('your_token_here');
+const bytes = await client.downloadFolder('your_token_here', '/docs');
+```
+
+Bytes are streamed from the server, decompressed, and written with
+`createWritable({ type: 'write', position, data })`. Because writables open
+with `keepExistingData: true`, an interrupted download resumes exactly where
+it stopped (`Range`/`If-Range` revalidation, IndexedDB-backed offsets).
+
+### Uploading
+
+```js
+// From a FileList / File[] / <input type="file">
+await client.upload('your_token_here', fileInput.files);
+
+// From a whole local folder (showDirectoryPicker, structure mirrored)
+await client.upload('your_token_here');
+
+// From a precomputed plan (you then drive readFile yourself)
+await client.upload('your_token_here', [
+  { path: 'dir/a.txt', size: 11, mtime: 1710000000 },
+]);
+```
+
+Each file is sliced into fixed-size chunks, each chunk compressed into one
+zstd frame, and POSTed with `x-libfw-offset`; a `412` on a stale offset makes
+the engine reset and re-send automatically.
+
+### Controls and state machine
+
+```js
+client.pause();   // downloading/uploading → paused
+client.resume();  // paused → resumed (state revalidated first)
+client.cancel();  // cancel the active transfer → failed
+
+client.state();       // 'idle' | 'downloading' | 'uploading' | 'paused'
+                      // | 'completed' | 'failed'
+client.progress();    // 0..1
+client.doneBytes();   // bytes transferred so far
+client.totalBytes();  // total bytes to transfer
+```
+
+### Progress events
+
+`options.onEvent` receives `{ type, path?, done?, total? }`:
+
+- `fileStart` — `{ type, path, done: 0, total: size }`
+- `fileCompleted` — `{ type, path }`
+- `progress` — `{ type, done, total }`
+
+### Errors
+
+Every rejection is a `LibfwError` with a stable `code`:
+
+`unknown` · `wasm` · `abort` · `unsupported` · `path` · `storage` · `idb` ·
+`http` · `network` · `decompress` · `compress` · `protocol` · `cancelled`
+
+```js
+try {
+  await client.downloadFolder(token);
+} catch (err) {
+  console.error(err.code, err.message); // e.g. "http", "http 404 for `/file/x`"
+}
+```
+
+### Browser support
+
+Downloading/uploading folders requires the File System Access API
+(`showDirectoryPicker`), so Chromium-based browsers only. `downloadFolder`
+throws `LibfwError` with code `unsupported` elsewhere.
 
 ## HTTP protocol
+
+### Routes
 
 | Method | Route          | Purpose |
 | ------ | -------------- | ------- |
@@ -110,17 +377,67 @@ state and `createWritable` writes. See [`sdk/README.md`](sdk/README.md).
 | POST   | `/file/{*path}` | streaming upload (headers below) |
 | GET    | `/dir/{*path}`  | directory listing (JSON) |
 
-Upload headers:
+All routes require `Authorization: Bearer <token>`.
+
+### Downloads
+
+- Plain `GET` returns `200` with the full body.
+- `Range: bytes=…` returns `206 Partial Content` with `Content-Range` and an
+  `ETag`; unsatisfiable ranges return `416` with `Content-Range: bytes */size`.
+- `If-Range`/`If-None-Match` are honored: a matching `If-None-Match` → `304
+  Not Modified`; a stale `If-Range` → full `200` body.
+- Compression: send `Accept-Encoding: zrip` (or `x-libfw-compress: zrip`) to
+  receive a zrip-compressed stream.
+
+### Uploads
 
 - `x-libfw-file-meta` — JSON `{ path, size, mtime, etag }` (required)
 - `x-libfw-offset` — absent = create (`409` if exists), `0` = overwrite,
-  `N > 0` = resume (mismatch → `412`)
+  `N > 0` = resume (size mismatch → `412`)
 - `x-libfw-compress` — `zrip` when the body is compressed
+
+### Directory listing
+
+`GET /dir/{*path}` returns a JSON array of entries:
+
+```json
+[
+  { "path": "dir/a.txt", "is_dir": false, "size": 11, "mtime": 1710000000 },
+  { "path": "dir/sub",   "is_dir": true,  "size": 0,  "mtime": 1710000001 }
+]
+```
+
+### Status code reference
+
+| Status | Meaning |
+| ------ | ------- |
+| `200` | full download / upload committed |
+| `201` | upload created |
+| `206` | partial content (Range fulfilled) |
+| `304` | `If-None-Match` matched |
+| `401` | missing / malformed / expired token |
+| `403` | valid token, insufficient rights for path/action |
+| `409` | upload with create semantics but target exists |
+| `412` | resume offset mismatch (client resets and re-uploads) |
+| `416` | unsatisfiable range |
+
+## Building from source
+
+```bash
+# full workspace (native targets)
+cargo build --workspace
+
+# WASM engine for the browser SDK
+wasm-pack build crates/libfw-client --target web --out-dir ../../sdk/pkg --release
+
+# UMD bundle of the SDK (requires rollup)
+npm --prefix sdk run build:umd
+```
 
 ## Testing
 
 ```bash
-cargo test --workspace            # 66 unit + integration tests (native)
+cargo test --workspace            # unit + integration tests (native)
 wasm-pack test crates/libfw-client --node   # WASM-side tests (Node)
 ```
 
