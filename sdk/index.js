@@ -207,8 +207,8 @@ export class LibfwClient {
       onWriteChunk: (path, offset, data) => this._onWriteChunk(path, offset, data),
       onFileCompleted: (path) => this._emit({ type: 'fileCompleted', path }),
       onProgress: (done, total) => this._emit({ type: 'progress', done, total }),
-      loadState: (path) => Idb.loadState(path),
-      saveState: (path, state) => Idb.saveState(path, state),
+      loadState: (direction, path) => Idb.loadState(`${direction}:${path}`),
+      saveState: (direction, path, state) => Idb.saveState(`${direction}:${path}`, state),
       getFileList: () => this._getFileList(),
       readFile: (path, offset, length) => this._readFile(path, offset, length),
       log: (msg) => {
@@ -270,9 +270,16 @@ export class LibfwClient {
     if (!writable) {
       const handle = await this._ensureFileHandle(path);
       this._fileHandles.set(path, handle);
-      // keepExistingData: true lets resumed downloads overwrite only the
-      // tail without truncating the already-written prefix.
-      writable = await handle.createWritable({ keepExistingData: true });
+      // Only a true resume (first chunk arrives at offset > 0) needs to
+      // keep the existing file's prefix. For a fresh download we open the
+      // writable WITHOUT keepExistingData, which truncates and lets us
+      // write sequentially. In real Chromium the keepExistingData +
+      // position-write path can leave empty target files behind a trail of
+      // orphaned `.crswap` swap files, so we avoid it unless required.
+      const isResume = offset > 0;
+      writable = await handle.createWritable(
+        isResume ? { keepExistingData: true } : undefined
+      );
       this._writables.set(path, writable);
     }
     await writable.write({ type: 'write', position: offset, data });

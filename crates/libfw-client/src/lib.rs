@@ -21,8 +21,8 @@
 //!   onWriteChunk(path, offset, data) {},   // Uint8Array
 //!   onFileCompleted(path) {},
 //!   onProgress(done, total) {},
-//!   loadState(path) { return Promise.resolve(null); },   // IndexedDB
-//!   saveState(path, state) { return Promise.resolve(); },// IndexedDB
+//!   loadState(direction, path) { return Promise.resolve(null); }, // IndexedDB
+//!   saveState(direction, path, state) { return Promise.resolve(); },// IndexedDB
 //!   getFileList() { return Promise.resolve([]); },       // uploads
 //!   readFile(path, offset, length) { return Promise.resolve(new Uint8Array(0)); },
 //!   log(msg) {},

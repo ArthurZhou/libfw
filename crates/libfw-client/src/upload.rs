@@ -9,7 +9,7 @@ use wasm_bindgen_futures::JsFuture;
 
 use futures::StreamExt;
 use libfw_core::compress::{compressor, CompressionFormat};
-use libfw_core::metadata::encode_file_meta;
+use libfw_core::metadata::encode_file_meta_header;
 use libfw_core::{HEADER_COMPRESS, HEADER_FILE_META, HEADER_OFFSET};
 
 use crate::config::ClientConfig;
@@ -46,7 +46,7 @@ async fn post_chunk(
         .set(HEADER_OFFSET, &offset.to_string())
         .map_err(|e| LibfwError::Js(format!("set offset header failed: {e:?}")))?;
     headers
-        .set(HEADER_FILE_META, &encode_file_meta(&file.to_meta()))
+        .set(HEADER_FILE_META, &encode_file_meta_header(&file.to_meta()))
         .map_err(|e| LibfwError::Js(format!("set meta header failed: {e:?}")))?;
     if compress {
         headers
@@ -87,7 +87,7 @@ async fn upload_file(
     'file: loop {
         // Load persisted resume state: { etag, offset }.
         let mut offset = 0u64;
-        if let Some(state) = callbacks.load_state(&file.path).await? {
+        if let Some(state) = callbacks.load_state("upload", &file.path).await? {
             if let Some(o) = Reflect::get(&state, &JsValue::from_str("offset"))
                 .ok()
                 .and_then(|v| v.as_f64())
@@ -142,6 +142,7 @@ async fn upload_file(
                         ));
                         let _ = callbacks
                             .save_state(
+                                "upload",
                                 &file.path,
                                 &state_json(0, &file.to_meta().etag, file.size),
                             )
@@ -168,6 +169,7 @@ async fn upload_file(
             // Persist progress so a crash/resume continues from here.
             callbacks
                 .save_state(
+                    "upload",
                     &file.path,
                     &state_json(end, &file.to_meta().etag, file.size),
                 )

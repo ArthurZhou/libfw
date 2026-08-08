@@ -158,6 +158,77 @@ pub fn decode_file_meta(header: &str) -> Result<FileMeta, serde_json::Error> {
     serde_json::from_str(header)
 }
 
+/// Base64 alphabet (RFC 4648 §4, standard).
+const B64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Base64-encode `input` (standard alphabet, `=` padding).
+pub fn base64_encode(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B64_ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(B64_ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            B64_ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64_ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Base64-decode `input` (standard alphabet, `=`/whitespace tolerated).
+pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(input.len().div_ceil(4) * 3);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for c in input.chars() {
+        if c == '=' || c.is_whitespace() {
+            continue;
+        }
+        let val = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            _ => return Err(format!("invalid base64 character: {c:?}")),
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Encode [`FileMeta`] for the [`HEADER_FILE_META`] header.
+///
+/// The raw JSON is base64-encoded so that non-Latin-1 virtual paths (e.g.
+/// CJK filenames) survive HTTP header transport — browsers reject header
+/// values containing characters outside ISO-8859-1.
+pub fn encode_file_meta_header(meta: &FileMeta) -> String {
+    base64_encode(encode_file_meta(meta).as_bytes())
+}
+
+/// Decode [`FileMeta`] from the [`HEADER_FILE_META`] header.
+pub fn decode_file_meta_header(header: &str) -> Result<FileMeta, serde_json::Error> {
+    let raw = base64_decode(header)
+        .map_err(|e| serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    decode_file_meta(&String::from_utf8_lossy(&raw))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +282,46 @@ mod tests {
         assert!(encoded.contains("etag"));
         let decoded = decode_file_meta(&encoded).unwrap();
         assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn base64_roundtrip_arbitrary_bytes() {
+        for bytes in [
+            b"".to_vec(),
+            b"f".to_vec(),
+            b"fo".to_vec(),
+            b"foo".to_vec(),
+            b"foob".to_vec(),
+            vec![0u8, 1, 2, 3, 255, 128, 64],
+            "中文文件名🚀".as_bytes().to_vec(),
+        ] {
+            let enc = base64_encode(&bytes);
+            assert_eq!(base64_decode(&enc).unwrap(), bytes, "for {bytes:?}");
+        }
+    }
+
+    #[test]
+    fn base64_encode_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+    }
+
+    #[test]
+    fn file_meta_header_roundtrip_with_unicode_path() {
+        // A CJK filename must survive the header-encoding roundtrip.
+        let meta = FileMeta::new("目录/报告.txt", 999, 7);
+        let encoded = encode_file_meta_header(&meta);
+        // The base64 form is pure ASCII — safe as an HTTP header value.
+        assert!(encoded.is_ascii());
+        let decoded = decode_file_meta_header(&encoded).unwrap();
+        assert_eq!(decoded, meta);
+    }
+
+    #[test]
+    fn decode_file_meta_header_rejects_garbage() {
+        assert!(decode_file_meta_header("!!!not-base64!!!").is_err());
     }
 }

@@ -105,9 +105,16 @@ impl Callbacks {
 
     /// Load persisted resume state for `path` from JS (IndexedDB).
     ///
+    /// `direction` separates upload from download state so a download of a
+    /// same-named file never leaks its `{offset, size}` into a later
+    /// upload (which would silently skip chunks) and vice versa.
+    ///
     /// Returns `Ok(None)` when no state exists.
-    pub async fn load_state(&self, path: &str) -> Result<Option<JsValue>, LibfwError> {
-        let promise = self.call("loadState", &[JsValue::from_str(path)])?;
+    pub async fn load_state(&self, direction: &str, path: &str) -> Result<Option<JsValue>, LibfwError> {
+        let promise = self.call(
+            "loadState",
+            &[JsValue::from_str(direction), JsValue::from_str(path)],
+        )?;
         let value = await_promise(promise).await?;
         if value.is_null() || value.is_undefined() {
             Ok(None)
@@ -117,10 +124,13 @@ impl Callbacks {
     }
 
     /// Persist resume state for `path` via JS (IndexedDB).
-    pub async fn save_state(&self, path: &str, state: &JsValue) -> Result<(), LibfwError> {
+    ///
+    /// `direction` (see [`Callbacks::load_state`]) namespaces the key so
+    /// upload and download resume state cannot collide.
+    pub async fn save_state(&self, direction: &str, path: &str, state: &JsValue) -> Result<(), LibfwError> {
         let promise = self.call(
             "saveState",
-            &[JsValue::from_str(path), state.clone()],
+            &[JsValue::from_str(direction), JsValue::from_str(path), state.clone()],
         )?;
         await_promise(promise).await.map(|_| ())
     }

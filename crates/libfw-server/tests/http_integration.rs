@@ -10,7 +10,7 @@ use http_body_util::BodyExt;
 use libfw_core::auth::{AuthError, PathValidator, TokenVerifier};
 use libfw_core::claims::{Permission, TokenClaims};
 use libfw_core::compress::{compressor, decompressor, CompressionFormat};
-use libfw_core::metadata::encode_file_meta;
+use libfw_core::metadata::encode_file_meta_header;
 use libfw_server::{router, FsStorage, ServerState, HEADER_COMPRESS, HEADER_FILE_META, HEADER_OFFSET};
 use tower::ServiceExt;
 
@@ -84,7 +84,7 @@ async fn upload_then_download_roundtrip() {
     // Upload (Create mode: no x-libfw-offset).
     let meta = libfw_core::metadata::FileMeta::new("a/b.txt", data.len() as u64, 1_700_000_000);
     let mut headers = auth_header("tok");
-    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta(&meta)).unwrap());
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
     let resp = app
         .clone()
         .oneshot(request("POST", "/file/a/b.txt", headers, Body::from(data.to_vec())))
@@ -108,7 +108,7 @@ async fn range_requests_return_206() {
     let data = b"0123456789".to_vec();
     let meta = libfw_core::metadata::FileMeta::new("r.bin", 10, 0);
     let mut headers = auth_header("tok");
-    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta(&meta)).unwrap());
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
     app.clone()
         .oneshot(request("POST", "/file/r.bin", headers, Body::from(data.clone())))
         .await
@@ -132,7 +132,7 @@ async fn if_none_match_returns_304() {
     let app = app(DevVerifier);
     let meta = libfw_core::metadata::FileMeta::new("e.txt", 3, 0);
     let mut headers = auth_header("tok");
-    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta(&meta)).unwrap());
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
     let upload = app
         .clone()
         .oneshot(request("POST", "/file/e.txt", headers, Body::from(b"abc".to_vec())))
@@ -189,7 +189,7 @@ async fn upload_then_list_dir() {
     let app = app(DevVerifier);
     let meta = libfw_core::metadata::FileMeta::new("sub/f.txt", 2, 0);
     let mut headers = auth_header("tok");
-    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta(&meta)).unwrap());
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
     app.clone()
         .oneshot(request("POST", "/file/sub/f.txt", headers, Body::from(b"hi".to_vec())))
         .await
@@ -217,7 +217,7 @@ async fn compressed_upload_and_download_roundtrip() {
 
     let meta = libfw_core::metadata::FileMeta::new("c.bin", data.len() as u64, 0);
     let mut headers = auth_header("tok");
-    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta(&meta)).unwrap());
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
     headers.insert(HEADER_COMPRESS, HeaderValue::from_static("zrip"));
     let resp = app
         .clone()
@@ -244,13 +244,45 @@ async fn compressed_upload_and_download_roundtrip() {
 }
 
 #[tokio::test]
+async fn browser_zstd_accept_encoding_does_not_trigger_zrip() {
+    // Regression: a browser sends `Accept-Encoding: gzip, deflate, br,
+    // zstd` automatically. This must NOT be interpreted as a request for
+    // libfw's private zrip wire format (which a plain browser `fetch`
+    // cannot decode) — the server must reply identity instead.
+    let app = app(DevVerifier);
+    let data = b"plain text body".to_vec();
+    let meta = libfw_core::metadata::FileMeta::new("z.bin", data.len() as u64, 0);
+    let mut headers = auth_header("tok");
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    app.clone()
+        .oneshot(request("POST", "/file/z.bin", headers, Body::from(data.clone())))
+        .await
+        .unwrap();
+
+    let mut headers = auth_header("tok");
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("gzip, deflate, br, zstd"),
+    );
+    let resp = app
+        .oneshot(request("GET", "/file/z.bin", headers, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // No zrip — a plain consumer can read the body verbatim.
+    assert_eq!(resp.headers().get(HEADER_COMPRESS).unwrap(), "identity");
+    let got = body_string(resp).await.into_bytes();
+    assert_eq!(got, data);
+}
+
+#[tokio::test]
 async fn resume_upload_at_offset() {
     let app = app(DevVerifier);
     let meta = libfw_core::metadata::FileMeta::new("res.txt", 6, 0);
 
     // First chunk: offset 0 → overwrite mode.
     let mut headers = auth_header("tok");
-    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta(&meta)).unwrap());
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
     headers.insert(HEADER_OFFSET, HeaderValue::from_static("0"));
     app.clone()
         .oneshot(request("POST", "/file/res.txt", headers.clone(), Body::from(b"ABCD".to_vec())))
@@ -278,7 +310,7 @@ async fn bad_resume_offset_is_412() {
     let app = app(DevVerifier);
     let meta = libfw_core::metadata::FileMeta::new("bad.txt", 4, 0);
     let mut headers = auth_header("tok");
-    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta(&meta)).unwrap());
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
     app.clone()
         .oneshot(request("POST", "/file/bad.txt", headers.clone(), Body::from(b"ABCD".to_vec())))
         .await
@@ -298,7 +330,7 @@ async fn unsatisfiable_range_is_416() {
     let app = app(DevVerifier);
     let meta = libfw_core::metadata::FileMeta::new("s.bin", 5, 0);
     let mut headers = auth_header("tok");
-    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta(&meta)).unwrap());
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
     app.clone()
         .oneshot(request("POST", "/file/s.bin", headers, Body::from(b"12345".to_vec())))
         .await
@@ -329,7 +361,7 @@ async fn duplicate_upload_without_offset_conflicts() {
     let app = app(DevVerifier);
     let meta = libfw_core::metadata::FileMeta::new("dup.txt", 1, 0);
     let mut headers = auth_header("tok");
-    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta(&meta)).unwrap());
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
     app.clone()
         .oneshot(request("POST", "/file/dup.txt", headers.clone(), Body::from(b"a".to_vec())))
         .await

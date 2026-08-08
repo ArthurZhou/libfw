@@ -99,7 +99,7 @@ async fn download_file(
 
     // 1. Load persisted resume state: { etag, offset }.
     let mut resume: Option<(String, u64)> = None;
-    if let Some(state) = callbacks.load_state(&file.path).await? {
+    if let Some(state) = callbacks.load_state("download", &file.path).await? {
         let etag = Reflect::get(&state, &JsValue::from_str("etag"))
             .ok()
             .and_then(|v| v.as_string())
@@ -279,7 +279,7 @@ async fn finish_download(
         .map_err(|e| LibfwError::Js(format!("state offset: {e:?}")))?;
     js_sys::Reflect::set(&state, &JsValue::from_str("size"), &JsValue::from_f64(size as f64))
         .map_err(|e| LibfwError::Js(format!("state size: {e:?}")))?;
-    callbacks.save_state(&file.path, &state).await?;
+    callbacks.save_state("download", &file.path, &state).await?;
     callbacks.on_file_completed(&file.path)?;
     Ok(DownloadOutcome { size, written })
 }

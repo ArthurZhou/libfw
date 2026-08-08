@@ -14,7 +14,7 @@ use futures::stream::{BoxStream, Stream, StreamExt};
 use libfw_core::auth::{Action, AuthError};
 use libfw_core::claims::TokenClaims;
 use libfw_core::compress::{decompressor, CompressionFormat, Compressor};
-use libfw_core::metadata::{decode_file_meta, FileMeta};
+use libfw_core::metadata::{decode_file_meta_header, FileMeta};
 use libfw_core::storage::WriteMode;
 use libfw_core::{RangeSpec, StorageError, STREAM_BUF_SIZE};
 use serde::Serialize;
@@ -233,12 +233,16 @@ async fn plan_download(
 }
 
 fn negotiate_download_format(state: &ServerState, req_headers: &HeaderMap) -> CompressionFormat {
+    // Only an explicit `zrip` token in Accept-Encoding asks for libfw's
+    // private wire format. A browser's standard `Accept-Encoding: … zstd`
+    // must NOT be treated as a zrip request — that would send a body the
+    // browser cannot decode (and would garble plain `fetch` consumers).
     let wants_zrip = req_headers
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
         .map(|v| {
             v.split(',')
-                .any(|e| CompressionFormat::parse_header(e.trim()) == Some(CompressionFormat::Zrip))
+                .any(|e| e.trim().eq_ignore_ascii_case("zrip"))
         })
         .unwrap_or(false);
     if wants_zrip && state.compression == CompressionFormat::Zrip {
@@ -304,7 +308,7 @@ pub(crate) async fn upload(
         .get(HEADER_FILE_META)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ApiError::BadRequest(format!("missing `{HEADER_FILE_META}` header")))?;
-    let meta: FileMeta = decode_file_meta(meta_header)
+    let meta: FileMeta = decode_file_meta_header(meta_header)
         .map_err(|e| ApiError::BadRequest(format!("invalid file meta: {e}")))?;
     if meta.size > state.max_upload_size {
         return Err(ApiError::PayloadTooLarge(state.max_upload_size));
