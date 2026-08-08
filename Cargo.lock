@@ -1055,7 +1055,7 @@ dependencies = [
 
 [[package]]
 name = "libfw-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "js-sys",
@@ -1072,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "libfw-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -1085,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "libfw-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
