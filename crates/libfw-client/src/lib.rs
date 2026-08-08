@@ -112,6 +112,42 @@ impl LibfwClient {
         })
     }
 
+    /// Download a single file at `file_path` into the chosen local directory.
+    ///
+    /// Resolves with the number of bytes written.
+    pub fn download_file(&self, base_url: &str, token: &str, file_path: &str) -> js_sys::Promise {
+        let base_url = base_url.to_string();
+        let token = token.to_string();
+        let file_path = file_path.to_string();
+        let config = self.config.clone();
+        let callbacks = self.callbacks.clone();
+        let control = self.control.clone();
+
+        wasm_bindgen_futures::future_to_promise(async move {
+            control.reset();
+            control.begin(TaskState::Downloading);
+            match download::download_single(
+                &base_url,
+                &token,
+                &file_path,
+                &callbacks,
+                &control,
+                &config,
+            )
+            .await
+            {
+                Ok(total) => {
+                    control.complete();
+                    Ok(JsValue::from_f64(total as f64))
+                }
+                Err(e) => {
+                    control.fail();
+                    Err(e.to_js())
+                }
+            }
+        })
+    }
+
     /// Upload the files reported by the JS `getFileList` callback.
     ///
     /// Resolves with the number of bytes uploaded.

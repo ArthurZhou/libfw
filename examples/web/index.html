@@ -28,8 +28,12 @@
   <label for="token">Bearer token (dev server accepts <code>dev-token</code>)</label>
   <input id="token" type="text" value="dev-token" />
 
+  <label for="path">Path (empty = root; e.g. <code>dir</code> or <code>dir/a.txt</code>)</label>
+  <input id="path" type="text" value="" placeholder="dir  or  dir/a.txt" />
+
   <div class="row">
     <button id="download">📥 Download folder…</button>
+    <button id="downloadFile">📄 Download file…</button>
     <button id="upload">📤 Upload folder…</button>
     <label style="flex-basis:100%">
       Or upload specific files:
@@ -78,6 +82,7 @@
     };
     const baseUrl = () => $('base').value.replace(/\/+$/, '');
     const token = () => $('token').value;
+    const pathInput = () => $('path').value.trim();
 
     // Rebuild the client whenever the base URL changes.
     client._options.baseUrl = baseUrl();
@@ -89,10 +94,24 @@
     $('download').addEventListener('click', async () => {
       try {
         controls(true);
-        const bytes = await client.downloadFolder(token());
+        const bytes = await client.downloadFolder(token(), pathInput());
         log(`download complete: ${bytes} bytes`);
       } catch (err) {
         log(`download failed: ${err?.message ?? err}`);
+      } finally {
+        controls(false);
+      }
+    });
+
+    $('downloadFile').addEventListener('click', async () => {
+      const p = pathInput();
+      if (!p) { log('enter a file path first (e.g. dir/a.txt)'); return; }
+      try {
+        controls(true);
+        const bytes = await client.downloadFile(token(), p);
+        log(`file download complete: ${bytes} bytes`);
+      } catch (err) {
+        log(`file download failed: ${err?.message ?? err}`);
       } finally {
         controls(false);
       }

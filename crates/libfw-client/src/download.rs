@@ -115,7 +115,6 @@ async fn download_file(
 
     let mut offset = resume.as_ref().map(|(_, o)| *o).unwrap_or(0);
     let mut etag = resume.as_ref().map(|(e, _)| e.clone()).unwrap_or_default();
-    let mut written = 0u64;
     let mut attempts = 0u32;
 
     loop {
@@ -140,28 +139,20 @@ async fn download_file(
                 200 => {
                     // Full content: the file changed (or first attempt).
                     etag = response_etag(&resp).unwrap_or(etag);
-                    let outcome = stream_download(&resp, file, callbacks, control, &mut written, 0)
-                        .await?;
-                    let size = outcome.size;
-                    let written = outcome.written;
-                    return finish_download(file, callbacks, etag, size, written).await;
+                    let outcome = stream_download(&resp, file, callbacks, control, 0).await?;
+                    return finish_download(file, callbacks, etag, outcome).await;
                 }
                 206 => {
                     if etag.is_empty() {
                         etag = response_etag(&resp).unwrap_or_default();
                     }
                     let start = content_range_start(&resp).unwrap_or(offset);
-                    let outcome =
-                        stream_download(&resp, file, callbacks, control, &mut written, start)
-                            .await?;
-                    let size = outcome.size;
-                    let written = outcome.written;
-                    return finish_download(file, callbacks, etag, size, written).await;
+                    let outcome = stream_download(&resp, file, callbacks, control, start).await?;
+                    return finish_download(file, callbacks, etag, outcome).await;
                 }
                 416 => {
                     // Offset beyond EOF → the file shrank; restart cleanly.
                     offset = 0;
-                    written = 0;
                     attempts = 0;
                     continue;
                 }
@@ -190,7 +181,6 @@ async fn stream_download(
     file: &FileEntry,
     callbacks: &Callbacks,
     control: &TaskControl,
-    written: &mut u64,
     start: u64,
 ) -> Result<DownloadOutcome, LibfwError> {
     // Decide the wire format from the response header (robust against a
@@ -232,7 +222,7 @@ async fn stream_download(
             let data = std::mem::take(&mut *out.borrow_mut());
             if !data.is_empty() {
                 let offset = file_offset.get();
-                callbacks.on_write_chunk(&path, offset, &data)?;
+                callbacks.on_write_chunk(&path, offset, &data).await?;
                 file_offset.set(offset.saturating_add(data.len() as u64));
                 stream_written.set(stream_written.get().saturating_add(data.len() as u64));
                 control.add_progress(data.len() as u64);
@@ -250,14 +240,13 @@ async fn stream_download(
     let tail = std::mem::take(&mut *out.borrow_mut());
     if !tail.is_empty() {
         let offset = file_offset.get();
-        callbacks.on_write_chunk(&path, offset, &tail)?;
+        callbacks.on_write_chunk(&path, offset, &tail).await?;
         file_offset.set(offset.saturating_add(tail.len() as u64));
         stream_written.set(stream_written.get().saturating_add(tail.len() as u64));
         control.add_progress(tail.len() as u64);
     }
 
     let written_total = stream_written.get();
-    *written = written_total;
     Ok(DownloadOutcome {
         size: final_size.max(file_offset.get()),
         written: written_total,
@@ -269,19 +258,22 @@ async fn finish_download(
     file: &FileEntry,
     callbacks: &Callbacks,
     etag: String,
-    size: u64,
-    written: u64,
+    outcome: DownloadOutcome,
 ) -> Result<DownloadOutcome, LibfwError> {
+    // Persist the ABSOLUTE end offset (`size`), not the per-request delta,
+    // so a later resume re-requests the correct byte range.
+    let offset = outcome.size;
+    let size = outcome.size;
     let state = js_sys::Object::new();
     js_sys::Reflect::set(&state, &JsValue::from_str("etag"), &JsValue::from_str(&etag))
         .map_err(|e| LibfwError::Js(format!("state etag: {e:?}")))?;
-    js_sys::Reflect::set(&state, &JsValue::from_str("offset"), &JsValue::from_f64(written as f64))
+    js_sys::Reflect::set(&state, &JsValue::from_str("offset"), &JsValue::from_f64(offset as f64))
         .map_err(|e| LibfwError::Js(format!("state offset: {e:?}")))?;
     js_sys::Reflect::set(&state, &JsValue::from_str("size"), &JsValue::from_f64(size as f64))
         .map_err(|e| LibfwError::Js(format!("state size: {e:?}")))?;
     callbacks.save_state("download", &file.path, &state).await?;
-    callbacks.on_file_completed(&file.path)?;
-    Ok(DownloadOutcome { size, written })
+    callbacks.on_file_completed(&file.path).await?;
+    Ok(outcome)
 }
 
 /// Download an entire folder (or the root when `path` is empty).
@@ -308,13 +300,31 @@ pub async fn download_folder(
     }))
     .buffer_unordered(config.concurrency);
 
-    let mut done = 0u64;
     while let Some(result) = stream.next().await {
-        let outcome = result?;
-        done = done.saturating_add(outcome.written);
-        callbacks.on_progress(done, total)?;
+        result?;
+        // Report progress from the shared control block so pause/resume and
+        // the onProgress events stay consistent (one source of truth).
+        callbacks.on_progress(control.done_bytes(), control.total_bytes())?;
     }
-    Ok(done)
+    Ok(control.done_bytes())
+}
+
+/// Download a single file at `path` (size/etag discovered from the server).
+pub async fn download_single(
+    base_url: &str,
+    token: &str,
+    path: &str,
+    callbacks: &Callbacks,
+    control: &TaskControl,
+    config: &ClientConfig,
+) -> Result<u64, LibfwError> {
+    let file = FileEntry {
+        path: path.to_string(),
+        size: 0,
+        mtime: 0,
+    };
+    let outcome = download_file(base_url, token, &file, callbacks, control, config).await?;
+    Ok(outcome.written)
 }
 
 /// Read the ETag response header.

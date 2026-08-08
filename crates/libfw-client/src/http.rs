@@ -90,13 +90,22 @@ where
     Ok(())
 }
 
-/// Header map helper: `Authorization: Bearer <token>` plus `Accept-Encoding`.
+/// Header map helper: `Authorization: Bearer <token>` plus the protocol
+/// handshake and optional `Accept-Encoding`.
 pub fn auth_headers(token: &str, accept_zrip: bool) -> Result<Headers, LibfwError> {
     let headers = Headers::new()
         .map_err(|e| LibfwError::Js(format!("Headers::new failed: {e:?}")))?;
     headers
         .set("Authorization", &format!("Bearer {token}"))
         .map_err(|e| LibfwError::Js(format!("set Authorization failed: {e:?}")))?;
+    // Advertise the wire protocol so the server can verify client/server
+    // builds are matched (it replies 426 on a mismatch).
+    headers
+        .set(
+            libfw_core::HEADER_PROTOCOL,
+            libfw_core::protocol_header_value(),
+        )
+        .map_err(|e| LibfwError::Js(format!("set protocol header failed: {e:?}")))?;
     if accept_zrip {
         headers
             .set("Accept-Encoding", "zrip")

@@ -74,24 +74,26 @@ impl Callbacks {
         .map(|_| ())
     }
 
-    /// Push a decompressed byte chunk for `path` at `offset` to JS.
-    pub fn on_write_chunk(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), LibfwError> {
+    /// Push a decompressed byte chunk for `path` at `offset` to JS and await
+    /// the JS write so chunks are delivered in order (critical for the SDK's
+    /// streaming writes to disk).
+    pub async fn on_write_chunk(&self, path: &str, offset: u64, data: &[u8]) -> Result<(), LibfwError> {
         let arr = js_sys::Uint8Array::from(data);
-        self.call(
+        let promise = self.call(
             "onWriteChunk",
             &[
                 JsValue::from_str(path),
                 JsValue::from_f64(offset as f64),
                 arr.into(),
             ],
-        )
-        .map(|_| ())
+        )?;
+        await_promise(promise).await.map(|_| ())
     }
 
     /// A file finished transferring successfully.
-    pub fn on_file_completed(&self, path: &str) -> Result<(), LibfwError> {
-        self.call("onFileCompleted", &[JsValue::from_str(path)])
-            .map(|_| ())
+    pub async fn on_file_completed(&self, path: &str) -> Result<(), LibfwError> {
+        let promise = self.call("onFileCompleted", &[JsValue::from_str(path)])?;
+        await_promise(promise).await.map(|_| ())
     }
 
     /// Overall progress update.

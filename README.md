@@ -61,8 +61,9 @@ The dev servers accept the token `dev-token`:
 
 ```bash
 # upload (streaming, with resume offset)
+# `x-libfw-file-meta` is base64(JSON) — the value below decodes to {"path":"dir/a.txt","size":11}
 curl -X POST -H "Authorization: Bearer dev-token" \
-     -H 'x-libfw-file-meta: {"path":"dir/a.txt","size":11}' \
+     -H 'x-libfw-file-meta: eyJwYXRoIjoiZGlyL2EudHh0Iiwic2l6ZSI6MTF9' \
      --data-binary "hello world" \
      http://127.0.0.1:8080/file/dir/a.txt
 
@@ -391,7 +392,7 @@ All routes require `Authorization: Bearer <token>`.
 
 ### Uploads
 
-- `x-libfw-file-meta` — JSON `{ path, size, mtime, etag }` (required)
+- `x-libfw-file-meta` — base64 of JSON `{ path, size, mtime, etag }` (required; encodes non-Latin-1 paths safely)
 - `x-libfw-offset` — absent = create (`409` if exists), `0` = overwrite,
   `N > 0` = resume (size mismatch → `412`)
 - `x-libfw-compress` — `zrip` when the body is compressed

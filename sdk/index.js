@@ -158,7 +158,7 @@ export class LibfwClient {
     this._dirHandle = null;
     /** @type {Map<string, FileSystemFileHandle>} path → file handle */
     this._fileHandles = new Map();
-    /** @type {Map<string, FileSystemWritableFileStream>} path → writable stream */
+    /** @type {Map<string, FileSystemWritableFileStream>} path → open writable stream */
     this._writables = new Map();
     /** @type {Map<string, File>} path → File (upload) */
     this._uploadFiles = new Map();
@@ -205,7 +205,7 @@ export class LibfwClient {
     return {
       onFileStart: (path, size) => this._emit({ type: 'fileStart', path, done: 0, total: size }),
       onWriteChunk: (path, offset, data) => this._onWriteChunk(path, offset, data),
-      onFileCompleted: (path) => this._emit({ type: 'fileCompleted', path }),
+      onFileCompleted: (path) => this._onFileCompleted(path),
       onProgress: (done, total) => this._emit({ type: 'progress', done, total }),
       loadState: (direction, path) => Idb.loadState(`${direction}:${path}`),
       saveState: (direction, path, state) => Idb.saveState(`${direction}:${path}`, state),
@@ -259,6 +259,36 @@ export class LibfwClient {
   }
 
   /**
+   * Download a single file from the server at `filePath` into a local
+   * directory chosen via `showDirectoryPicker()`.
+   *
+   * @param {string} token bearer token
+   * @param {string} filePath virtual server path of the file to download
+   * @returns {Promise<number>} total bytes written
+   * @throws {LibfwError}
+   */
+  async downloadFile(token, filePath) {
+    const engine = await this._ready();
+    if (typeof window === 'undefined' || typeof window.showDirectoryPicker !== 'function') {
+      throw new LibfwError('File System Access API is not available in this browser', 'unsupported');
+    }
+    if (!filePath) throw new LibfwError('downloadFile requires a file path', 'path');
+    this._dirHandle = await window.showDirectoryPicker();
+    this._fileHandles.clear();
+    try {
+      return await engine.download_file(this._options.baseUrl, token, filePath);
+    } catch (err) {
+      throw toLibfwError(err);
+    } finally {
+      await this._flushWritables();
+    }
+  }
+
+  /**
+   * Stream a decompressed chunk straight to disk at its absolute byte
+   * offset, keeping memory bounded regardless of file size (no whole-file
+   * buffering). The engine awaits this callback, so writes for a file are
+   * applied strictly in order.
    * @param {string} path virtual path
    * @param {number} offset byte offset
    * @param {Uint8Array} data decompressed chunk
@@ -268,21 +298,48 @@ export class LibfwClient {
   async _onWriteChunk(path, offset, data) {
     let writable = this._writables.get(path);
     if (!writable) {
+      // Open the destination once per file. A true resume (first chunk at
+      // offset > 0) keeps the existing prefix on disk; a fresh download opens
+      // a truncating writable. Always close the writable on completion/abort
+      // so no orphaned `.crswap` swap files are left behind.
+      const isResume = offset > 0;
       const handle = await this._ensureFileHandle(path);
       this._fileHandles.set(path, handle);
-      // Only a true resume (first chunk arrives at offset > 0) needs to
-      // keep the existing file's prefix. For a fresh download we open the
-      // writable WITHOUT keepExistingData, which truncates and lets us
-      // write sequentially. In real Chromium the keepExistingData +
-      // position-write path can leave empty target files behind a trail of
-      // orphaned `.crswap` swap files, so we avoid it unless required.
-      const isResume = offset > 0;
       writable = await handle.createWritable(
         isResume ? { keepExistingData: true } : undefined
       );
       this._writables.set(path, writable);
     }
     await writable.write({ type: 'write', position: offset, data });
+  }
+
+  /**
+   * Close the destination writable once a file's transfer completes.
+   * @param {string} path virtual path
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _onFileCompleted(path) {
+    await this._closeWritable(path);
+    this._emit({ type: 'fileCompleted', path });
+  }
+
+  /**
+   * Close (and forget) a file's writable, flushing buffered bytes to disk.
+   * @param {string} path virtual path
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _closeWritable(path) {
+    const writable = this._writables.get(path);
+    if (writable) {
+      this._writables.delete(path);
+      try {
+        await writable.close();
+      } catch {
+        /* best-effort flush on failure/abort */
+      }
+    }
   }
 
   /**
@@ -305,13 +362,20 @@ export class LibfwClient {
   }
 
   /**
-   * Close all open writable streams (flush to disk).
+   * Close all still-open writable streams (flush to disk). Called on
+   * success, failure or cancellation of a transfer.
    * @returns {Promise<void>}
    * @private
    */
   async _flushWritables() {
-    const pending = [...this._writables.values()].map((w) => w.close().catch(() => {}));
-    this._writables.clear();
+    const pending = [...this._writables.entries()].map(async ([path, writable]) => {
+      this._writables.delete(path);
+      try {
+        await writable.close();
+      } catch {
+        /* best-effort flush */
+      }
+    });
     await Promise.allSettled(pending);
   }
 

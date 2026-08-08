@@ -25,7 +25,7 @@ use futures::stream::{BoxStream, Stream, StreamExt};
 use libfw_core::auth::{AuthError, PathValidator, TokenVerifier};
 use libfw_core::claims::{Permission, TokenClaims};
 use libfw_core::compress::{decompressor, CompressionFormat};
-use libfw_core::metadata::{decode_file_meta, FileMeta};
+use libfw_core::metadata::{decode_file_meta_header, FileMeta};
 use libfw_core::storage::WriteMode;
 use libfw_core::{RangeSpec, StorageError, STREAM_BUF_SIZE};
 use libfw_server::{
@@ -336,7 +336,7 @@ async fn file_upload(
             return HttpResponse::BadRequest().body(format!("missing `{HEADER_FILE_META}` header"))
         }
     };
-    let meta: FileMeta = match decode_file_meta(meta_header) {
+    let meta: FileMeta = match decode_file_meta_header(meta_header) {
         Ok(m) => m,
         Err(_) => return HttpResponse::BadRequest().body("invalid file meta"),
     };

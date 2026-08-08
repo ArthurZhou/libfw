@@ -36,3 +36,18 @@ pub const PROTOCOL_NAME: &str = "libfw";
 
 /// Protocol version used in the handshake header.
 pub const PROTOCOL_VERSION: &str = "1";
+
+/// The canonical `x-libfw-protocol` header value (e.g. `libfw/1`).
+///
+/// Both the server and the WASM client must agree on this exact value; the
+/// server rejects (426) requests that explicitly advertise a different one.
+/// Keep in sync with [`PROTOCOL_NAME`] / [`PROTOCOL_VERSION`].
+pub fn protocol_header_value() -> &'static str {
+    "libfw/1"
+}
+
+/// Whether a received `x-libfw-protocol` handshake value is compatible with
+/// this build of the library.
+pub fn protocol_compatible(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case(protocol_header_value())
+}

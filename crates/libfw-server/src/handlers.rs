@@ -15,7 +15,7 @@ use libfw_core::auth::{Action, AuthError};
 use libfw_core::claims::TokenClaims;
 use libfw_core::compress::{decompressor, CompressionFormat, Compressor};
 use libfw_core::metadata::{decode_file_meta_header, FileMeta};
-use libfw_core::storage::WriteMode;
+use libfw_core::storage::{UploadSink, WriteMode};
 use libfw_core::{RangeSpec, StorageError, STREAM_BUF_SIZE};
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -294,6 +294,35 @@ struct UploadOk {
     file: FileMeta,
 }
 
+/// Write one decompressed batch to the sink, enforcing the server's
+/// upload-size cap AND the client-declared `meta.size` bound.
+///
+/// The bound is computed as `resume_offset + appended_this_request` so a
+/// malicious client can never grow a file beyond what it declared (which is
+/// itself capped at `max_upload_size`). Counting *decompressed* bytes (not
+/// compressed) is what actually protects disk usage.
+async fn write_batch(
+    sink: &mut Box<dyn UploadSink>,
+    state: &ServerState,
+    resume_offset: u64,
+    meta_size: u64,
+    appended: &mut u64,
+    data: &[u8],
+) -> Result<(), ApiError> {
+    *appended = appended.saturating_add(data.len() as u64);
+    let total = resume_offset.saturating_add(*appended);
+    if total > state.max_upload_size {
+        return Err(ApiError::PayloadTooLarge(state.max_upload_size));
+    }
+    if total > meta_size {
+        return Err(ApiError::BadRequest(
+            "uploaded bytes exceed the declared file size".into(),
+        ));
+    }
+    sink.write(data).await?;
+    Ok(())
+}
+
 pub(crate) async fn upload(
     State(state): State<Arc<ServerState>>,
     Path(path): Path<String>,
@@ -334,34 +363,45 @@ pub(crate) async fn upload(
             WriteMode::Resume { offset }
         }
     };
+    let resume_offset = match mode {
+        WriteMode::Resume { offset } => offset,
+        _ => 0,
+    };
 
     let mut sink = state.storage.write_stream(&path, mode).await?;
     let mut decomp = decompressor(format);
     let mut out: Vec<u8> = Vec::new();
-    let mut written = 0u64;
+    let mut appended = 0u64;
     let mut stream = body.into_data_stream();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| ApiError::Io(std::io::Error::other(e)))?;
-        written = written.saturating_add(chunk.len() as u64);
-        if written > state.max_upload_size {
-            sink.abort().await?;
-            return Err(ApiError::PayloadTooLarge(state.max_upload_size));
+    // Run the streaming writes; on any failure abort the (temp) sink so no
+    // partial target or orphan temp file is left behind.
+    let write_result: Result<(), ApiError> = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ApiError::Io(std::io::Error::other(e)))?;
+            decomp
+                .decompress(&chunk, &mut out)
+                .map_err(|e| ApiError::BadRequest(format!("compressed stream invalid: {e}")))?;
+            let data = std::mem::take(&mut out);
+            if !data.is_empty() {
+                write_batch(&mut sink, &state, resume_offset, meta.size, &mut appended, &data)
+                    .await?;
+            }
         }
+        // Flush any final decompressed frames.
         decomp
-            .decompress(&chunk, &mut out)
-            .map_err(|e| ApiError::BadRequest(format!("compressed stream invalid: {e}")))?;
-        let data = std::mem::take(&mut out);
-        if !data.is_empty() {
-            sink.write(&data).await?;
+            .finish(&mut out)
+            .map_err(|e| ApiError::BadRequest(format!("compressed stream truncated: {e}")))?;
+        if !out.is_empty() {
+            write_batch(&mut sink, &state, resume_offset, meta.size, &mut appended, &out).await?;
         }
+        Ok(())
     }
-    // Flush any final decompressed frames.
-    decomp
-        .finish(&mut out)
-        .map_err(|e| ApiError::BadRequest(format!("compressed stream truncated: {e}")))?;
-    if !out.is_empty() {
-        sink.write(&out).await?;
+    .await;
+
+    if let Err(e) = write_result {
+        let _ = sink.abort().await;
+        return Err(e);
     }
 
     let committed = sink.commit().await?;
@@ -377,8 +417,25 @@ pub(crate) async fn list_dir(
     Path(path): Path<String>,
     BearerClaims(claims): BearerClaims,
 ) -> Result<Response, ApiError> {
-    authorize_request(&state, &claims, &path, Action::Read)?;
-    let path = validate_rel_path(path.as_str()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    list_dir_impl(&state, &claims, &path).await
+}
+
+/// `GET /dir` — list the mount root (the wildcard route `/dir/{*path}`
+/// does not match the bare `/dir`, so it needs its own handler).
+pub(crate) async fn list_dir_root(
+    State(state): State<Arc<ServerState>>,
+    BearerClaims(claims): BearerClaims,
+) -> Result<Response, ApiError> {
+    list_dir_impl(&state, &claims, "").await
+}
+
+async fn list_dir_impl(
+    state: &ServerState,
+    claims: &TokenClaims,
+    path: &str,
+) -> Result<Response, ApiError> {
+    authorize_request(state, claims, path, Action::Read)?;
+    let path = validate_rel_path(path).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let entries = state.storage.list_dir(&path).await?;
     Ok(Json(entries).into_response())
 }

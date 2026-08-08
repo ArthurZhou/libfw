@@ -30,6 +30,10 @@ impl FsStorage {
     }
 
     /// Resolve a virtual path against the root, rejecting traversal.
+    ///
+    /// Both textual `..` segments and symlinked path components are
+    /// rejected so a read/write can never escape the mount root through a
+    /// symlink planted inside it.
     fn resolve(&self, path: &str) -> Result<PathBuf, StorageError> {
         let rel = Path::new(path);
         if rel.is_absolute() {
@@ -38,7 +42,23 @@ impl FsStorage {
         let mut joined = self.root.clone();
         for component in rel.components() {
             match component {
-                Component::Normal(seg) => joined.push(seg),
+                Component::Normal(seg) => {
+                    joined.push(seg);
+                    // Reject any component that is itself a symlink.
+                    match std::fs::symlink_metadata(&joined) {
+                        Ok(m) if m.file_type().is_symlink() => {
+                            return Err(StorageError::Unsupported(
+                                "path must not traverse a symlink",
+                            ))
+                        }
+                        Ok(_) => {}
+                        // A not-yet-existing component is fine (e.g. a new
+                        // upload target); it will be validated as it is
+                        // created component by component.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(StorageError::Other(e)),
+                    }
+                }
                 Component::CurDir => {}
                 _ => {
                     return Err(StorageError::Unsupported(
@@ -133,6 +153,8 @@ impl StorageBackend for FsStorage {
                     file,
                     tmp: Some(tmp),
                     target: full,
+                    rel: path.to_string(),
+                    mode,
                     written: 0,
                 }))
             }
@@ -160,6 +182,8 @@ impl StorageBackend for FsStorage {
                     file,
                     tmp: None,
                     target: full,
+                    rel: path.to_string(),
+                    mode,
                     written: offset,
                 }))
             }
@@ -175,7 +199,13 @@ impl StorageBackend for FsStorage {
         let mut entries = Vec::new();
         let mut read_dir = tokio::fs::read_dir(&full)
             .await
-            .map_err(|e| StorageError::Other(e))?;
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    StorageError::NotFound(path.to_string())
+                } else {
+                    StorageError::Other(e)
+                }
+            })?;
         while let Some(entry) = read_dir
             .next_entry()
             .await
@@ -234,16 +264,23 @@ impl StorageBackend for FsStorage {
 }
 
 /// A temporary path for a target, unique per attempt.
+///
+/// Uniqueness combines a monotonic counter with a timestamp so two
+/// concurrent Create-mode uploads to the same target never collide on the
+/// same temp file (which would otherwise interleave/truncate each other).
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn temp_path_for(target: &Path) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let counter = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let file_name = target
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "upload".to_string());
-    let tmp_name = format!(".libfw-tmp-{file_name}-{nanos}");
+    let tmp_name = format!(".libfw-tmp-{file_name}-{nanos}-{counter}");
     target.with_file_name(tmp_name)
 }
 
@@ -252,6 +289,11 @@ pub struct FsSink {
     file: tokio::fs::File,
     tmp: Option<PathBuf>,
     target: PathBuf,
+    /// The full virtual path (used for the committed `FileMeta`).
+    rel: String,
+    /// The mode the sink was opened with (used for the Create atomicity
+    /// check at commit time).
+    mode: WriteMode,
     written: u64,
 }
 
@@ -273,23 +315,39 @@ impl UploadSink for FsSink {
             mut file,
             tmp,
             target,
+            rel,
+            mode,
             ..
         } = *self;
         file.flush().await.map_err(|e| StorageError::Other(e))?;
         file.sync_all().await.map_err(|e| StorageError::Other(e))?;
         drop(file);
         if let Some(tmp) = tmp {
+            // Create mode must never clobber a target that appeared while
+            // we were streaming (closes the check-then-rename TOCTOU for
+            // the common non-concurrent-writer case).
+            if matches!(mode, WriteMode::Create)
+                && tokio::fs::try_exists(&target)
+                    .await
+                    .map_err(|e| StorageError::Other(e))?
+            {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(StorageError::AlreadyExists(rel));
+            }
             tokio::fs::rename(&tmp, &target)
                 .await
                 .map_err(|e| StorageError::Other(e))?;
+            // Durability: fsync the parent directory so the rename itself
+            // survives a crash.
+            if let Some(parent) = target.parent() {
+                if let Ok(d) = tokio::fs::File::open(parent).await {
+                    let _ = d.sync_all().await;
+                }
+            }
         }
         let meta = tokio::fs::metadata(&target)
             .await
             .map_err(|e| StorageError::Other(e))?;
-        let rel = target
-            .strip_prefix(&target.parent().map(Path::to_path_buf).unwrap_or_default())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
         Ok(file_meta_at(&rel, &meta))
     }
 
@@ -421,5 +479,38 @@ mod tests {
         let storage = FsStorage::new(dir.path());
         assert!(storage.file_meta("../etc/passwd").await.is_err());
         assert!(storage.file_meta("/etc/passwd").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn committed_meta_has_full_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path());
+        let sink = storage
+            .write_stream("deep/nested/f.txt", WriteMode::Create)
+            .await
+            .unwrap();
+        let mut sink = sink;
+        sink.write(b"hi").await.unwrap();
+        let meta = sink.commit().await.unwrap();
+        assert_eq!(meta.path, "deep/nested/f.txt");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_symlink_traversal() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path());
+
+        // A symlink planted inside the root pointing outside it must not let
+        // reads/writes escape the mount root.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"top-secret").unwrap();
+        symlink(outside.path(), dir.path().join("evil")).unwrap();
+
+        assert!(storage.read_stream("evil/secret.txt", RangeSpec::full(10)).await.is_err());
+        assert!(storage.file_meta("evil/secret.txt").await.is_err());
+        assert!(storage.write_stream("evil/new.txt", WriteMode::Create).await.is_err());
     }
 }

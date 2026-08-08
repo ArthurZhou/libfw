@@ -3,15 +3,14 @@ rem ============================================================================
 rem  libfw - one-click dev-mode test launcher (Windows)
 rem
 rem   1. runs `cargo test --workspace`
-rem   2. starts the axum dev server on :8080 (token: dev-token)
-rem   3. serves the web demo from the repo root on :5173
-rem   4. opens the browser to the demo page
+rem   2. starts the axum dev server on :8080 (token: dev-token); it also serves
+rem      the web demo from the repo root (via --static), so no python is needed
+rem   3. opens the browser to the demo page
 rem
-rem  Requirements: cargo and python on PATH (python is only used to serve
-rem  the static web demo).
+rem  Requirement: cargo on PATH.
 rem
-rem  Usage: double-click this file. The two servers run in their own
-rem  windows; close them (or press any key here) when done.
+rem  Usage: double-click this file. The server runs in its own window; close
+rem  it (or press any key here) when done.
 rem ============================================================================
 
 setlocal
@@ -38,7 +37,7 @@ if not exist "sdk\pkg\libfw_client.js" (
 )
 
 echo.
-echo == 1/4 cargo test --workspace ==
+echo == 1/3 cargo test --workspace ==
 call cargo test --workspace
 if errorlevel 1 (
   echo.
@@ -48,32 +47,24 @@ if errorlevel 1 (
 )
 
 echo.
-echo == 2/4 starting axum dev server on :%PORT_API% ^(token: %TOKEN%^) ==
+echo == 2/3 starting axum dev server on :%PORT_API% ^(token: %TOKEN%^) ==
 if not exist "dev-data" mkdir "dev-data"
-start "libfw axum server" cmd /k "cargo run -p axum-server -- dev-data %PORT_API%"
+rem --static serves the web demo from the repo root (no python needed).
+start "libfw axum server" cmd /k "cargo run -p axum-server -- dev-data %PORT_API% --static %ROOT%"
 
 echo.
-echo == 3/4 serving web demo on :%PORT_WEB% ==
-where python >nul 2>nul
-if errorlevel 1 (
-  echo warning: python not found - serve "%ROOT%" manually ^(e.g. npx serve^).
-) else (
-  rem Serve from the repo ROOT so examples\web\index.html can import ..\..\sdk\.
-  start "libfw web demo" cmd /k "python -m http.server %PORT_WEB%"
-)
-
-echo.
-echo == 4/4 opening browser ==
-set "DEMO_URL=http://127.0.0.1:%PORT_WEB%/examples/web/index.html"
-timeout /t 2 /nobreak >nul
+echo == 3/3 opening browser ==
+set "DEMO_URL=http://127.0.0.1:%PORT_API%/examples/web/index.html"
+timeout /t 3 /nobreak >nul
 start "" "%DEMO_URL%"
 
 echo.
-echo == dev servers running ==
+echo == dev server running ==
 echo   demo page : %DEMO_URL%
 echo   server API: http://127.0.0.1:%PORT_API%   ^(token: %TOKEN%^)
+echo   health     : http://127.0.0.1:%PORT_API%/health
 echo.
-echo The servers run in their own windows. Close them when done.
+echo The server runs in its own window. Close it when done.
 echo.
 pause
 endlocal

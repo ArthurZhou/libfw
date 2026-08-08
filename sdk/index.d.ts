@@ -95,6 +95,16 @@ export declare class LibfwClient {
   downloadFolder(token: string, dirPath?: string): Promise<number>;
 
   /**
+   * Download a single file from the server at `filePath` into a user-selected
+   * local directory.
+   *
+   * @param token bearer token
+   * @param filePath virtual server path of the file to download
+   * @returns total bytes written
+   */
+  downloadFile(token: string, filePath: string): Promise<number>;
+
+  /**
    * Upload files to the server.
    *
    * `files` may be a `FileList`, `File[]`, or `UploadEntry[]`. When omitted,

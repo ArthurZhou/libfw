@@ -51,11 +51,15 @@ pub use storage::{FsStorage, FsSink};
 
 use std::sync::Arc;
 
+use axum::extract::Request;
+use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::Router;
 use libfw_core::auth::{AuthError, TokenVerifier, Validator};
 use libfw_core::compress::CompressionFormat;
 use libfw_core::storage::StorageBackend;
-use libfw_core::DEFAULT_MAX_UPLOAD_SIZE;
+use libfw_core::{protocol_compatible, protocol_header_value, DEFAULT_MAX_UPLOAD_SIZE, HEADER_PROTOCOL};
 pub use libfw_core::{HEADER_COMPRESS, HEADER_FILE_META, HEADER_OFFSET};
 
 /// Immutable server configuration shared by all handlers.
@@ -153,6 +157,32 @@ impl ServerStateBuilder {
     }
 }
 
+/// Reject requests that explicitly advertise an incompatible protocol
+/// version with `426 Upgrade Required`.
+///
+/// Requests *without* the handshake header are allowed, so raw HTTP clients
+/// (curl, tests, older builds) keep working; the WASM/SDK client always
+/// sends the header so it is guaranteed to be matched with this server.
+async fn validate_protocol(req: Request, next: Next) -> Response {
+    if let Some(value) = req
+        .headers()
+        .get(HEADER_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+    {
+        if !protocol_compatible(value) {
+            return (
+                StatusCode::UPGRADE_REQUIRED,
+                format!(
+                    "unsupported protocol `{value}`; expected `{}`",
+                    protocol_header_value()
+                ),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
 /// Build the axum router with the libfw routes mounted.
 ///
 /// Routes:
@@ -161,13 +191,18 @@ impl ServerStateBuilder {
 /// - `POST /file/{*path}` — streaming upload (headers: `x-libfw-file-meta`,
 ///   optional `x-libfw-offset`, optional `x-libfw-compress`)
 /// - `GET  /dir/{*path}`  — directory listing (JSON)
+///
+/// All routes first pass through [`validate_protocol`], which enforces the
+/// `x-libfw-protocol` handshake shared with the WASM client.
 pub fn router(state: Arc<ServerState>) -> Router {
     use axum::routing::{get, post};
 
     Router::new()
         .route("/file/{*path}", get(handlers::download).head(handlers::head_file))
         .route("/file/{*path}", post(handlers::upload))
+        .route("/dir", get(handlers::list_dir_root))
         .route("/dir/{*path}", get(handlers::list_dir))
+        .layer(axum::middleware::from_fn(validate_protocol))
         .with_state(state)
 }
 

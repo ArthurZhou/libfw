@@ -174,12 +174,11 @@ async fn upload_file(
                     &state_json(end, &file.to_meta().etag, file.size),
                 )
                 .await?;
-            callbacks.on_progress(control.done_bytes(), control.total_bytes())?;
         }
         break 'file;
     }
 
-    callbacks.on_file_completed(&file.path)?;
+    callbacks.on_file_completed(&file.path).await?;
     Ok(uploaded_total)
 }
 
@@ -222,7 +221,8 @@ pub async fn upload(
     let mut done = 0u64;
     while let Some(result) = stream.next().await {
         done = done.saturating_add(result?);
-        callbacks.on_progress(done, total)?;
+        // Single source of truth for progress is the shared control block.
+        callbacks.on_progress(control.done_bytes(), control.total_bytes())?;
     }
     Ok(done)
 }

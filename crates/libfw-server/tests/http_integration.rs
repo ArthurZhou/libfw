@@ -374,3 +374,99 @@ async fn duplicate_upload_without_offset_conflicts() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
+
+#[tokio::test]
+async fn upload_exceeding_declared_size_is_rejected_and_not_committed() {
+    let app = app(DevVerifier);
+    // Declare a 2-byte file but send 5 bytes → must be rejected (400) and
+    // leave no partial target on disk.
+    let meta = libfw_core::metadata::FileMeta::new("oversize.txt", 2, 0);
+    let mut headers = auth_header("tok");
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/oversize.txt", headers, Body::from(b"12345".to_vec())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .oneshot(request("GET", "/file/oversize.txt", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn wrong_protocol_version_is_426() {
+    let app = app(DevVerifier);
+    let mut headers = auth_header("tok");
+    headers.insert(
+        libfw_core::HEADER_PROTOCOL,
+        HeaderValue::from_static("libfw/999"),
+    );
+    let resp = app
+        .oneshot(request("GET", "/file/x.txt", headers, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED);
+}
+
+#[tokio::test]
+async fn matching_protocol_version_is_accepted() {
+    let app = app(DevVerifier);
+    let mut headers = auth_header("tok");
+    headers.insert(
+        libfw_core::HEADER_PROTOCOL,
+        HeaderValue::from_static("libfw/1"),
+    );
+    // Auth + protocol pass; a missing file then yields 404 (not 426/401/403).
+    let resp = app
+        .oneshot(request("GET", "/file/missing.txt", headers, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn absent_protocol_header_is_tolerated() {
+    let app = app(DevVerifier);
+    // Raw clients that don't advertise a version still work.
+    let resp = app
+        .oneshot(request("GET", "/file/missing.txt", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn root_listing_is_reachable_via_dir() {
+    let app = app(DevVerifier);
+    let meta = libfw_core::metadata::FileMeta::new("root.txt", 2, 0);
+    let mut headers = auth_header("tok");
+    headers.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    app.clone()
+        .oneshot(request("POST", "/file/root.txt", headers, Body::from(b"hi".to_vec())))
+        .await
+        .unwrap();
+
+    // The wildcard route `/dir/{*path}` does not match bare `/dir`, so the
+    // root listing must be served explicitly (the WASM client uses `/dir`).
+    let resp = app
+        .oneshot(request("GET", "/dir", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(body.contains("root.txt"), "root listing: {body}");
+}
+
+#[tokio::test]
+async fn listing_missing_dir_is_404_not_500() {
+    let app = app(DevVerifier);
+    let resp = app
+        .oneshot(request("GET", "/dir/does-not-exist", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

@@ -51,7 +51,11 @@ pub fn parse_range_header(header: &str) -> Result<Option<ParsedRange>, RangePars
         let end = if end_s.is_empty() {
             u64::MAX
         } else {
-            parse_u64(end_s)? + 1 // inclusive → exclusive
+            // Inclusive → exclusive end. Guard against overflow on the
+            // largest u64 value instead of panicking (debug) / wrapping.
+            parse_u64(end_s)?
+                .checked_add(1)
+                .ok_or(RangeParseError::Malformed)?
         };
         if end <= start {
             return Err(RangeParseError::Malformed);
@@ -143,6 +147,15 @@ mod tests {
         assert_eq!(parse_range_header("bytes=abc"), Err(RangeParseError::Malformed));
         assert_eq!(parse_range_header("bytes=5-2"), Err(RangeParseError::Malformed));
         assert_eq!(parse_range_header("bytes=-"), Err(RangeParseError::Malformed));
+    }
+
+    #[test]
+    fn rejects_overflowing_end_instead_of_panicking() {
+        // u64::MAX + 1 must not overflow/panic; it is treated as malformed.
+        assert_eq!(
+            parse_range_header("bytes=0-18446744073709551615"),
+            Err(RangeParseError::Malformed)
+        );
     }
 
     #[test]
