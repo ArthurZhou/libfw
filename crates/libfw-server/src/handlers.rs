@@ -5,28 +5,32 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use libfw_core::auth::{Action, AuthError};
 use libfw_core::claims::TokenClaims;
-use libfw_core::compress::{decompressor_with_limit, CompressionFormat, Compressor, MAX_FRAME_OUTPUT};
-use libfw_core::metadata::{decode_file_meta_header, FileMeta};
+use libfw_core::compress::{
+    CompressionFormat, Compressor, MAX_FRAME_OUTPUT, decompressor_with_limit,
+};
+use libfw_core::metadata::{FileMeta, decode_file_meta_header};
 use libfw_core::storage::{UploadSink, WriteMode};
-use libfw_core::{RangeSpec, StorageError, STREAM_BUF_SIZE};
+use libfw_core::{RangeSpec, STREAM_BUF_SIZE, StorageError};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::auth::{AuthRejection, BearerClaims};
 use crate::http::{
-    content_range_none_value, content_range_value, etag_matches_if_none_match, if_range_matches,
-    parse_range_header, ParsedRange,
+    ParsedRange, content_range_none_value, content_range_value, etag_matches_if_none_match,
+    if_range_matches, parse_range_header,
 };
-use crate::{validate_rel_path, ServerState, HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET};
+use crate::{
+    HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET, ServerState, validate_rel_path,
+};
 
 /// Errors surfaced by handlers, mapped to HTTP responses.
 #[derive(Debug, thiserror::Error)]
@@ -97,6 +101,9 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
+            ApiError::Storage(StorageError::Unsupported(msg)) => {
+                return (StatusCode::BAD_REQUEST, msg.to_string()).into_response();
+            }
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg),
@@ -104,9 +111,10 @@ impl IntoResponse for ApiError {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("upload exceeds limit of {limit} bytes"),
             ),
-            ApiError::RangeMalformed => {
-                (StatusCode::BAD_REQUEST, "malformed range header".to_string())
-            }
+            ApiError::RangeMalformed => (
+                StatusCode::BAD_REQUEST,
+                "malformed range header".to_string(),
+            ),
             ApiError::Storage(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             ApiError::Io(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         }
@@ -206,7 +214,10 @@ async fn plan_download(
 
     let mut headers = vec![
         (header::ACCEPT_RANGES.as_str(), "bytes".to_string()),
-        (header::CONTENT_TYPE.as_str(), "application/octet-stream".to_string()),
+        (
+            header::CONTENT_TYPE.as_str(),
+            "application/octet-stream".to_string(),
+        ),
         (header::ETAG.as_str(), meta.etag),
         (HEADER_COMPRESS, format.as_str().to_string()),
     ];
@@ -240,10 +251,7 @@ fn negotiate_download_format(state: &ServerState, req_headers: &HeaderMap) -> Co
     let wants_zrip = req_headers
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(',')
-                .any(|e| e.trim().eq_ignore_ascii_case("zrip"))
-        })
+        .map(|v| v.split(',').any(|e| e.trim().eq_ignore_ascii_case("zrip")))
         .unwrap_or(false);
     if wants_zrip && state.compression == CompressionFormat::Zrip {
         CompressionFormat::Zrip
@@ -267,7 +275,9 @@ pub(crate) async fn download(
     for (name, value) in plan.headers {
         builder = builder.header(name, value);
     }
-    Ok(builder.body(Body::from_stream(stream)).expect("valid response"))
+    Ok(builder
+        .body(Body::from_stream(stream))
+        .expect("valid response"))
 }
 
 pub(crate) async fn head_file(
@@ -394,8 +404,15 @@ pub(crate) async fn upload(
                 .map_err(|e| ApiError::BadRequest(format!("compressed stream invalid: {e}")))?;
             let data = std::mem::take(&mut out);
             if !data.is_empty() {
-                write_batch(&mut sink, &state, resume_offset, meta.size, &mut appended, &data)
-                    .await?;
+                write_batch(
+                    &mut sink,
+                    &state,
+                    resume_offset,
+                    meta.size,
+                    &mut appended,
+                    &data,
+                )
+                .await?;
             }
         }
         // Flush any final decompressed frames.
@@ -403,7 +420,15 @@ pub(crate) async fn upload(
             .finish(&mut out)
             .map_err(|e| ApiError::BadRequest(format!("compressed stream truncated: {e}")))?;
         if !out.is_empty() {
-            write_batch(&mut sink, &state, resume_offset, meta.size, &mut appended, &out).await?;
+            write_batch(
+                &mut sink,
+                &state,
+                resume_offset,
+                meta.size,
+                &mut appended,
+                &out,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -479,7 +504,10 @@ fn reader_stream(reader: Box<dyn Read + Send>) -> BoxStream<'static, Result<Byte
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if tx.blocking_send(Ok(Bytes::copy_from_slice(&buf[..n]))).is_err() {
+                    if tx
+                        .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
                         break; // consumer dropped
                     }
                 }
@@ -526,7 +554,7 @@ where
                                 return Poll::Ready(Some(Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
                                     e,
-                                ))))
+                                ))));
                             }
                         }
                     }
@@ -548,7 +576,7 @@ where
                             return Poll::Ready(Some(Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 e,
-                            ))))
+                            ))));
                         }
                     }
                 }
