@@ -70,6 +70,15 @@ export interface LibfwClientOptions {
    * automatically for both ESM and classic-`<script>`/UMD consumers.
    */
   wasmUrl?: string;
+  /**
+   * How downloads reach the user's disk.
+   *
+   * - `'fs'` — File System Access API (`showDirectoryPicker`), streaming to disk.
+   * - `'browser'` — buffer each file, then trigger a traditional browser
+   *   download; folders are packed into a `.zip` archive.
+   * - `'auto'` (default) — `'fs'` when the API exists, else `'browser'`.
+   */
+  downloadMode?: 'auto' | 'fs' | 'browser';
   /** Optional progress/state listener. */
   onEvent?: (event: LibfwEvent) => void;
 }

@@ -4,7 +4,10 @@
  * A thin, dependency-free wrapper around the libfw WASM engine that owns:
  *  - WASM instantiation (via the wasm-bindgen `web` glue),
  *  - the File System Access API (`showDirectoryPicker`, `getFileHandle`,
- *    `createWritable`),
+ *    `createWritable`) for streaming downloads,
+ *  - a traditional browser-download fallback when the File System Access API
+ *    is unavailable: single files download directly, folders are packed into
+ *    a `.zip` archive (see `downloadMode`),
  *  - IndexedDB resume-state persistence,
  *  - converting engine callbacks (`onWriteChunk`, `getFileList`, …) into
  *    real file I/O.
@@ -16,6 +19,7 @@
  */
 
 import init, { LibfwClient as WasmEngine } from './pkg/libfw_client.js';
+import { createZip } from './zip.js';
 
 /** Database / store names used by the IndexedDB resume-state layer. */
 const IDB_NAME = 'libfw';
@@ -194,6 +198,11 @@ export class LibfwClient {
    * @param {string} [options.wasmUrl] explicit URL of `libfw_client_bg.wasm`;
    *        when omitted it is resolved automatically for both ESM and
    *        classic-`<script>`/UMD consumers (see {@link LibfwClient#_wasmUrl})
+   * @param {'auto'|'fs'|'browser'} [options.downloadMode='auto'] how downloads
+   *        reach the user's disk: `'fs'` uses the File System Access API
+   *        (`showDirectoryPicker`); `'browser'` buffers each file and triggers
+   *        a traditional browser download (folders are packed into a `.zip`);
+   *        `'auto'` picks `'fs'` when the API exists, otherwise `'browser'`.
    * @param {(event: {type: string, done: number, total: number, path?: string, error?: string}) => void} [options.onEvent]
    *        optional progress/state listener
    */
@@ -208,6 +217,7 @@ export class LibfwClient {
       maxRetryDelayMs: 30000,
       timeoutMs: 60000,
       wasmUrl: null,
+      downloadMode: 'auto',
       onEvent: null,
       ...options,
     };
@@ -225,6 +235,11 @@ export class LibfwClient {
     this._uploadFiles = new Map();
     /** @type {Array<{path:string,size:number,mtime:number}>} upload plan */
     this._uploadPlan = [];
+    /**
+     * Active browser-download fallback state, or `null`.
+     * @type {{isFolder:boolean, buffers:Map<string,Uint8Array[]>, order:string[], sizes:Map<string,number>}|null}
+     */
+    this._fallback = null;
   }
 
   // ------------------------------------------------------------------ setup
@@ -294,7 +309,10 @@ export class LibfwClient {
    */
   _makeCallbacks() {
     return {
-      onFileStart: (path, size) => this._emit({ type: 'fileStart', path, done: 0, total: size }),
+      onFileStart: (path, size) => {
+        if (this._fallback) this._fallback.sizes.set(path, size);
+        this._emit({ type: 'fileStart', path, done: 0, total: size });
+      },
       onWriteChunk: (path, offset, data) => this._onWriteChunk(path, offset, data),
       onFileCompleted: (path) => this._onFileCompleted(path),
       onProgress: (done, total) => this._emit({ type: 'progress', done, total }),
@@ -319,25 +337,54 @@ export class LibfwClient {
     }
   }
 
+  /**
+   * Whether the File System Access API is available in this browser.
+   * @returns {boolean}
+   * @private
+   */
+  _supportsFsAccess() {
+    return (
+      typeof window !== 'undefined' &&
+      typeof window.showDirectoryPicker === 'function' &&
+      typeof FileSystemFileHandle !== 'undefined' &&
+      typeof FileSystemDirectoryHandle !== 'undefined'
+    );
+  }
+
+  /**
+   * Resolve the effective download mode from the `downloadMode` option:
+   * an explicit `'fs'`/`'browser'` wins; `'auto'` falls back to the browser
+   * download when the File System Access API is missing.
+   * @returns {'fs'|'browser'}
+   * @private
+   */
+  _effectiveMode() {
+    const mode = this._options.downloadMode || 'auto';
+    if (mode === 'fs' || mode === 'browser') return mode;
+    return this._supportsFsAccess() ? 'fs' : 'browser';
+  }
+
   // ------------------------------------------------------------ downloads
 
   /**
-   * Download a whole folder from the server into a local directory chosen
-   * by the user via `showDirectoryPicker()`.
+   * Download a whole folder from the server.
    *
-   * Folder structure (including nested directories) is preserved; bytes are
-   * streamed to disk through a single `createWritable()` per file (append
-   * writes, atomically committed on `close()`).
+   * With the File System Access API available the folder is streamed into a
+   * user-selected local directory (`showDirectoryPicker`), preserving the
+   * structure through one `createWritable()` per file. Without FS API (or
+   * with `downloadMode: 'browser'`) the folder is buffered in memory, packed
+   * into a `.zip` and saved via a traditional browser download — no manual
+   * feature detection needed by the caller.
    *
    * @param {string} token bearer token
    * @param {string} [dirPath=''] virtual server path to download (root by default)
-   * @returns {Promise<number>} total bytes written
+   * @returns {Promise<number>} total bytes transferred
    * @throws {LibfwError}
    */
   async downloadFolder(token, dirPath = '') {
     const engine = await this._ready();
-    if (typeof window === 'undefined' || typeof window.showDirectoryPicker !== 'function') {
-      throw new LibfwError('File System Access API is not available in this browser', 'unsupported');
+    if (this._effectiveMode() === 'browser') {
+      return this._downloadViaBrowser(engine, token, dirPath, true);
     }
     this._dirHandle = await window.showDirectoryPicker();
     this._fileHandles.clear();
@@ -351,20 +398,24 @@ export class LibfwClient {
   }
 
   /**
-   * Download a single file from the server at `filePath` into a local
-   * directory chosen via `showDirectoryPicker()`.
+   * Download a single file from the server at `filePath`.
+   *
+   * With the File System Access API available the file is streamed into the
+   * directory chosen via `showDirectoryPicker()`. Without FS API (or with
+   * `downloadMode: 'browser'`) the file is buffered and saved through a
+   * traditional browser download.
    *
    * @param {string} token bearer token
    * @param {string} filePath virtual server path of the file to download
-   * @returns {Promise<number>} total bytes written
+   * @returns {Promise<number>} total bytes transferred
    * @throws {LibfwError}
    */
   async downloadFile(token, filePath) {
     const engine = await this._ready();
-    if (typeof window === 'undefined' || typeof window.showDirectoryPicker !== 'function') {
-      throw new LibfwError('File System Access API is not available in this browser', 'unsupported');
-    }
     if (!filePath) throw new LibfwError('downloadFile requires a file path', 'path');
+    if (this._effectiveMode() === 'browser') {
+      return this._downloadViaBrowser(engine, token, filePath, false);
+    }
     this._dirHandle = await window.showDirectoryPicker();
     this._fileHandles.clear();
     try {
@@ -374,6 +425,123 @@ export class LibfwClient {
     } finally {
       await this._flushWritables();
     }
+  }
+
+  /**
+   * Buffer-chunk fallback download used when the File System Access API is
+   * unavailable (or `downloadMode: 'browser'`).
+   *
+   * `onWriteChunk` chunks are collected per path in memory (the engine keeps
+   * calling them in order). When the transfer finishes: a single file is
+   * emitted as a `Blob` and saved via a normal browser download; a folder is
+   * packed into a `.zip` (STORE method) and downloaded. Progress/state events
+   * keep flowing as usual. Note this buffers the whole transfer in memory —
+   * the cost of not having FS API to stream to disk.
+   *
+   * @param {WasmEngine} engine
+   * @param {string} token
+   * @param {string} path virtual path
+   * @param {boolean} isFolder
+   * @returns {Promise<number>} total bytes transferred
+   * @private
+   */
+  async _downloadViaBrowser(engine, token, path, isFolder) {
+    this._fallback = { isFolder, buffers: new Map(), order: [], sizes: new Map() };
+    try {
+      const total = isFolder
+        ? await engine.download_folder(this._options.baseUrl, token, path)
+        : await engine.download_file(this._options.baseUrl, token, path);
+      const { buffers, order, sizes } = this._fallback;
+      if (isFolder) {
+        const entries = [];
+        for (const p of order) {
+          entries.push({ name: this._cleanPath(p), data: this._concatBuffers(buffers.get(p) || []) });
+        }
+        // Include files that were announced but produced no bytes (empty).
+        for (const p of sizes.keys()) {
+          if (!buffers.has(p)) entries.push({ name: this._cleanPath(p), data: new Uint8Array(0) });
+        }
+        this._triggerBrowserDownload(createZip(entries), this._archiveName(path));
+      } else {
+        const data = this._concatBuffers(buffers.get(path) || []);
+        this._triggerBrowserDownload(new Blob([data], { type: 'application/octet-stream' }), this._downloadName(path));
+      }
+      return total;
+    } catch (err) {
+      throw toLibfwError(err);
+    } finally {
+      this._fallback = null;
+    }
+  }
+
+  /**
+   * Concatenate buffered chunks into one `Uint8Array`.
+   * @param {Uint8Array[]} bufs
+   * @returns {Uint8Array}
+   * @private
+   */
+  _concatBuffers(bufs) {
+    if (bufs.length === 0) return new Uint8Array(0);
+    if (bufs.length === 1) return bufs[0];
+    const len = bufs.reduce((n, b) => n + b.length, 0);
+    const out = new Uint8Array(len);
+    let off = 0;
+    for (const b of bufs) {
+      out.set(b, off);
+      off += b.length;
+    }
+    return out;
+  }
+
+  /**
+   * Strip a leading `/` so an entry path is archive/OS friendly.
+   * @param {string} path
+   * @returns {string}
+   * @private
+   */
+  _cleanPath(path) {
+    return String(path).replace(/^\/+/, '');
+  }
+
+  /**
+   * Derive a safe file name from a virtual path.
+   * @param {string} path
+   * @returns {string}
+   * @private
+   */
+  _downloadName(path) {
+    const name = this._cleanPath(path).split('/').pop();
+    return name || 'download';
+  }
+
+  /**
+   * Derive the `.zip` archive name for a folder download.
+   * @param {string} path
+   * @returns {string}
+   * @private
+   */
+  _archiveName(path) {
+    const base = this._cleanPath(path).split('/').pop() || 'download';
+    return `${base.replace(/[^\w.\- ]+/g, '_') || 'download'}.zip`;
+  }
+
+  /**
+   * Trigger a traditional browser download via a temporary `<a download>`.
+   * @param {Blob} blob
+   * @param {string} filename
+   * @returns {void}
+   * @private
+   */
+  _triggerBrowserDownload(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Revoke once the download has had a chance to start.
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
   }
 
   /**
@@ -396,6 +564,18 @@ export class LibfwClient {
    * @private
    */
   async _onWriteChunk(path, offset, data) {
+    if (this._fallback) {
+      // Browser-download fallback: collect chunks in memory instead of
+      // streaming to disk. Chunks arrive in order, so a plain append works.
+      let bufs = this._fallback.buffers.get(path);
+      if (!bufs) {
+        bufs = [];
+        this._fallback.buffers.set(path, bufs);
+        this._fallback.order.push(path);
+      }
+      bufs.push(data);
+      return;
+    }
     let entry = this._writables.get(path);
     if (!entry) {
       const { dir, name, handle } = await this._ensureFileHandle(path);
@@ -424,6 +604,11 @@ export class LibfwClient {
    * @private
    */
   async _onFileCompleted(path) {
+    if (this._fallback) {
+      // Nothing is open to flush in browser-download mode.
+      this._emit({ type: 'fileCompleted', path });
+      return;
+    }
     await this._closeWritable(path);
     this._emit({ type: 'fileCompleted', path });
   }
