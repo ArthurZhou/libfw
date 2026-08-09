@@ -28,6 +28,14 @@ pub const HEADER_FILE_META: &str = "x-libfw-file-meta";
 /// HTTP header carrying the byte offset to resume an interrupted upload.
 pub const HEADER_OFFSET: &str = "x-libfw-offset";
 
+/// HTTP header marking an upload request as the FINAL chunk of a file.
+///
+/// When present (value `1`/`true`), the server verifies that the resulting
+/// file size equals the declared `x-libfw-file-meta` size before committing,
+/// so a client cannot commit a truncated file. Absent (older clients) skips
+/// the check — the header is optional and backward compatible.
+pub const HEADER_FINAL: &str = "x-libfw-final";
+
 /// HTTP header carrying the (optional) transfer version handshake.
 pub const HEADER_PROTOCOL: &str = "x-libfw-protocol";
 

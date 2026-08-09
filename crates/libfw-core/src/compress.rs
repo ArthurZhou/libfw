@@ -79,6 +79,17 @@ pub const MAX_FRAME_OUTPUT: usize = CHUNK_SIZE as usize;
 /// compresses to ≈ chunk size + framing overhead, hence the slack.
 pub const MAX_PENDING_FRAME: usize = CHUNK_SIZE as usize + STREAM_BUF_SIZE;
 
+/// Default cap on the total bytes a single [`Decompressor::decompress`] call
+/// may append to the output buffer.
+///
+/// A hostile peer could otherwise send many *small* frames in one network
+/// chunk, each expanding to [`MAX_FRAME_OUTPUT`] — inflating memory by a
+/// large factor before the caller drains the buffer. The default (a handful
+/// of frames) keeps the transient peak bounded while comfortably allowing
+/// legitimate coalesced reads (e.g. a browser delivering several 64 KiB
+/// download frames at once).
+pub const MAX_OUTPUT_PER_CALL: usize = MAX_FRAME_OUTPUT.saturating_mul(8);
+
 /// Default zrip compression level (Fast strategy, good for network transfer).
 pub const ZRIP_DEFAULT_LEVEL: i32 = 1;
 
@@ -130,9 +141,22 @@ pub fn compressor(format: CompressionFormat) -> Result<Box<dyn Compressor>, Comp
 
 /// Construct a decompressor for `format`.
 pub fn decompressor(format: CompressionFormat) -> Box<dyn Decompressor> {
+    decompressor_with_limit(format, MAX_OUTPUT_PER_CALL)
+}
+
+/// Construct a decompressor for `format` with an explicit per-call output
+/// budget (bytes a single [`Decompressor::decompress`] call may append).
+///
+/// Use a tight budget (e.g. [`MAX_FRAME_OUTPUT`]) on the server where the
+/// peer is potentially hostile; use the default generous budget on the
+/// client so coalesced multi-frame reads are never rejected.
+pub fn decompressor_with_limit(
+    format: CompressionFormat,
+    max_output_per_call: usize,
+) -> Box<dyn Decompressor> {
     match format {
         CompressionFormat::None => Box::new(PassthroughDecompressor),
-        CompressionFormat::Zrip => Box::new(ZripDecompressor::new()),
+        CompressionFormat::Zrip => Box::new(ZripDecompressor::with_max_output(max_output_per_call)),
     }
 }
 
@@ -235,19 +259,31 @@ pub struct ZripDecompressor {
     /// Compressed bytes not yet turned into complete frames.
     pending: Vec<u8>,
     finished: bool,
+    /// Hard cap on the total bytes appended to `out` during a single
+    /// [`Decompressor::decompress`] / [`Decompressor::finish`] call.
+    max_output_per_call: usize,
 }
 
 impl ZripDecompressor {
-    /// Create a decompressor.
+    /// Create a decompressor with the default per-call output budget
+    /// ([`MAX_OUTPUT_PER_CALL`]).
     pub fn new() -> Self {
+        ZripDecompressor::with_max_output(MAX_OUTPUT_PER_CALL)
+    }
+
+    /// Create a decompressor with an explicit per-call output budget.
+    pub fn with_max_output(max_output_per_call: usize) -> Self {
         ZripDecompressor {
             pending: Vec::with_capacity(STREAM_BUF_SIZE),
             finished: false,
+            max_output_per_call,
         }
     }
 
-    /// Decode as many complete frames as `pending` holds.
-    fn drain_frames(&mut self, out: &mut Vec<u8>) -> Result<(), DecompressError> {
+    /// Decode as many complete frames as `pending` holds, appending at most
+    /// `max_add` bytes to `out` across the whole call.
+    fn drain_frames(&mut self, out: &mut Vec<u8>, max_add: usize) -> Result<(), DecompressError> {
+        let mut added = 0usize;
         loop {
             let boundary = frame_boundary(&self.pending);
             match boundary {
@@ -266,7 +302,13 @@ impl ZripDecompressor {
                             ))
                         })?
                     };
+                    // Enforce the per-call budget *before* appending so the
+                    // memory spike of a multi-frame bomb never materializes.
+                    if added.saturating_add(decoded.len()) > max_add {
+                        return Err(DecompressError::TooLarge { limit: max_add });
+                    }
                     out.extend_from_slice(&decoded);
+                    added = added.saturating_add(decoded.len());
                     self.pending.drain(..len);
                 }
                 FrameBoundary::Incomplete => return Ok(()),
@@ -301,7 +343,7 @@ impl Decompressor for ZripDecompressor {
         if !input.is_empty() {
             self.pending.extend_from_slice(input);
         }
-        self.drain_frames(out)?;
+        self.drain_frames(out, self.max_output_per_call)?;
         if self.pending.len() > MAX_PENDING_FRAME {
             return Err(DecompressError::TooLarge {
                 limit: MAX_PENDING_FRAME,
@@ -315,7 +357,7 @@ impl Decompressor for ZripDecompressor {
             return Ok(());
         }
         self.finished = true;
-        self.drain_frames(out)?;
+        self.drain_frames(out, self.max_output_per_call)?;
         if !self.pending.is_empty() {
             return Err(DecompressError::Truncated(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -599,6 +641,47 @@ mod tests {
         let mut plain = Vec::new();
         let err = d.decompress(b"this is not a zstd frame at all", &mut plain);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn per_call_output_budget_rejects_multi_frame_bomb() {
+        // A hostile peer delivers many small frames in ONE decompress() call;
+        // the cumulative decoded output must trip the per-call budget instead
+        // of ballooning memory.
+        let mut compressed = Vec::new();
+        for _ in 0..64 {
+            let mut c = ZripCompressor::new(ZRIP_DEFAULT_LEVEL).unwrap();
+            c.compress(&vec![7u8; STREAM_BUF_SIZE], &mut compressed)
+                .unwrap();
+            c.finish(&mut compressed).unwrap();
+        }
+        let mut d = ZripDecompressor::with_max_output(MAX_FRAME_OUTPUT);
+        let mut plain = Vec::new();
+        let err = d.decompress(&compressed, &mut plain);
+        assert!(
+            matches!(err, Err(DecompressError::TooLarge { .. })),
+            "expected TooLarge, got {err:?}"
+        );
+        // The buffer must not have been inflated past the budget.
+        assert!(plain.len() <= MAX_FRAME_OUTPUT);
+    }
+
+    #[test]
+    fn generous_default_budget_allows_coalesced_frames() {
+        // Several small frames in one call are fine under the default budget
+        // (what a browser may hand the client's decompressor).
+        let mut compressed = Vec::new();
+        for _ in 0..8 {
+            let mut c = ZripCompressor::new(ZRIP_DEFAULT_LEVEL).unwrap();
+            c.compress(&vec![7u8; STREAM_BUF_SIZE], &mut compressed)
+                .unwrap();
+            c.finish(&mut compressed).unwrap();
+        }
+        let mut d = ZripDecompressor::new();
+        let mut plain = Vec::new();
+        d.decompress(&compressed, &mut plain).unwrap();
+        d.finish(&mut plain).unwrap();
+        assert_eq!(plain.len(), 8 * STREAM_BUF_SIZE);
     }
 
     #[test]

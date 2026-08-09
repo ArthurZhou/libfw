@@ -60,7 +60,7 @@ use libfw_core::auth::{AuthError, TokenVerifier, Validator};
 use libfw_core::compress::CompressionFormat;
 use libfw_core::storage::StorageBackend;
 use libfw_core::{protocol_compatible, protocol_header_value, DEFAULT_MAX_UPLOAD_SIZE, HEADER_PROTOCOL};
-pub use libfw_core::{HEADER_COMPRESS, HEADER_FILE_META, HEADER_OFFSET};
+pub use libfw_core::{HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET};
 
 /// Immutable server configuration shared by all handlers.
 pub struct ServerState {

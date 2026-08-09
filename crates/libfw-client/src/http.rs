@@ -29,24 +29,46 @@ pub fn request(
         .map_err(|e| LibfwError::Network(format!("failed to build request for `{url}`: {e:?}")))
 }
 
-/// Perform a `fetch` and return the `Response`.
-pub async fn fetch(request: &Request) -> Result<Response, LibfwError> {
+/// Perform a `fetch` and return the `Response`, aborting after `timeout_ms`.
+pub async fn fetch(request: &Request, timeout_ms: u32) -> Result<Response, LibfwError> {
     let window = web_sys::window()
         .ok_or_else(|| LibfwError::Js("no window available".into()))?;
     let promise = window.fetch_with_request(request);
-    let value = JsFuture::from(promise)
+    let value = JsFuture::from(with_timeout(promise, timeout_ms))
         .await
         .map_err(|e| LibfwError::Network(format!("fetch failed: {}", js_value_string(&e))))?;
     Ok(value.unchecked_into())
 }
 
+/// Race a promise against a timer that rejects after `ms` (0 disables).
+///
+/// Enforces the client's per-request / per-read timeout so a hung peer
+/// cannot stall a transfer forever (an `AbortController`-style guard without
+/// an explicit signal object).
+fn with_timeout(promise: js_sys::Promise, ms: u32) -> js_sys::Promise {
+    if ms == 0 {
+        return promise;
+    }
+    let timer = js_sys::Promise::new(&mut |_resolve, reject| {
+        let window = web_sys::window().expect("window");
+        let f: &js_sys::Function = reject.unchecked_ref();
+        let err = js_sys::Error::new(&format!("libfw request timed out after {ms}ms"));
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_1(
+            f,
+            ms as i32,
+            &err.into(),
+        );
+    });
+    js_sys::Promise::race(&js_sys::Array::of2(&promise, &timer))
+}
+
 /// Read the entire response body into memory (used for small JSON payloads
 /// like directory listings).
-pub async fn read_all(resp: &Response) -> Result<Vec<u8>, LibfwError> {
+pub async fn read_all(resp: &Response, timeout_ms: u32) -> Result<Vec<u8>, LibfwError> {
     let promise = resp.array_buffer().map_err(|e| {
         LibfwError::Network(format!("arrayBuffer() failed: {}", js_value_string(&e)))
     })?;
-    let value = JsFuture::from(promise)
+    let value = JsFuture::from(with_timeout(promise, timeout_ms))
         .await
         .map_err(|e| LibfwError::Network(format!("body read failed: {}", js_value_string(&e))))?;
     let buf: js_sys::ArrayBuffer = value.unchecked_into();
@@ -59,7 +81,11 @@ pub async fn read_all(resp: &Response) -> Result<Vec<u8>, LibfwError> {
 ///
 /// The callback is async so transfers can pause/resume/cancel between
 /// chunks while yielding to the JS event loop.
-pub async fn stream_body<F, Fut>(resp: &Response, mut on_chunk: F) -> Result<(), LibfwError>
+pub async fn stream_body<F, Fut>(
+    resp: &Response,
+    timeout_ms: u32,
+    mut on_chunk: F,
+) -> Result<(), LibfwError>
 where
     F: FnMut(Vec<u8>) -> Fut,
     Fut: std::future::Future<Output = Result<(), LibfwError>>,
@@ -69,9 +95,13 @@ where
         .ok_or_else(|| LibfwError::Network("response has no body stream".into()))?;
     let reader: web_sys::ReadableStreamDefaultReader = body.get_reader().unchecked_into();
     loop {
-        let value = JsFuture::from(reader.read())
+        // A stalled body (peer stops sending) must also time out, not just
+        // the initial connection.
+        let value = JsFuture::from(with_timeout(reader.read(), timeout_ms))
             .await
-            .map_err(|e| LibfwError::Network(format!("body read failed: {}", js_value_string(&e))))?;
+            .map_err(|e| {
+                LibfwError::Network(format!("body read failed: {}", js_value_string(&e)))
+            })?;
         let obj: js_sys::Object = value.unchecked_into();
         let done = Reflect::get(&obj, &JsValue::from_str("done"))
             .map_err(|e| LibfwError::Network(format!("bad stream chunk: {e:?}")))?

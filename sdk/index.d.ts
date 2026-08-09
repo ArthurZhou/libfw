@@ -16,7 +16,8 @@ export type LibfwErrorCode =
   | 'decompress'
   | 'compress'
   | 'protocol'
-  | 'cancelled';
+  | 'cancelled'
+  | 'too-large';
 
 /** Uniform error type thrown by every SDK operation. */
 export declare class LibfwError extends Error {
@@ -79,6 +80,13 @@ export interface LibfwClientOptions {
    * - `'auto'` (default) — `'fs'` when the API exists, else `'browser'`.
    */
   downloadMode?: 'auto' | 'fs' | 'browser';
+  /**
+   * Memory cap (bytes) for the in-memory `'browser'` download fallback.
+   * File sizes are pre-checked against it before buffering; a download that
+   * would exceed it is rejected with a `too-large` error. `0` disables the
+   * limit. Default `536870912` (512 MiB).
+   */
+  maxFallbackBytes?: number;
   /** Optional progress/state listener. */
   onEvent?: (event: LibfwEvent) => void;
 }

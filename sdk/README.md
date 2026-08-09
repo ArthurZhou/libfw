@@ -78,6 +78,10 @@ dist/libfw-client.umd.js   UMD bundle (after build:umd)
     streams downloads through the File System Access API; `'browser'` buffers
     and triggers a traditional browser download (folders become `.zip`);
     `'auto'` uses `'fs'` when the API exists and falls back to `'browser'`.
+  - `maxFallbackBytes: number` (default `536870912`, 512 MiB) — memory cap
+    for the in-memory `'browser'` fallback. File sizes are pre-checked
+    against it before buffering; a download that would exceed it rejects
+    with a `too-large` `LibfwError` instead of risking an OOM. `0` disables.
 - `downloadFolder(token, dirPath?) → Promise<number>`
 - `downloadFile(token, filePath) → Promise<number>`
 - `upload(token, files?) → Promise<number>`

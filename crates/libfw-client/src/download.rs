@@ -24,23 +24,31 @@ use crate::state::TaskControl;
 
 /// A single file download outcome, used for resume-state bookkeeping.
 struct DownloadOutcome {
-    /// Final size observed from the server.
+    /// Final absolute size/offset observed from the server.
     size: u64,
-    /// Bytes actually written (decompressed).
-    written: u64,
 }
 
+/// Persist download progress roughly every this many bytes so an
+/// interrupted transfer can resume from a recent offset instead of
+/// restarting from byte 0.
+const RESUME_SAVE_EVERY: u64 = 4 * 1024 * 1024;
+
 /// List the immediate children of a virtual directory via `GET /dir/..`.
-async fn list_dir(base_url: &str, token: &str, path: &str) -> Result<Vec<DirEntry>, LibfwError> {
+async fn list_dir(
+    base_url: &str,
+    token: &str,
+    path: &str,
+    timeout_ms: u32,
+) -> Result<Vec<DirEntry>, LibfwError> {
     let headers = auth_headers(token, false)?;
     let url = dir_url(base_url, path);
     let req = request(&url, "GET", &headers, None)?;
-    let resp = fetch(&req).await?;
+    let resp = fetch(&req, timeout_ms).await?;
     let status = resp.status();
     if status != 200 {
         return Err(LibfwError::Http { status, url });
     }
-    let body = read_all(&resp).await?;
+    let body = read_all(&resp, timeout_ms).await?;
     serde_json::from_slice::<Vec<DirEntry>>(&body)
         .map_err(|e| LibfwError::Protocol(format!("bad listing JSON: {e}")))
 }
@@ -53,11 +61,12 @@ async fn collect_files(
     base_url: &str,
     token: &str,
     path: &str,
+    timeout_ms: u32,
 ) -> Result<Vec<FileEntry>, LibfwError> {
     let mut out = Vec::new();
     let mut stack = vec![path.to_string()];
     while let Some(dir) = stack.pop() {
-        for entry in list_dir(base_url, token, &dir).await? {
+        for entry in list_dir(base_url, token, &dir, timeout_ms).await? {
             if entry.is_dir {
                 stack.push(entry.path);
             } else {
@@ -134,12 +143,14 @@ async fn download_file(
         let url = file_url(base_url, &file.path);
         let req = request(&url, "GET", &headers, None)?;
 
-        match fetch(&req).await {
+        match fetch(&req, config.timeout_ms).await {
             Ok(resp) => match resp.status() {
                 200 => {
                     // Full content: the file changed (or first attempt).
                     etag = response_etag(&resp).unwrap_or(etag);
-                    let outcome = stream_download(&resp, file, callbacks, control, 0).await?;
+                    let outcome =
+                        stream_download(&resp, file, callbacks, control, 0, &etag, config.timeout_ms)
+                            .await?;
                     return finish_download(file, callbacks, etag, outcome).await;
                 }
                 206 => {
@@ -147,7 +158,16 @@ async fn download_file(
                         etag = response_etag(&resp).unwrap_or_default();
                     }
                     let start = content_range_start(&resp).unwrap_or(offset);
-                    let outcome = stream_download(&resp, file, callbacks, control, start).await?;
+                    let outcome = stream_download(
+                        &resp,
+                        file,
+                        callbacks,
+                        control,
+                        start,
+                        &etag,
+                        config.timeout_ms,
+                    )
+                    .await?;
                     return finish_download(file, callbacks, etag, outcome).await;
                 }
                 416 => {
@@ -176,12 +196,18 @@ async fn download_file(
 
 /// Stream a `200`/`206` response body, decompressing on the fly and
 /// pushing chunks to JS. `start` is the byte offset the body begins at.
+///
+/// Progress is persisted to the resume store every [`RESUME_SAVE_EVERY`]
+/// bytes (best-effort) so an interrupted transfer can resume from a recent
+/// offset; `finish_download` persists the final state on success.
 async fn stream_download(
     resp: &Response,
     file: &FileEntry,
     callbacks: &Callbacks,
     control: &TaskControl,
     start: u64,
+    etag: &str,
+    timeout_ms: u32,
 ) -> Result<DownloadOutcome, LibfwError> {
     // Decide the wire format from the response header (robust against a
     // server that did not honour our Accept-Encoding).
@@ -198,38 +224,53 @@ async fn stream_download(
     let decomp = Rc::new(RefCell::new(decompressor(format)));
     let out = Rc::new(RefCell::new(Vec::new()));
     let file_offset = Rc::new(Cell::new(start));
-    let stream_written = Rc::new(Cell::new(0u64));
+    let last_saved = Rc::new(Cell::new(0u64));
     let callbacks = callbacks.clone();
     let control = control.clone();
     let path = file.path.clone();
+    let etag = etag.to_string();
     let final_size = file.size;
 
-    stream_body(resp, |chunk| {
-        let decomp = decomp.clone();
-        let out = out.clone();
-        let file_offset = file_offset.clone();
-        let stream_written = stream_written.clone();
-        let callbacks = callbacks.clone();
-        let control = control.clone();
-        let path = path.clone();
-        async move {
-            control.wait_ready().await?;
-            control.check()?;
-            decomp
-                .borrow_mut()
-                .decompress(&chunk, &mut out.borrow_mut())
-                .map_err(|e| LibfwError::Decompress(e.to_string()))?;
-            let data = std::mem::take(&mut *out.borrow_mut());
-            if !data.is_empty() {
-                let offset = file_offset.get();
-                callbacks.on_write_chunk(&path, offset, &data).await?;
-                file_offset.set(offset.saturating_add(data.len() as u64));
-                stream_written.set(stream_written.get().saturating_add(data.len() as u64));
-                control.add_progress(data.len() as u64);
+    stream_body(
+        resp,
+        timeout_ms,
+        |chunk| {
+            let decomp = decomp.clone();
+            let out = out.clone();
+            let file_offset = file_offset.clone();
+            let last_saved = last_saved.clone();
+            let callbacks = callbacks.clone();
+            let control = control.clone();
+            let path = path.clone();
+            let etag = etag.clone();
+            async move {
+                control.wait_ready().await?;
+                control.check()?;
+                decomp
+                    .borrow_mut()
+                    .decompress(&chunk, &mut out.borrow_mut())
+                    .map_err(|e| LibfwError::Decompress(e.to_string()))?;
+                let data = std::mem::take(&mut *out.borrow_mut());
+                if !data.is_empty() {
+                    let offset = file_offset.get();
+                    callbacks.on_write_chunk(&path, offset, &data).await?;
+                    file_offset.set(offset.saturating_add(data.len() as u64));
+                    control.add_progress(data.len() as u64);
+
+                    // Persist an absolute resume offset every so often so a
+                    // crash mid-transfer can continue instead of restarting.
+                    let done = file_offset.get();
+                    if done >= last_saved.get().saturating_add(RESUME_SAVE_EVERY) {
+                        last_saved.set(done);
+                        let _ = callbacks
+                            .save_state("download", &path, &resume_state_obj(&etag, done))
+                            .await;
+                    }
+                }
+                Ok(())
             }
-            Ok(())
-        }
-    })
+        },
+    )
     .await?;
 
     // Flush any final decompressed frames.
@@ -242,15 +283,33 @@ async fn stream_download(
         let offset = file_offset.get();
         callbacks.on_write_chunk(&path, offset, &tail).await?;
         file_offset.set(offset.saturating_add(tail.len() as u64));
-        stream_written.set(stream_written.get().saturating_add(tail.len() as u64));
         control.add_progress(tail.len() as u64);
     }
 
-    let written_total = stream_written.get();
     Ok(DownloadOutcome {
         size: final_size.max(file_offset.get()),
-        written: written_total,
     })
+}
+
+/// Build a resume-state object for JS persistence.
+fn resume_state_obj(etag: &str, offset: u64) -> JsValue {
+    let state = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &state,
+        &JsValue::from_str("etag"),
+        &JsValue::from_str(etag),
+    );
+    let _ = js_sys::Reflect::set(
+        &state,
+        &JsValue::from_str("offset"),
+        &JsValue::from_f64(offset as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &state,
+        &JsValue::from_str("size"),
+        &JsValue::from_f64(offset as f64),
+    );
+    state.into()
 }
 
 /// Persist resume state (via the JS IndexedDB layer) and notify JS.
@@ -285,7 +344,7 @@ pub async fn download_folder(
     control: &TaskControl,
     config: &ClientConfig,
 ) -> Result<u64, LibfwError> {
-    let files = collect_files(base_url, token, path).await?;
+    let files = collect_files(base_url, token, path, config.timeout_ms).await?;
     let total = total_bytes(&files);
     control.set_total(total);
     callbacks.on_progress(0, total)?;
@@ -324,7 +383,10 @@ pub async fn download_single(
         mtime: 0,
     };
     let outcome = download_file(base_url, token, &file, callbacks, control, config).await?;
-    Ok(outcome.written)
+    // Return the ABSOLUTE byte count (the final offset), consistent with
+    // `download_folder`, rather than this response's delta (which would be
+    // misleading on a resumed download).
+    Ok(outcome.size)
 }
 
 /// Read the ETag response header.

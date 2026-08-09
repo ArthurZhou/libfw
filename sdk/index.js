@@ -203,6 +203,12 @@ export class LibfwClient {
    *        (`showDirectoryPicker`); `'browser'` buffers each file and triggers
    *        a traditional browser download (folders are packed into a `.zip`);
    *        `'auto'` picks `'fs'` when the API exists, otherwise `'browser'`.
+   * @param {number} [options.maxFallbackBytes=536870912] memory cap (bytes)
+   *        for the in-memory `'browser'` download fallback. Each file's size
+   *        (and the cumulative buffered total) is pre-checked against it
+   *        before any bytes are buffered; a download that would exceed it is
+   *        rejected with a `too-large` error instead of risking an OOM.
+   *        `0` disables the limit.
    * @param {(event: {type: string, done: number, total: number, path?: string, error?: string}) => void} [options.onEvent]
    *        optional progress/state listener
    */
@@ -218,6 +224,7 @@ export class LibfwClient {
       timeoutMs: 60000,
       wasmUrl: null,
       downloadMode: 'auto',
+      maxFallbackBytes: 512 * 1024 * 1024,
       onEvent: null,
       ...options,
     };
@@ -310,14 +317,41 @@ export class LibfwClient {
   _makeCallbacks() {
     return {
       onFileStart: (path, size) => {
-        if (this._fallback) this._fallback.sizes.set(path, size);
+        if (this._fallback) {
+          this._fallback.sizes.set(path, size);
+          // Pre-check the in-memory cap BEFORE any bytes are buffered so an
+          // oversized download is rejected instead of exhausting memory.
+          const max = this._maxFallbackBytes();
+          if (max > 0) {
+            if (size > max) {
+              throw new LibfwError(
+                `file too large for browser download (${size} > ${max} bytes): ${path}`,
+                'too-large'
+              );
+            }
+            this._fallback.total += size;
+            if (this._fallback.total > max) {
+              throw new LibfwError(
+                `browser download would buffer more than the ${max}-byte in-memory limit`,
+                'too-large'
+              );
+            }
+          }
+        }
         this._emit({ type: 'fileStart', path, done: 0, total: size });
       },
       onWriteChunk: (path, offset, data) => this._onWriteChunk(path, offset, data),
       onFileCompleted: (path) => this._onFileCompleted(path),
       onProgress: (done, total) => this._emit({ type: 'progress', done, total }),
       loadState: (direction, path) => Idb.loadState(`${direction}:${path}`),
-      saveState: (direction, path, state) => Idb.saveState(`${direction}:${path}`, state),
+      saveState: (direction, path, state) => {
+        // The in-memory browser-download fallback never commits bytes to
+        // disk, so a persisted download offset would be a phantom that
+        // poisons a later FS-API resume. Skip persisting download state
+        // while a fallback transfer is active.
+        if (direction === 'download' && this._fallback) return Promise.resolve();
+        return Idb.saveState(`${direction}:${path}`, state);
+      },
       getFileList: () => this._getFileList(),
       readFile: (path, offset, length) => this._readFile(path, offset, length),
       log: (msg) => {
@@ -394,6 +428,7 @@ export class LibfwClient {
       throw toLibfwError(err);
     } finally {
       await this._flushWritables();
+      await this._syncResumeOffsets();
     }
   }
 
@@ -424,6 +459,7 @@ export class LibfwClient {
       throw toLibfwError(err);
     } finally {
       await this._flushWritables();
+      await this._syncResumeOffsets();
     }
   }
 
@@ -446,7 +482,7 @@ export class LibfwClient {
    * @private
    */
   async _downloadViaBrowser(engine, token, path, isFolder) {
-    this._fallback = { isFolder, buffers: new Map(), order: [], sizes: new Map() };
+    this._fallback = { isFolder, buffers: new Map(), order: [], sizes: new Map(), total: 0 };
     try {
       const total = isFolder
         ? await engine.download_folder(this._options.baseUrl, token, path)
@@ -455,11 +491,16 @@ export class LibfwClient {
       if (isFolder) {
         const entries = [];
         for (const p of order) {
-          entries.push({ name: this._cleanPath(p), data: this._concatBuffers(buffers.get(p) || []) });
+          entries.push({
+            name: this._safeEntryName(p),
+            data: this._concatBuffers(buffers.get(p) || []),
+          });
         }
         // Include files that were announced but produced no bytes (empty).
         for (const p of sizes.keys()) {
-          if (!buffers.has(p)) entries.push({ name: this._cleanPath(p), data: new Uint8Array(0) });
+          if (!buffers.has(p)) {
+            entries.push({ name: this._safeEntryName(p), data: new Uint8Array(0) });
+          }
         }
         this._triggerBrowserDownload(createZip(entries), this._archiveName(path));
       } else {
@@ -501,6 +542,33 @@ export class LibfwClient {
    */
   _cleanPath(path) {
     return String(path).replace(/^\/+/, '');
+  }
+
+  /**
+   * Validate a virtual path for use as a ZIP entry name, rejecting any
+   * traversal (`..`), absolute/drive-letter prefixes or Windows-style
+   * separators that could escape the archive on extraction (zip-slip).
+   * @param {string} path
+   * @returns {string}
+   * @private
+   */
+  _safeEntryName(path) {
+    const cleaned = this._cleanPath(path);
+    const segs = String(cleaned).split('/');
+    if (segs.some((seg) => seg === '..' || seg.includes('\\') || /^[a-zA-Z]:/.test(seg))) {
+      throw new LibfwError(`unsafe path in download: ${path}`, 'path');
+    }
+    return cleaned;
+  }
+
+  /**
+   * The configured in-memory cap for the browser-download fallback.
+   * @returns {number} 0 disables the limit.
+   * @private
+   */
+  _maxFallbackBytes() {
+    const max = Number(this._options.maxFallbackBytes);
+    return Number.isFinite(max) && max > 0 ? max : 0;
   }
 
   /**
@@ -685,6 +753,34 @@ export class LibfwClient {
       }
     });
     await Promise.allSettled(pending);
+  }
+
+  /**
+   * Reconcile persisted download resume offsets with the bytes actually
+   * committed to disk.
+   *
+   * `createWritable()` only commits to the real file on `close()`, so an
+   * interrupted download's on-disk length can be ahead of (or behind) the
+   * engine's periodically-saved offset. Overwriting each file's stored
+   * offset with its real size keeps the append-based resume consistent:
+   * the next transfer resumes exactly where the file on disk ends.
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _syncResumeOffsets() {
+    for (const [path, handle] of this._fileHandles) {
+      try {
+        const file = await handle.getFile();
+        const size = file.size;
+        const state = await Idb.loadState(`download:${path}`);
+        if (state && typeof state.etag === 'string') {
+          await Idb.saveState(`download:${path}`, { ...state, offset: size, size });
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
+    this._fileHandles.clear();
   }
 
   // -------------------------------------------------------------- uploads

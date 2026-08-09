@@ -13,7 +13,7 @@ use axum::Json;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use libfw_core::auth::{Action, AuthError};
 use libfw_core::claims::TokenClaims;
-use libfw_core::compress::{decompressor, CompressionFormat, Compressor};
+use libfw_core::compress::{decompressor_with_limit, CompressionFormat, Compressor, MAX_FRAME_OUTPUT};
 use libfw_core::metadata::{decode_file_meta_header, FileMeta};
 use libfw_core::storage::{UploadSink, WriteMode};
 use libfw_core::{RangeSpec, StorageError, STREAM_BUF_SIZE};
@@ -26,7 +26,7 @@ use crate::http::{
     content_range_none_value, content_range_value, etag_matches_if_none_match, if_range_matches,
     parse_range_header, ParsedRange,
 };
-use crate::{validate_rel_path, ServerState, HEADER_COMPRESS, HEADER_FILE_META, HEADER_OFFSET};
+use crate::{validate_rel_path, ServerState, HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET};
 
 /// Errors surfaced by handlers, mapped to HTTP responses.
 #[derive(Debug, thiserror::Error)]
@@ -369,7 +369,17 @@ pub(crate) async fn upload(
     };
 
     let mut sink = state.storage.write_stream(&path, mode).await?;
-    let mut decomp = decompressor(format);
+    // Tight per-call output budget: a hostile client sending many small
+    // frames in one body chunk must be rejected before it can inflate
+    // memory (each frame is capped at MAX_FRAME_OUTPUT already).
+    let mut decomp = decompressor_with_limit(format, MAX_FRAME_OUTPUT);
+    // `x-libfw-final` marks the request as the file's last chunk; only then
+    // can the server verify the committed size matches `meta.size`.
+    let final_chunk = headers
+        .get(HEADER_FINAL)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let mut out: Vec<u8> = Vec::new();
     let mut appended = 0u64;
     let mut stream = body.into_data_stream();
@@ -402,6 +412,20 @@ pub(crate) async fn upload(
     if let Err(e) = write_result {
         let _ = sink.abort().await;
         return Err(e);
+    }
+
+    // On the final chunk, the committed size must EXACTLY match the
+    // client-declared `meta.size` (write_batch already rejects overruns;
+    // this rejects undersized/truncated final bodies so a partial file can
+    // never be committed as a complete one). Older clients that omit the
+    // header keep the previous behavior.
+    let final_size = resume_offset.saturating_add(appended);
+    if final_chunk && final_size != meta.size {
+        let _ = sink.abort().await;
+        return Err(ApiError::BadRequest(format!(
+            "final chunk yields {} bytes but the declared file size is {}",
+            final_size, meta.size
+        )));
     }
 
     let committed = sink.commit().await?;

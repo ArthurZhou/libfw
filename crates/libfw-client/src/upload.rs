@@ -10,7 +10,7 @@ use wasm_bindgen_futures::JsFuture;
 use futures::StreamExt;
 use libfw_core::compress::{compressor, CompressionFormat};
 use libfw_core::metadata::encode_file_meta_header;
-use libfw_core::{HEADER_COMPRESS, HEADER_FILE_META, HEADER_OFFSET};
+use libfw_core::{HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET};
 
 use crate::config::ClientConfig;
 use crate::error::LibfwError;
@@ -40,6 +40,8 @@ async fn post_chunk(
     offset: u64,
     body: &[u8],
     compress: bool,
+    timeout_ms: u32,
+    final_chunk: bool,
 ) -> Result<(), LibfwError> {
     let headers = auth_headers(token, false)?;
     headers
@@ -53,11 +55,18 @@ async fn post_chunk(
             .set(HEADER_COMPRESS, "zrip")
             .map_err(|e| LibfwError::Js(format!("set compress header failed: {e:?}")))?;
     }
+    // Mark the final chunk so the server can verify the committed size
+    // matches the declared `meta.size` (and reject truncated uploads).
+    if final_chunk {
+        headers
+            .set(HEADER_FINAL, "1")
+            .map_err(|e| LibfwError::Js(format!("set final header failed: {e:?}")))?;
+    }
 
     let url = file_url(base_url, &file.path);
     let body_value = js_sys::Uint8Array::from(body);
     let req = request(&url, "POST", &headers, Some(&body_value.into()))?;
-    let resp = fetch(&req).await?;
+    let resp = fetch(&req, timeout_ms).await?;
     let status = resp.status();
     if status == 201 {
         Ok(())
@@ -97,6 +106,13 @@ async fn upload_file(
         }
         offset = offset.min(file.size);
 
+        // Seed the shared progress with the prefix already on the server so
+        // a pure resume reaches 100% at completion instead of showing only
+        // this session's delta.
+        let mut pass_added = offset;
+        control.add_progress(offset);
+        let mut pass_uploaded = 0u64;
+
         for (start, end) in chunk_bounds(file, config.chunk_size, offset) {
             control.wait_ready().await?;
             control.check()?;
@@ -130,16 +146,31 @@ async fn upload_file(
             loop {
                 control.wait_ready().await?;
                 control.check()?;
-                match post_chunk(base_url, token, file, start, &payload, config.compress).await {
+                match post_chunk(
+                    base_url,
+                    token,
+                    file,
+                    start,
+                    &payload,
+                    config.compress,
+                    config.timeout_ms,
+                    end == file.size,
+                )
+                .await
+                {
                     Ok(()) => break,
                     Err(LibfwError::Http { status: 412, .. }) if !restarted => {
                         // Server says our offset is stale → wipe state and
-                        // re-upload the whole file from byte 0.
+                        // re-upload the whole file from byte 0. Undo this
+                        // pass's progress (resume seed + already-posted
+                        // bytes) so the file's bytes are never double-counted
+                        // in the progress bar or the returned byte count.
                         restarted = true;
                         callbacks.log(&format!(
                             "server rejected offset {start} for `{}`; resetting",
                             file.path
                         ));
+                        control.subtract_progress(pass_added);
                         let _ = callbacks
                             .save_state(
                                 "upload",
@@ -163,7 +194,8 @@ async fn upload_file(
                 }
             }
 
-            uploaded_total = uploaded_total.saturating_add(len);
+            pass_uploaded = pass_uploaded.saturating_add(len);
+            pass_added = pass_added.saturating_add(len);
             control.add_progress(len);
 
             // Persist progress so a crash/resume continues from here.
@@ -175,6 +207,7 @@ async fn upload_file(
                 )
                 .await?;
         }
+        uploaded_total = uploaded_total.saturating_add(pass_uploaded);
         break 'file;
     }
 

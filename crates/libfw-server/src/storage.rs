@@ -248,9 +248,19 @@ impl StorageBackend for FsStorage {
 
     async fn remove(&self, path: &str) -> Result<(), StorageError> {
         let full = self.resolve(path)?;
-        let meta = tokio::fs::metadata(&full)
+        // Use `symlink_metadata` (not `metadata`) so a symlink that appeared
+        // since `resolve` checked is never followed — we refuse to remove
+        // *through* it. (The check-then-use race cannot be fully closed on
+        // all platforms without openat/O_NOFOLLOW; this narrows it for the
+        // destructive operation.)
+        let meta = tokio::fs::symlink_metadata(&full)
             .await
             .map_err(|e| StorageError::Other(e))?;
+        if meta.file_type().is_symlink() {
+            return Err(StorageError::Unsupported(
+                "refusing to remove through a symlink",
+            ));
+        }
         if meta.is_dir() {
             tokio::fs::remove_dir_all(&full)
                 .await

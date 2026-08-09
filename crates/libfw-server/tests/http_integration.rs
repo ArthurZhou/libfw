@@ -11,7 +11,7 @@ use libfw_core::auth::{AuthError, PathValidator, TokenVerifier};
 use libfw_core::claims::{Permission, TokenClaims};
 use libfw_core::compress::{compressor, decompressor, CompressionFormat};
 use libfw_core::metadata::encode_file_meta_header;
-use libfw_server::{router, FsStorage, ServerState, HEADER_COMPRESS, HEADER_FILE_META, HEADER_OFFSET};
+use libfw_server::{router, FsStorage, ServerState, HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET};
 use tower::ServiceExt;
 
 /// A verifier that maps the token to a subject with full permissions.
@@ -303,6 +303,65 @@ async fn resume_upload_at_offset() {
         .await
         .unwrap();
     assert_eq!(body_string(resp).await, "ABCDEF");
+}
+
+#[tokio::test]
+async fn final_chunk_mismatched_size_is_rejected() {
+    let app = app(DevVerifier);
+
+    // Declare a 4-byte file but send a 3-byte body marked as the FINAL
+    // chunk → the size check on the final request must reject (400) and
+    // nothing may be committed.
+    let meta = libfw_core::metadata::FileMeta::new("final.txt", 4, 0);
+    let mut headers = auth_header("tok");
+    headers.insert(
+        HEADER_FILE_META,
+        HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap(),
+    );
+    headers.insert(HEADER_OFFSET, HeaderValue::from_static("0"));
+    headers.insert(HEADER_FINAL, HeaderValue::from_static("1"));
+    let resp = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/file/final.txt",
+            headers,
+            Body::from(b"abc".to_vec()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = app
+        .oneshot(request("GET", "/file/final.txt", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn final_chunk_matching_size_is_accepted() {
+    let app = app(DevVerifier);
+    let meta = libfw_core::metadata::FileMeta::new("ok.txt", 4, 0);
+    let mut headers = auth_header("tok");
+    headers.insert(
+        HEADER_FILE_META,
+        HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap(),
+    );
+    headers.insert(HEADER_OFFSET, HeaderValue::from_static("0"));
+    headers.insert(HEADER_FINAL, HeaderValue::from_static("1"));
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/ok.txt", headers, Body::from(b"abcd".to_vec())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .oneshot(request("GET", "/file/ok.txt", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(body_string(resp).await, "abcd");
 }
 
 #[tokio::test]
