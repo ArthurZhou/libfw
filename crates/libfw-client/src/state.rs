@@ -7,6 +7,7 @@
 //! borrows span `.await` points).
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use wasm_bindgen::JsValue;
 
@@ -44,14 +45,21 @@ impl TaskState {
 }
 
 /// Shared, mutable task control state.
+///
+/// Every field is `Rc<Cell<_>>` so that **clones share the same state**.
+/// The WASM facade hands an owned clone to each transfer future, and the
+/// transfer clones it again into per-file tasks; without `Rc` those clones
+/// would *copy* the byte counters and state flags, so progress would report
+/// `0` and `pause`/`resume`/`cancel` would never reach the running task.
+/// `Rc` is sound here because WASM is single-threaded.
 #[derive(Debug, Clone)]
 pub struct TaskControl {
-    state: Cell<TaskState>,
+    state: Rc<Cell<TaskState>>,
     /// The state to restore on `resume()` (downloading/uploading).
-    active: Cell<TaskState>,
-    cancelled: Cell<bool>,
-    done_bytes: Cell<u64>,
-    total_bytes: Cell<u64>,
+    active: Rc<Cell<TaskState>>,
+    cancelled: Rc<Cell<bool>>,
+    done_bytes: Rc<Cell<u64>>,
+    total_bytes: Rc<Cell<u64>>,
 }
 
 impl Default for TaskControl {
@@ -64,11 +72,11 @@ impl TaskControl {
     /// Create a fresh, idle control block.
     pub fn new() -> Self {
         TaskControl {
-            state: Cell::new(TaskState::Idle),
-            active: Cell::new(TaskState::Idle),
-            cancelled: Cell::new(false),
-            done_bytes: Cell::new(0),
-            total_bytes: Cell::new(0),
+            state: Rc::new(Cell::new(TaskState::Idle)),
+            active: Rc::new(Cell::new(TaskState::Idle)),
+            cancelled: Rc::new(Cell::new(false)),
+            done_bytes: Rc::new(Cell::new(0)),
+            total_bytes: Rc::new(Cell::new(0)),
         }
     }
 
@@ -242,6 +250,29 @@ mod tests {
         assert_eq!(c.progress(), 0.25);
         c.add_progress(200);
         assert_eq!(c.progress(), 1.0);
+    }
+
+    #[test]
+    fn clones_share_counters_and_flags() {
+        // Regression: the WASM facade clones the control into each transfer
+        // task. Clones must share progress and pause/cancel state, otherwise
+        // `done_bytes()`/`progress()` report 0 and controls never reach the
+        // running task.
+        let c = TaskControl::new();
+        let task = c.clone();
+        c.set_total(100);
+        task.add_progress(40);
+        assert_eq!(c.done_bytes(), 40);
+        assert_eq!(c.progress(), 0.4);
+        // Controls issued on one handle must be visible to the task's handle.
+        c.begin(TaskState::Downloading);
+        c.pause();
+        assert_eq!(task.state(), TaskState::Paused);
+        c.resume();
+        assert_eq!(task.state(), TaskState::Downloading);
+        c.cancel();
+        assert!(matches!(task.check(), Err(LibfwError::Cancelled)));
+        assert!(task.is_cancelled());
     }
 
     #[test]

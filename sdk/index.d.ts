@@ -65,6 +65,11 @@ export interface LibfwClientOptions {
   maxRetryDelayMs?: number;
   /** Per-request timeout (ms). Default `60000`. */
   timeoutMs?: number;
+  /**
+   * Explicit URL of `libfw_client_bg.wasm`. When omitted it is resolved
+   * automatically for both ESM and classic-`<script>`/UMD consumers.
+   */
+  wasmUrl?: string;
   /** Optional progress/state listener. */
   onEvent?: (event: LibfwEvent) => void;
 }
@@ -142,6 +147,17 @@ export declare class LibfwClient {
 
   /** Total bytes to transfer. */
   totalBytes(): number;
+
+  /**
+   * Delete persisted resume state (IndexedDB).
+   *
+   * Pass a direction to wipe only that transfer's state (`'download'` or
+   * `'upload'`); omit it to clear the whole store.
+   *
+   * @param direction restrict the wipe to one transfer direction
+   * @returns number of records removed
+   */
+  clearResumeStore(direction?: 'upload' | 'download'): Promise<number>;
 }
 
 export default LibfwClient;

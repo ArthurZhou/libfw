@@ -5,8 +5,9 @@
 /sdk/pkg
 
 # Node
-/node_modules
+node_modules/
 /sdk/dist
+/sdk/package-lock.json
 
 # Dev-mode launcher data
 /dev-data/

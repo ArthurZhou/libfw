@@ -26,7 +26,7 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "build:wasm": "wasm-pack build ../crates/libfw-client --target web --out-dir ../sdk/pkg --release",
+    "build:wasm": "wasm-pack build ../crates/libfw-client --target web --out-dir ../../sdk/pkg --release",
     "build:umd": "rollup -c rollup.config.mjs",
     "build": "npm run build:wasm && npm run build:umd"
   },

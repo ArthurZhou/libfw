@@ -106,6 +106,47 @@ const Idb = {
       tx.onerror = () => reject(new LibfwError(`idb put: ${tx.error}`, 'idb'));
     });
   },
+
+  /**
+   * Delete every key whose `direction:` prefix matches (e.g. all
+   * `download:*` keys) while leaving the other direction intact.
+   * @param {string} direction `'upload'` | `'download'`
+   * @returns {Promise<number>} number of records removed
+   */
+  async clearDirection(direction) {
+    const db = await Idb.open();
+    const prefix = `${direction}:`;
+    const keys = await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).getAllKeys();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(new LibfwError(`idb keys: ${req.error}`, 'idb'));
+    });
+    const matches = keys.filter((key) => String(key).startsWith(prefix));
+    if (matches.length === 0) return 0;
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STORE);
+      for (const key of matches) store.delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(new LibfwError(`idb clear direction: ${tx.error}`, 'idb'));
+    });
+    return matches.length;
+  },
+
+  /**
+   * Wipe the whole resume store.
+   * @returns {Promise<void>}
+   */
+  async clear() {
+    const db = await Idb.open();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(new LibfwError(`idb clear: ${tx.error}`, 'idb'));
+    });
+  },
 };
 
 /** Split a POSIX virtual path into segments. */
@@ -123,6 +164,22 @@ function splitPath(path) {
  * await client.downloadFolder('your_token_here');
  * await client.upload('your_token_here', fileInput.files);
  */
+
+/**
+ * `<script src>` of the bundle that is currently evaluating this module.
+ *
+ * `document.currentScript` is only non-null during a classic script's
+ * synchronous evaluation, so it is captured here once, at load time, rather
+ * than read later from an async callback (where it would already be `null`).
+ * In ESM this is `null` (modules never set `currentScript`), which is
+ * correct — the ESM path resolves the `.wasm` via `import.meta.url` instead.
+ * @type {string|null}
+ */
+const BUNDLE_SCRIPT_SRC =
+  typeof document !== 'undefined' && document.currentScript && document.currentScript.src
+    ? document.currentScript.src
+    : null;
+
 export class LibfwClient {
   /**
    * @param {object} [options]
@@ -134,6 +191,9 @@ export class LibfwClient {
    * @param {number} [options.baseRetryDelayMs=500] initial backoff (ms)
    * @param {number} [options.maxRetryDelayMs=30000] backoff ceiling (ms)
    * @param {number} [options.timeoutMs=60000] per-request timeout (ms)
+   * @param {string} [options.wasmUrl] explicit URL of `libfw_client_bg.wasm`;
+   *        when omitted it is resolved automatically for both ESM and
+   *        classic-`<script>`/UMD consumers (see {@link LibfwClient#_wasmUrl})
    * @param {(event: {type: string, done: number, total: number, path?: string, error?: string}) => void} [options.onEvent]
    *        optional progress/state listener
    */
@@ -147,6 +207,7 @@ export class LibfwClient {
       baseRetryDelayMs: 500,
       maxRetryDelayMs: 30000,
       timeoutMs: 60000,
+      wasmUrl: null,
       onEvent: null,
       ...options,
     };
@@ -176,7 +237,12 @@ export class LibfwClient {
   async _ready() {
     if (this._engine) return this._engine;
     if (!this._initPromise) {
-      this._initPromise = init().catch((err) => {
+      // Always pass the .wasm location explicitly so the generated glue's
+      // ESM-only `import.meta.url` fallback is never exercised — that
+      // fallback throws when the SDK is bundled for a classic <script>/UMD
+      // context. See _wasmUrl() for how the URL is resolved. The
+      // `{ module_or_path }` object form is the glue's non-deprecated API.
+      this._initPromise = init({ module_or_path: this._wasmUrl() }).catch((err) => {
         this._initPromise = null;
         throw toLibfwError(err);
       });
@@ -194,6 +260,31 @@ export class LibfwClient {
     engine.set_callbacks(this._makeCallbacks());
     this._engine = engine;
     return engine;
+  }
+
+  /**
+   * Resolve the `.wasm` file URL without relying on `import.meta` (which is
+   * ESM-only and a parse error in a classic `<script>`).
+   *
+   * Order: explicit `wasmUrl` option → classic-script `document.currentScript`
+   * → ESM `import.meta.url`. The `wasmUrl` option is the escape hatch for
+   * deployments where neither auto-detection applies.
+   * @returns {string|URL}
+   * @private
+   */
+  _wasmUrl() {
+    if (this._options.wasmUrl) return this._options.wasmUrl;
+    // Classic <script> / UMD: the bundle's own <script src> (captured at load
+    // time in BUNDLE_SCRIPT_SRC) tells us where the sibling `.wasm` lives.
+    if (BUNDLE_SCRIPT_SRC) {
+      return new URL('libfw_client_bg.wasm', BUNDLE_SCRIPT_SRC);
+    }
+    // ESM: relative to this module.
+    if (typeof import.meta !== 'undefined' && import.meta.url) {
+      return new URL('./pkg/libfw_client_bg.wasm', import.meta.url);
+    }
+    // Last resort: same-origin relative path.
+    return 'libfw_client_bg.wasm';
   }
 
   /**
@@ -234,8 +325,9 @@ export class LibfwClient {
    * Download a whole folder from the server into a local directory chosen
    * by the user via `showDirectoryPicker()`.
    *
-   * Folder structure (including nested directories) is preserved; bytes
-   * are streamed to disk through `createWritable({ type: 'write' })`.
+   * Folder structure (including nested directories) is preserved; bytes are
+   * streamed to disk through a single `createWritable()` per file (append
+   * writes, atomically committed on `close()`).
    *
    * @param {string} token bearer token
    * @param {string} [dirPath=''] virtual server path to download (root by default)
@@ -285,32 +377,44 @@ export class LibfwClient {
   }
 
   /**
-   * Stream a decompressed chunk straight to disk at its absolute byte
-   * offset, keeping memory bounded regardless of file size (no whole-file
-   * buffering). The engine awaits this callback, so writes for a file are
-   * applied strictly in order.
+   * Stream a decompressed chunk to disk, keeping memory bounded regardless
+   * of file size (no whole-file buffering).
+   *
+   * The destination writable is opened exactly once per file and written in
+   * **append mode** (`writable.write(data)` without an explicit `position`).
+   * The engine awaits this callback, so chunks for a file arrive strictly in
+   * order, making append writes correct for both fresh and resumed
+   * downloads. Crucially, this avoids per-write
+   * `{ type: 'write', position }` calls, which in Chromium can spawn a fresh
+   * `.crswap` swap file per write and leave the target file empty on close —
+   * the single `createWritable()` + sequential writes + one `close()` below
+   * commits the swap file atomically.
    * @param {string} path virtual path
-   * @param {number} offset byte offset
+   * @param {number} offset byte offset (informational; writes append)
    * @param {Uint8Array} data decompressed chunk
    * @returns {Promise<void>}
    * @private
    */
   async _onWriteChunk(path, offset, data) {
-    let writable = this._writables.get(path);
-    if (!writable) {
-      // Open the destination once per file. A true resume (first chunk at
-      // offset > 0) keeps the existing prefix on disk; a fresh download opens
-      // a truncating writable. Always close the writable on completion/abort
-      // so no orphaned `.crswap` swap files are left behind.
-      const isResume = offset > 0;
-      const handle = await this._ensureFileHandle(path);
+    let entry = this._writables.get(path);
+    if (!entry) {
+      const { dir, name, handle } = await this._ensureFileHandle(path);
       this._fileHandles.set(path, handle);
-      writable = await handle.createWritable(
+      // A true resume (first chunk at offset > 0) keeps the existing prefix
+      // on disk; a fresh download opens a truncating writable.
+      const isResume = offset > 0;
+      if (!isResume) {
+        // Remove any orphaned `.crswap` left behind by a crashed/aborted run
+        // so a stale swap file can never shadow the new write.
+        await this._removeSwapFile(dir, name);
+      }
+      const writable = await handle.createWritable(
         isResume ? { keepExistingData: true } : undefined
       );
-      this._writables.set(path, writable);
+      entry = { writable, dir, name };
+      this._writables.set(path, entry);
     }
-    await writable.write({ type: 'write', position: offset, data });
+    await entry.writable.write(data);
   }
 
   /**
@@ -325,17 +429,18 @@ export class LibfwClient {
   }
 
   /**
-   * Close (and forget) a file's writable, flushing buffered bytes to disk.
+   * Close (and forget) a file's writable, atomically committing the swap
+   * file to its final name. Best-effort so failure/abort never throws.
    * @param {string} path virtual path
    * @returns {Promise<void>}
    * @private
    */
   async _closeWritable(path) {
-    const writable = this._writables.get(path);
-    if (writable) {
+    const entry = this._writables.get(path);
+    if (entry) {
       this._writables.delete(path);
       try {
-        await writable.close();
+        await entry.writable.close();
       } catch {
         /* best-effort flush on failure/abort */
       }
@@ -346,7 +451,7 @@ export class LibfwClient {
    * Resolve (and create, if needed) the file handle for a virtual path,
    * creating any parent directories along the way.
    * @param {string} path
-   * @returns {Promise<FileSystemFileHandle>}
+   * @returns {Promise<{dir: FileSystemDirectoryHandle, name: string, handle: FileSystemFileHandle}>}
    * @private
    */
   async _ensureFileHandle(path) {
@@ -358,7 +463,25 @@ export class LibfwClient {
     for (let i = 0; i < segments.length - 1; i += 1) {
       dir = await dir.getDirectoryHandle(segments[i], { create: true });
     }
-    return dir.getFileHandle(segments[segments.length - 1], { create: true });
+    const name = segments[segments.length - 1];
+    const handle = await dir.getFileHandle(name, { create: true });
+    return { dir, name, handle };
+  }
+
+  /**
+   * Delete a leftover Chromium swap file (`.<name>.crswap`) next to a file,
+   * ignoring any error (no swap file, or permission denied).
+   * @param {FileSystemDirectoryHandle} dir parent directory
+   * @param {string} name target file name
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _removeSwapFile(dir, name) {
+    try {
+      await dir.removeEntry(`.${name}.crswap`, { recursive: false });
+    } catch {
+      /* nothing to clean up */
+    }
   }
 
   /**
@@ -368,10 +491,10 @@ export class LibfwClient {
    * @private
    */
   async _flushWritables() {
-    const pending = [...this._writables.entries()].map(async ([path, writable]) => {
+    const pending = [...this._writables.entries()].map(async ([path, entry]) => {
       this._writables.delete(path);
       try {
-        await writable.close();
+        await entry.writable.close();
       } catch {
         /* best-effort flush */
       }
@@ -543,6 +666,36 @@ export class LibfwClient {
    */
   totalBytes() {
     return this._engine ? this._engine.total_bytes() : 0;
+  }
+
+  // ------------------------------------------------------------- resume store
+
+  /**
+   * Delete persisted resume state (IndexedDB).
+   *
+   * Pass a direction to wipe only that transfer's state, leaving the other
+   * direction intact — the targeted replacement for clearing the whole store
+   * before every transfer:
+   *
+   * - `await client.clearResumeStore('download')` — drop all download state.
+   * - `await client.clearResumeStore('upload')` — drop all upload state.
+   * - `await client.clearResumeStore()` — wipe everything (whole-store clear).
+   *
+   * @param {'upload'|'download'} [direction] restrict to one direction
+   * @returns {Promise<number>} number of records removed
+   */
+  async clearResumeStore(direction) {
+    if (direction !== undefined && direction !== 'upload' && direction !== 'download') {
+      throw new LibfwError(
+        `clearResumeStore: expected 'upload' | 'download' | undefined, got ${JSON.stringify(direction)}`,
+        'path'
+      );
+    }
+    if (direction === undefined) {
+      await Idb.clear();
+      return 0;
+    }
+    return Idb.clearDirection(direction);
   }
 }
 
