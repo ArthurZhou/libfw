@@ -337,15 +337,24 @@ async fn commit_upload(
 /// with a bounded in-flight window — throughput is bounded by bandwidth
 /// instead of `chunk_size / RTT`.
 ///
-/// The server is the **source of truth**: before and after sending, the
-/// client probes the byte ranges the server has actually persisted (tus's
-/// `Upload-Offset` / `HEAD` philosophy) and re-sends *only* the still-missing
-/// gaps — "verify-then-complete". Retransmission is self-healing: a lost
-/// response that nonetheless landed server-side is detected by the next probe
-/// (no wasted re-send), a block whose write was truly lost is re-sent, and a
-/// failed commit triggers a fresh probe + refill instead of failing the task.
-/// A final `x-libfw-final` commit request verifies the merged size then
-/// renames the temp into place ("merge").
+/// The server is the **source of truth**, but only consulted when it must be
+/// (download-style "no ack" happy path):
+/// - One probe seeds progress from any partial the server already holds and
+///   reports which blocks are still missing; round 0 reuses that result, so
+///   there is no duplicate probe before the first send.
+/// - The missing blocks are then POSTed concurrently; each `201` response is
+///   that block's ack, so the client does NOT re-verify before committing —
+///   it trusts the acks exactly as download trusts the bytes it receives.
+/// - A single `x-libfw-final` commit validates the merged size against
+///   `meta.size` and atomically renames the temp into place. The commit — not
+///   a probe — is the authority: a chunk the acks missed (rare) surfaces
+///   there as a rejection and triggers a re-probe + refill + retry, so
+///   self-healing costs nothing on the happy path.
+///
+/// Retransmission is self-healing: a lost response that nonetheless landed
+/// server-side is detected by the next probe (no wasted re-send), a block
+/// whose write was truly lost is re-sent, and a failed commit triggers a
+/// fresh probe + refill instead of failing the task.
 ///
 /// A legacy server that ignores the probe yields an empty range list → a
 /// full re-send, which is correct thanks to idempotent positional writes.
@@ -364,7 +373,7 @@ async fn upload_session_resumable(
     // interrupted attempt) are seeded into progress so a resume reflects the
     // true fraction. They are NOT counted in the returned `uploaded` figure,
     // which reports only what THIS session retained.
-    let received = probe_session(base_url, token, file, &session, config.timeout_ms).await?
+    let mut received = probe_session(base_url, token, file, &session, config.timeout_ms).await?
         .unwrap_or_default();
     let initial_covered = covered_bytes(&received).min(file.size);
     if initial_covered > 0 {
@@ -373,33 +382,30 @@ async fn upload_session_resumable(
     }
 
     let mut rounds = 0u32;
-    loop {
+    let mut first_error: Option<LibfwError> = None;
+    let uploaded = loop {
         control.wait_ready().await?;
         control.check()?;
 
-        // 1. Ask the server what it actually holds (authoritative).
-        let received = probe_session(base_url, token, file, &session, config.timeout_ms).await?
-            .unwrap_or_default();
+        // 1. Server is the source of truth for what it already holds. Round
+        //    0 reuses the initial probe result — we never probe twice before
+        //    the first send — and later rounds ask afresh.
+        if rounds > 0 {
+            received = probe_session(base_url, token, file, &session, config.timeout_ms).await?
+                .unwrap_or_default();
+        }
         let missing = aligned_missing(file, config.chunk_size, &received);
 
-        // 2. Everything present → commit. A commit failure (e.g. a size
-        //    mismatch from a racing write) does NOT fail the task: we loop
-        //    back, re-probe and re-fill the gaps, then retry the commit.
+        // 2. Everything already present → commit directly (a resume whose
+        //    partial covers the whole file, or a converged retry). A commit
+        //    failure (e.g. a size mismatch from a racing write) does NOT fail
+        //    the task: we loop back, re-probe and re-fill the gaps, then
+        //    retry the commit.
         if missing.is_empty() {
             match commit_upload(base_url, token, file, callbacks, control, config, &session)
                 .await
             {
-                Ok(()) => {
-                    callbacks
-                        .save_state(
-                            "upload",
-                            &file.path,
-                            &state_json(file.size, &file.to_meta().etag, file.size),
-                        )
-                        .await?;
-                    let final_covered = covered_bytes(&received).min(file.size);
-                    return Ok(final_covered.saturating_sub(initial_covered));
-                }
+                Ok(()) => break file.size.saturating_sub(initial_covered),
                 Err(e) => {
                     if rounds >= config.max_retries {
                         return Err(e);
@@ -409,6 +415,7 @@ async fn upload_session_resumable(
                         "commit failed for `{}`; re-verifying server state: {e}",
                         file.path
                     ));
+                    first_error.get_or_insert(e);
                     continue;
                 }
             }
@@ -419,8 +426,8 @@ async fn upload_session_resumable(
         //    larger than) the cross-file `concurrency`, so one file keeps
         //    enough chunks in flight to fill the bandwidth-delay product on
         //    high-latency links. Per-block failures are collected, not fatal:
-        //    the next probe decides what truly remains, so we only ever
-        //    retransmit the broken/lost parts.
+        //    each block's 201 response is its ack, and a rejected ack only
+        //    retries that block.
         let mut stream = futures::stream::iter(missing.into_iter().map(|(start, end)| {
             let base_url = base_url.to_string();
             let token = token.to_string();
@@ -438,33 +445,65 @@ async fn upload_session_resumable(
         }))
         .buffer_unordered(window);
 
-        let mut first_error: Option<LibfwError> = None;
         while let Some(res) = stream.next().await {
             if let Err(e) = res {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
+                first_error.get_or_insert(e);
             }
         }
 
-        rounds += 1;
-        if rounds > config.max_retries {
-            // Bounded: give the server one final probe; if it still reports
-            // gaps, surface the first underlying error (or a convergence
-            // error). This mirrors tus's give-up path after repeated HEADs.
-            let received = probe_session(base_url, token, file, &session, config.timeout_ms).await?
-                .unwrap_or_default();
-            if aligned_missing(file, config.chunk_size, &received).is_empty() {
-                continue; // converged → loop top commits
-            }
-            return Err(first_error.unwrap_or_else(|| {
-                LibfwError::Protocol(format!(
-                    "upload of `{}` did not converge after {rounds} rounds",
+        // 4. No-ack happy path: commit directly instead of asking the server
+        //    to re-verify first (mirroring download, which trusts the bytes it
+        //    receives). The commit validates the merged size against
+        //    `meta.size` — it, not a probe, is the authority — so a chunk the
+        //    acks missed (rare) is caught here as a rejection and triggers a
+        //    re-probe + refill on the next round.
+        match commit_upload(base_url, token, file, callbacks, control, config, &session).await {
+            Ok(()) => break file.size.saturating_sub(initial_covered),
+            Err(e) => {
+                rounds += 1;
+                if rounds > config.max_retries {
+                    // Bounded: one final probe decides whether we truly did
+                    // not converge (surface the first underlying error) or
+                    // merely hit a transient commit rejection (converged → one
+                    // last commit). Mirrors tus's give-up after repeated HEADs.
+                    let received = probe_session(
+                        base_url,
+                        token,
+                        file,
+                        &session,
+                        config.timeout_ms,
+                    )
+                    .await?
+                    .unwrap_or_default();
+                    if aligned_missing(file, config.chunk_size, &received).is_empty() {
+                        commit_upload(base_url, token, file, callbacks, control, config, &session)
+                            .await?;
+                        break file.size.saturating_sub(initial_covered);
+                    }
+                    return Err(first_error.unwrap_or_else(|| {
+                        LibfwError::Protocol(format!(
+                            "upload of `{}` did not converge after {rounds} rounds",
+                            file.path
+                        ))
+                    }));
+                }
+                callbacks.log(&format!(
+                    "commit failed for `{}`; re-verifying server state: {e}",
                     file.path
-                ))
-            }));
+                ));
+                first_error.get_or_insert(e);
+            }
         }
-    }
+    };
+
+    callbacks
+        .save_state(
+            "upload",
+            &file.path,
+            &state_json(file.size, &file.to_meta().etag, file.size),
+        )
+        .await?;
+    Ok(uploaded)
 }
 
 /// Total number of bytes covered by a set of (possibly overlapping) received
