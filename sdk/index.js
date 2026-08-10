@@ -188,9 +188,11 @@ export class LibfwClient {
   /**
    * @param {object} [options]
    * @param {string} [options.baseUrl=''] base URL the server routes are mounted under
-   * @param {number} [options.concurrency=4] max concurrent file transfers; also
-   *        the in-flight chunk window for a single file's upload (keeps
-   *        high-latency links saturated)
+   * @param {number} [options.concurrency=4] max concurrently-transferring files
+   * @param {number} [options.uploadWindow=8] in-flight chunk window for a
+   *        single file's upload; independent of `concurrency`, keeps a
+   *        high-latency link saturated (raise it to reduce upload stutter;
+   *        keep within your server's connection limit, ~6 for HTTP/1.1)
    * @param {boolean} [options.compress=true] negotiate zrip compression
    * @param {number} [options.chunkSize=2097152] upload chunk size in bytes
    * @param {number} [options.maxRetries=3] retries per chunk/file before failing
@@ -218,6 +220,7 @@ export class LibfwClient {
     this._options = {
       baseUrl: '',
       concurrency: 4,
+      uploadWindow: 8,
       compress: true,
       chunkSize: 2 * 1024 * 1024,
       maxRetries: 3,
@@ -274,6 +277,7 @@ export class LibfwClient {
     await this._initPromise;
     const engine = new WasmEngine({
       concurrency: this._options.concurrency,
+      uploadWindow: this._options.uploadWindow,
       compress: this._options.compress,
       chunkSize: this._options.chunkSize,
       maxRetries: this._options.maxRetries,

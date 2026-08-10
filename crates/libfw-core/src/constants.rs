@@ -9,6 +9,15 @@ pub const STREAM_BUF_SIZE: usize = 64 * 1024;
 /// Maximum default concurrent connections in the WASM engine.
 pub const DEFAULT_CONCURRENCY: usize = 4;
 
+/// Default in-flight chunk window for a single file's upload.
+///
+/// Kept independent of (and larger than) [`DEFAULT_CONCURRENCY`] so one file
+/// keeps many chunks in flight on high-latency links — enough to fill the
+/// bandwidth-delay product and avoid the "fill, drain, fill" stutter that a
+/// tiny window (== concurrency) causes. It also sets an upper bound that
+/// still works within browser per-origin connection limits (~6 for HTTP/1.1).
+pub const DEFAULT_UPLOAD_WINDOW: usize = 8;
+
 /// Default maximum retry count for a failed chunk before failing the task.
 pub const MAX_RETRIES: u32 = 3;
 

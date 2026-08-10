@@ -6,7 +6,7 @@
 use js_sys::Reflect;
 use wasm_bindgen::prelude::*;
 
-use libfw_core::{CHUNK_SIZE, DEFAULT_CONCURRENCY, MAX_RETRIES};
+use libfw_core::{CHUNK_SIZE, DEFAULT_CONCURRENCY, DEFAULT_UPLOAD_WINDOW, MAX_RETRIES};
 
 /// Default delay before the first retry (milliseconds).
 pub const DEFAULT_BASE_RETRY_MS: u32 = 500;
@@ -18,8 +18,14 @@ pub const DEFAULT_TIMEOUT_MS: u32 = 60_000;
 /// Runtime configuration of the WASM engine.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// Maximum number of concurrent chunk/file transfers (default 4).
+    /// Maximum number of concurrently-transferring files (default 4).
     pub concurrency: usize,
+    /// In-flight chunk window for a single file's upload (default 8).
+    ///
+    /// Independent of `concurrency`: one file keeps up to `upload_window`
+    /// chunks in flight, so a high-latency link stays saturated (throughput
+    /// is bounded by bandwidth, not `chunk_size / RTT`).
+    pub upload_window: usize,
     /// Request `zrip` compression from the server / compress uploads.
     pub compress: bool,
     /// Fixed chunk size used to slice files (default 2 MiB).
@@ -38,6 +44,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         ClientConfig {
             concurrency: DEFAULT_CONCURRENCY,
+            upload_window: DEFAULT_UPLOAD_WINDOW,
             compress: true,
             chunk_size: CHUNK_SIZE,
             max_retries: MAX_RETRIES,
@@ -95,6 +102,11 @@ impl ClientConfig {
                 cfg.concurrency = v;
             }
         }
+        if let Some(v) = opt_usize(opts, "uploadWindow") {
+            if v > 0 {
+                cfg.upload_window = v;
+            }
+        }
         if let Some(v) = opt_bool(opts, "compress") {
             cfg.compress = v;
         }
@@ -145,6 +157,7 @@ mod tests {
     fn defaults_are_sane() {
         let cfg = ClientConfig::default();
         assert_eq!(cfg.concurrency, 4);
+        assert_eq!(cfg.upload_window, DEFAULT_UPLOAD_WINDOW);
         assert_eq!(cfg.chunk_size, CHUNK_SIZE);
         assert_eq!(cfg.max_retries, MAX_RETRIES);
         assert!(cfg.compress);
@@ -177,6 +190,12 @@ mod tests {
         let obj = js_sys::Object::new();
         js_sys::Reflect::set(&obj, &JsValue::from_str("concurrency"), &JsValue::from_f64(8.0))
             .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("uploadWindow"),
+            &JsValue::from_f64(16.0),
+        )
+        .unwrap();
         js_sys::Reflect::set(&obj, &JsValue::from_str("compress"), &JsValue::FALSE).unwrap();
         js_sys::Reflect::set(
             &obj,
@@ -186,6 +205,7 @@ mod tests {
         .unwrap();
         let cfg = ClientConfig::from_js(&obj);
         assert_eq!(cfg.concurrency, 8);
+        assert_eq!(cfg.upload_window, 16);
         assert!(!cfg.compress);
         assert_eq!(cfg.chunk_size, 1024);
     }

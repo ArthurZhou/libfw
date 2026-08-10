@@ -11,6 +11,8 @@ import { LibfwClient } from 'libfw-client';
 const client = new LibfwClient({
   baseUrl: '/api',      // where libfw-server routes are mounted
   concurrency: 4,       // max parallel file transfers
+  uploadWindow: 8,      // in-flight chunks per single file (raise to reduce
+                        // upload stutter on high-latency links)
   compress: true,       // zrip streaming compression
   onEvent: (e) => console.log(e), // { type: 'progress', done, total }
 });
@@ -44,8 +46,12 @@ client.cancel();
   browser download — a single file as-is, a folder packed into a `.zip`.
 - `upload(token, files?)` — the engine slices each file into fixed-size
   chunks, reads them via `readFile`, compresses each chunk into one zstd
-  frame, and POSTs them with `x-libfw-offset` for server-side resume
-  validation.
+  frame, and POSTs them with an absolute `x-libfw-offset` into a shared
+  per-session temp file. Up to `uploadWindow` chunks of one file are kept in
+  flight concurrently (independent of the cross-file `concurrency`), so a
+  high-latency link stays saturated and only genuinely missing blocks are
+  re-sent after an interruption (server-probed, BitTorrent-style). A final
+  `x-libfw-final` request merges the temp into place.
 - Resume state (`etag`, `offset`, `size`) is persisted per path in
   IndexedDB and re-validated on every retry.
 - Pause/resume/cancel drive the WASM state machine

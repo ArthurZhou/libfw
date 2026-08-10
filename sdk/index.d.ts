@@ -52,8 +52,15 @@ export interface LibfwEvent {
 export interface LibfwClientOptions {
   /** Base URL the libfw server routes are mounted under. Default `''`. */
   baseUrl?: string;
-  /** Max concurrent file transfers. Default `4`. */
+  /** Max concurrently-transferring files. Default `4`. */
   concurrency?: number;
+  /**
+   * In-flight chunk window for a single file's upload, independent of
+   * `concurrency`. A higher value keeps high-latency links saturated and
+   * reduces upload stutter; keep it within your server's connection limit
+   * (~6 for HTTP/1.1). Default `8`.
+   */
+  uploadWindow?: number;
   /** Negotiate zrip compression. Default `true`. */
   compress?: boolean;
   /** Upload chunk size in bytes. Default 2 MiB. */

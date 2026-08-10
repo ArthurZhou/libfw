@@ -377,9 +377,13 @@ async fn upload_session_resumable(
     }
 
     // Send the missing blocks concurrently (out of order) with a bounded
-    // window. No special first-chunk handling is needed: the probe already
-    // created the shared temp on the server.
-    let window = config.concurrency.max(1);
+    // per-file window. Kept independent of (and typically larger than) the
+    // cross-file `concurrency` so a single file keeps enough chunks in flight
+    // to fill the bandwidth-delay product — avoiding the fill/drain/fill
+    // stutter a tiny window causes on high-latency links. No special
+    // first-chunk handling is needed: the probe already created the shared
+    // temp on the server.
+    let window = config.upload_window.max(1);
     let mut stream = futures::stream::iter(
         missing
             .into_iter()

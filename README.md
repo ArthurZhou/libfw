@@ -281,6 +281,9 @@ npm --prefix sdk run build:umd
 const client = new LibfwClient({
   baseUrl: '/api',            // where libfw-server routes are mounted
   concurrency: 4,             // max parallel file transfers (default 4)
+  uploadWindow: 8,            // in-flight chunks per single file (default 8;
+                              // raise to reduce upload stutter on high-latency
+                              // links, keep within server conn limit ~6 HTTP/1.1)
   compress: true,             // negotiate zrip compression (default true)
   chunkSize: 2 * 1024 * 1024, // upload chunk size (default 2 MiB)
   maxRetries: 3,              // retries per chunk/file (default 3)
@@ -321,8 +324,13 @@ await client.upload('your_token_here', [
 ```
 
 Each file is sliced into fixed-size chunks, each chunk compressed into one
-zstd frame, and POSTed with `x-libfw-offset`; a `412` on a stale offset makes
-the engine reset and re-send automatically.
+zstd frame and POSTed with an absolute `x-libfw-offset` into a shared
+per-session temp file. Up to `uploadWindow` chunks of one file are kept in
+flight concurrently (independent of the cross-file `concurrency`), so a
+high-latency link stays saturated. Before sending, the server is probed for
+the byte ranges it already holds; only the still-missing blocks are re-sent
+(BitTorrent-style resume), and a final `x-libfw-final` request merges the temp
+into place.
 
 ### Controls and state machine
 
