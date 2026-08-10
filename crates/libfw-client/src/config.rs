@@ -6,7 +6,10 @@
 use js_sys::Reflect;
 use wasm_bindgen::prelude::*;
 
-use libfw_core::{CHUNK_SIZE, DEFAULT_CONCURRENCY, DEFAULT_UPLOAD_WINDOW, MAX_RETRIES};
+use libfw_core::{
+    CHUNK_SIZE, DEFAULT_CONCURRENCY, DEFAULT_DOWNLOAD_CHUNK_SIZE, DEFAULT_DOWNLOAD_WINDOW,
+    DEFAULT_UPLOAD_WINDOW, MAX_RETRIES,
+};
 
 /// Default delay before the first retry (milliseconds).
 pub const DEFAULT_BASE_RETRY_MS: u32 = 500;
@@ -26,6 +29,21 @@ pub struct ClientConfig {
     /// chunks in flight, so a high-latency link stays saturated (throughput
     /// is bounded by bandwidth, not `chunk_size / RTT`).
     pub upload_window: usize,
+    /// In-flight byte-range window for a single file's **download** (default
+    /// 4).
+    ///
+    /// A large file is downloaded as `download_window` concurrent `Range`
+    /// GETs so its throughput is bounded by bandwidth instead of one
+    /// connection's `chunk_size / RTT` (tus-style parallel transfer). Set to
+    /// `1` to fall back to the sequential single-connection path.
+    pub download_window: usize,
+    /// Chunk size for parallel downloads (default 256 KiB).
+    ///
+    /// Smaller than the upload chunk on purpose: the WASM engine reorders
+    /// in-flight chunks in memory so the SDK keeps receiving them in order
+    /// (append-mode writes), and `download_window * download_chunk_size` is
+    /// that buffer's worst-case size.
+    pub download_chunk_size: u64,
     /// Request `zrip` compression from the server / compress uploads.
     pub compress: bool,
     /// Fixed chunk size used to slice files (default 2 MiB).
@@ -45,6 +63,8 @@ impl Default for ClientConfig {
         ClientConfig {
             concurrency: DEFAULT_CONCURRENCY,
             upload_window: DEFAULT_UPLOAD_WINDOW,
+            download_window: DEFAULT_DOWNLOAD_WINDOW,
+            download_chunk_size: DEFAULT_DOWNLOAD_CHUNK_SIZE,
             compress: true,
             chunk_size: CHUNK_SIZE,
             max_retries: MAX_RETRIES,
@@ -107,6 +127,16 @@ impl ClientConfig {
                 cfg.upload_window = v;
             }
         }
+        if let Some(v) = opt_usize(opts, "downloadWindow") {
+            if v > 0 {
+                cfg.download_window = v;
+            }
+        }
+        if let Some(v) = opt_u64(opts, "downloadChunkSize") {
+            if v > 0 {
+                cfg.download_chunk_size = v;
+            }
+        }
         if let Some(v) = opt_bool(opts, "compress") {
             cfg.compress = v;
         }
@@ -158,6 +188,8 @@ mod tests {
         let cfg = ClientConfig::default();
         assert_eq!(cfg.concurrency, 4);
         assert_eq!(cfg.upload_window, DEFAULT_UPLOAD_WINDOW);
+        assert_eq!(cfg.download_window, DEFAULT_DOWNLOAD_WINDOW);
+        assert_eq!(cfg.download_chunk_size, DEFAULT_DOWNLOAD_CHUNK_SIZE);
         assert_eq!(cfg.chunk_size, CHUNK_SIZE);
         assert_eq!(cfg.max_retries, MAX_RETRIES);
         assert!(cfg.compress);
@@ -196,6 +228,18 @@ mod tests {
             &JsValue::from_f64(16.0),
         )
         .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("downloadWindow"),
+            &JsValue::from_f64(6.0),
+        )
+        .unwrap();
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("downloadChunkSize"),
+            &JsValue::from_f64(131072.0),
+        )
+        .unwrap();
         js_sys::Reflect::set(&obj, &JsValue::from_str("compress"), &JsValue::FALSE).unwrap();
         js_sys::Reflect::set(
             &obj,
@@ -206,6 +250,8 @@ mod tests {
         let cfg = ClientConfig::from_js(&obj);
         assert_eq!(cfg.concurrency, 8);
         assert_eq!(cfg.upload_window, 16);
+        assert_eq!(cfg.download_window, 6);
+        assert_eq!(cfg.download_chunk_size, 131072);
         assert!(!cfg.compress);
         assert_eq!(cfg.chunk_size, 1024);
     }

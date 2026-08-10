@@ -59,8 +59,9 @@ pub struct LibfwClient {
 #[wasm_bindgen]
 impl LibfwClient {
     /// Create an engine. `options` may include:
-    /// `{ concurrency, compress, chunkSize, maxRetries, baseRetryDelayMs,
-    /// maxRetryDelayMs, timeoutMs }`.
+    /// `{ concurrency, uploadWindow, downloadWindow, downloadChunkSize,
+    /// compress, chunkSize, maxRetries, baseRetryDelayMs, maxRetryDelayMs,
+    /// timeoutMs }`.
     #[wasm_bindgen(constructor)]
     pub fn new(opts: JsValue) -> LibfwClient {
         let config = ClientConfig::from_js(&opts);

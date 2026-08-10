@@ -18,6 +18,41 @@ pub const DEFAULT_CONCURRENCY: usize = 4;
 /// still works within browser per-origin connection limits (~6 for HTTP/1.1).
 pub const DEFAULT_UPLOAD_WINDOW: usize = 8;
 
+/// Default in-flight chunk window for a single file's **download**.
+///
+/// The tus-style parallel download fetches a large file as many concurrent
+/// byte-range GETs, so a single file's throughput is bounded by bandwidth
+/// instead of `chunk_size / RTT` (the same bandwidth-delay-product fill that
+/// [`DEFAULT_UPLOAD_WINDOW`] provides for uploads). Independent of
+/// `concurrency` (cross-file) and of the upload window. Kept modest because
+/// the WASM engine buffers in-flight chunks in a reorder map so it can emit
+/// them to the SDK strictly in order (append-mode writes); the buffer bound
+/// is `window * download_chunk_size`.
+pub const DEFAULT_DOWNLOAD_WINDOW: usize = 4;
+
+/// Default chunk size for parallel (byte-range) downloads — 256 KiB.
+///
+/// Deliberately smaller than the 2 MiB upload chunk: the WASM engine holds
+/// up to `download_window` of these in a reorder buffer while waiting for
+/// them to arrive in order, so `window * chunk_size` (4 × 256 KiB = 1 MiB by
+/// default) is the engine's worst-case extra allocation — comfortably under
+/// the ~2 MiB per-file memory budget.
+pub const DEFAULT_DOWNLOAD_CHUNK_SIZE: u64 = 256 * 1024;
+
+/// A file with fewer remaining bytes than this stays on the sequential
+/// single-connection download path; larger files use the parallel range-GET
+/// path (which has per-request overhead that only pays off at size).
+pub const MIN_PARALLEL_DOWNLOAD_BYTES: u64 = 512 * 1024;
+
+/// Server-side TTL after which an unfinished "session" upload temp (and its
+/// `.blocks` range sidecar) is considered stale and garbage-collected.
+///
+/// tus `Expiration`-style: a client that vanishes mid-upload would otherwise
+/// leave its shared temp behind forever; the server sweeps temps older than
+/// this. Uploads that are actively being written keep their temp fresh, so
+/// this never interrupts an in-flight transfer.
+pub const DEFAULT_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 /// Default maximum retry count for a failed chunk before failing the task.
 pub const MAX_RETRIES: u32 = 3;
 

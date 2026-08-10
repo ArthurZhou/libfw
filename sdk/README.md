@@ -11,8 +11,11 @@ import { LibfwClient } from 'libfw-client';
 const client = new LibfwClient({
   baseUrl: '/api',      // where libfw-server routes are mounted
   concurrency: 4,       // max parallel file transfers
-  uploadWindow: 8,      // in-flight chunks per single file (raise to reduce
-                        // upload stutter on high-latency links)
+  uploadWindow: 8,      // in-flight chunks per single file upload (raise to
+                        // reduce upload stutter on high-latency links)
+  downloadWindow: 4,    // in-flight byte-range GETs per single file download
+                        // (tus-style parallel download: one file's throughput
+                        // isn't bounded by a single connection's RTT)
   compress: true,       // zrip streaming compression
   onEvent: (e) => console.log(e), // { type: 'progress', done, total }
 });
@@ -40,18 +43,25 @@ client.cancel();
 - `downloadFolder(token, dirPath?)` / `downloadFile(token, filePath)` — the
   engine lists (for folders) and downloads each file with `Range`/`If-Range`
   resume, decompresses the zrip stream, and pushes `Uint8Array` chunks to the
-  SDK. With the File System Access API the SDK streams them to disk via
-  `fileHandle.createWritable()`; without it (or with `downloadMode: 'browser'`)
-  the SDK buffers the chunks and saves the result through a traditional
-  browser download — a single file as-is, a folder packed into a `.zip`.
+  SDK. Large files use the **tus-style parallel path**: `downloadWindow`
+  concurrent byte-range GETs, reordered in memory so the SDK still receives
+  bytes strictly in order (append-mode `createWritable()`, no `.crswap`
+  churn), with per-chunk independent retries. With the File System Access API
+  the SDK streams them to disk via `fileHandle.createWritable()`; without it
+  (or with `downloadMode: 'browser'`) the SDK buffers the chunks and saves the
+  result through a traditional browser download — a single file as-is, a
+  folder packed into a `.zip`.
 - `upload(token, files?)` — the engine slices each file into fixed-size
   chunks, reads them via `readFile`, compresses each chunk into one zstd
   frame, and POSTs them with an absolute `x-libfw-offset` into a shared
   per-session temp file. Up to `uploadWindow` chunks of one file are kept in
   flight concurrently (independent of the cross-file `concurrency`), so a
-  high-latency link stays saturated and only genuinely missing blocks are
-  re-sent after an interruption (server-probed, BitTorrent-style). A final
-  `x-libfw-final` request merges the temp into place.
+  high-latency link stays saturated. Uploads are **tus-style
+  verify-then-complete**: the server is the source of truth — the client
+  probes the byte ranges the server actually persisted and re-sends only the
+  still-missing blocks, filling gaps a lost response may have left (and
+  re-probing + refilling if a commit fails) before the final `x-libfw-final`
+  request merges the temp into place.
 - Resume state (`etag`, `offset`, `size`) is persisted per path in
   IndexedDB and re-validated on every retry.
 - Pause/resume/cancel drive the WASM state machine
@@ -80,6 +90,12 @@ dist/libfw-client.umd.js   UMD bundle (after build:umd)
 ## API
 
 - `new LibfwClient(options?)`
+  - `downloadWindow: number` (default `4`) — in-flight byte-range GETs per
+    single file download; `1` disables parallelism.
+  - `downloadChunkSize: number` (default `262144`, 256 KiB) — byte range size
+    for parallel downloads; the engine reorders in-flight chunks in memory
+    (worst case ≈ `downloadWindow * downloadChunkSize` bytes) so the SDK
+    still receives data in order.
   - `downloadMode: 'auto' | 'fs' | 'browser'` (default `'auto'`) — `'fs'`
     streams downloads through the File System Access API; `'browser'` buffers
     and triggers a traditional browser download (folders become `.zip`);

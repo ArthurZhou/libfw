@@ -160,6 +160,19 @@ async fn probe_session(
     ))
 }
 
+/// The sub-ranges of a whole file (aligned to `chunk_size` boundaries) not
+/// covered by any `received` range.
+///
+/// Used after a probe to compute exactly which blocks are still missing, so
+/// only the broken/lost parts get re-transmitted (tus-style resume).
+fn aligned_missing(file: &FileEntry, chunk_size: u64, received: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut missing = Vec::new();
+    for (start, end) in chunk_bounds(file, chunk_size, 0) {
+        missing.extend(missing_ranges(start, end, received));
+    }
+    missing
+}
+
 /// The sub-ranges of `[start, end)` not covered by any `received` range.
 ///
 /// Used after a probe to compute exactly which bytes are still missing, so
@@ -318,14 +331,24 @@ async fn commit_upload(
 
 /// Upload a whole file with the resumable, out-of-order "session" protocol.
 ///
-/// This is the BitTorrent-style transfer path: each block is POSTed with its
+/// This is the tus-style transfer path: each block is POSTed with its
 /// ABSOLUTE `x-libfw-offset` into a shared per-session temp on the server
-/// (positional writes), so blocks may be sent out of order and pipelined with
-/// a bounded in-flight window — throughput is bounded by bandwidth instead of
-/// `chunk_size / RTT`. Before sending, the server is probed for the byte
-/// ranges it already holds (from a previous interrupted attempt); only the
-/// still-missing blocks are (re)sent. A final `x-libfw-final` commit request
-/// verifies the merged size then renames the temp into place ("merge").
+/// (positional writes), so blocks may be sent out of order and pipelined
+/// with a bounded in-flight window — throughput is bounded by bandwidth
+/// instead of `chunk_size / RTT`.
+///
+/// The server is the **source of truth**: before and after sending, the
+/// client probes the byte ranges the server has actually persisted (tus's
+/// `Upload-Offset` / `HEAD` philosophy) and re-sends *only* the still-missing
+/// gaps — "verify-then-complete". Retransmission is self-healing: a lost
+/// response that nonetheless landed server-side is detected by the next probe
+/// (no wasted re-send), a block whose write was truly lost is re-sent, and a
+/// failed commit triggers a fresh probe + refill instead of failing the task.
+/// A final `x-libfw-final` commit request verifies the merged size then
+/// renames the temp into place ("merge").
+///
+/// A legacy server that ignores the probe yields an empty range list → a
+/// full re-send, which is correct thanks to idempotent positional writes.
 async fn upload_session_resumable(
     base_url: &str,
     token: &str,
@@ -335,92 +358,113 @@ async fn upload_session_resumable(
     config: &ClientConfig,
 ) -> Result<u64, LibfwError> {
     let session = session_id_for(file);
+    let window = config.upload_window.max(1);
 
-    // Probe the server for what it already has. A legacy server that ignores
-    // the probe yields an empty range list → we (correctly) re-send all
-    // blocks; positional writes are idempotent so this is always safe.
+    // Initial probe: bytes the server already holds (from a previous
+    // interrupted attempt) are seeded into progress so a resume reflects the
+    // true fraction. They are NOT counted in the returned `uploaded` figure,
+    // which reports only what THIS session retained.
     let received = probe_session(base_url, token, file, &session, config.timeout_ms).await?
         .unwrap_or_default();
-
-    // Compute the missing byte ranges across the whole file, then align them
-    // to chunk boundaries so each block is a bounded request.
-    let mut missing: Vec<(u64, u64)> = Vec::new();
-    for (start, end) in chunk_bounds(file, config.chunk_size, 0) {
-        missing.extend(missing_ranges(start, end, &received));
-    }
-
-    let mut uploaded = 0u64;
-
-    // Seed the shared progress with bytes the server already holds (from a
-    // previous interrupted attempt), so a resume reflects the true fraction
-    // done and a pure resume reaches 100% at completion. These bytes are NOT
-    // counted in the returned `uploaded` figure, which reports only what this
-    // session actually sent.
-    let covered = covered_bytes(&received).min(file.size);
-    if covered > 0 {
-        control.add_progress(covered);
+    let initial_covered = covered_bytes(&received).min(file.size);
+    if initial_covered > 0 {
+        control.add_progress(initial_covered);
         control.report_progress_if(callbacks)?;
     }
 
-    // Empty file, or nothing missing after a full prior attempt: just commit
-    // (merge) the already-received temp into place.
-    if missing.is_empty() {
-        commit_upload(base_url, token, file, callbacks, control, config, &session).await?;
-        callbacks
-            .save_state(
-                "upload",
-                &file.path,
-                &state_json(file.size, &file.to_meta().etag, file.size),
-            )
-            .await?;
-        return Ok(0);
-    }
+    let mut rounds = 0u32;
+    loop {
+        control.wait_ready().await?;
+        control.check()?;
 
-    // Send the missing blocks concurrently (out of order) with a bounded
-    // per-file window. Kept independent of (and typically larger than) the
-    // cross-file `concurrency` so a single file keeps enough chunks in flight
-    // to fill the bandwidth-delay product — avoiding the fill/drain/fill
-    // stutter a tiny window causes on high-latency links. No special
-    // first-chunk handling is needed: the probe already created the shared
-    // temp on the server.
-    let window = config.upload_window.max(1);
-    let mut stream = futures::stream::iter(
-        missing
-            .into_iter()
-            .map(|(start, end)| {
-                let base_url = base_url.to_string();
-                let token = token.to_string();
-                let file = file.clone();
-                let callbacks = callbacks.clone();
-                let control = control.clone();
-                let config = config.clone();
-                let session = session.clone();
-                async move {
-                    upload_one_chunk(
-                        &base_url, &token, &file, &callbacks, &control, &config, start, end,
-                        &session,
-                    )
-                    .await
+        // 1. Ask the server what it actually holds (authoritative).
+        let received = probe_session(base_url, token, file, &session, config.timeout_ms).await?
+            .unwrap_or_default();
+        let missing = aligned_missing(file, config.chunk_size, &received);
+
+        // 2. Everything present → commit. A commit failure (e.g. a size
+        //    mismatch from a racing write) does NOT fail the task: we loop
+        //    back, re-probe and re-fill the gaps, then retry the commit.
+        if missing.is_empty() {
+            match commit_upload(base_url, token, file, callbacks, control, config, &session)
+                .await
+            {
+                Ok(()) => {
+                    callbacks
+                        .save_state(
+                            "upload",
+                            &file.path,
+                            &state_json(file.size, &file.to_meta().etag, file.size),
+                        )
+                        .await?;
+                    let final_covered = covered_bytes(&received).min(file.size);
+                    return Ok(final_covered.saturating_sub(initial_covered));
                 }
-            }),
-    )
-    .buffer_unordered(window);
+                Err(e) => {
+                    if rounds >= config.max_retries {
+                        return Err(e);
+                    }
+                    rounds += 1;
+                    callbacks.log(&format!(
+                        "commit failed for `{}`; re-verifying server state: {e}",
+                        file.path
+                    ));
+                    continue;
+                }
+            }
+        }
 
-    while let Some(res) = stream.next().await {
-        uploaded = uploaded.saturating_add(res?);
+        // 3. Re-send ONLY the missing blocks, concurrently (out of order)
+        //    with a bounded per-file window — independent of (and typically
+        //    larger than) the cross-file `concurrency`, so one file keeps
+        //    enough chunks in flight to fill the bandwidth-delay product on
+        //    high-latency links. Per-block failures are collected, not fatal:
+        //    the next probe decides what truly remains, so we only ever
+        //    retransmit the broken/lost parts.
+        let mut stream = futures::stream::iter(missing.into_iter().map(|(start, end)| {
+            let base_url = base_url.to_string();
+            let token = token.to_string();
+            let file = file.clone();
+            let callbacks = callbacks.clone();
+            let control = control.clone();
+            let config = config.clone();
+            let session = session.clone();
+            async move {
+                upload_one_chunk(
+                    &base_url, &token, &file, &callbacks, &control, &config, start, end, &session,
+                )
+                .await
+            }
+        }))
+        .buffer_unordered(window);
+
+        let mut first_error: Option<LibfwError> = None;
+        while let Some(res) = stream.next().await {
+            if let Err(e) = res {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+
+        rounds += 1;
+        if rounds > config.max_retries {
+            // Bounded: give the server one final probe; if it still reports
+            // gaps, surface the first underlying error (or a convergence
+            // error). This mirrors tus's give-up path after repeated HEADs.
+            let received = probe_session(base_url, token, file, &session, config.timeout_ms).await?
+                .unwrap_or_default();
+            if aligned_missing(file, config.chunk_size, &received).is_empty() {
+                continue; // converged → loop top commits
+            }
+            return Err(first_error.unwrap_or_else(|| {
+                LibfwError::Protocol(format!(
+                    "upload of `{}` did not converge after {rounds} rounds",
+                    file.path
+                ))
+            }));
+        }
     }
-
-    // Commit (verify merged size == meta.size, then rename into place).
-    commit_upload(base_url, token, file, callbacks, control, config, &session).await?;
-
-    callbacks
-        .save_state(
-            "upload",
-            &file.path,
-            &state_json(file.size, &file.to_meta().etag, file.size),
-        )
-        .await?;
-    Ok(uploaded)
 }
 
 /// Total number of bytes covered by a set of (possibly overlapping) received
@@ -499,7 +543,15 @@ pub async fn upload(
     while let Some(result) = stream.next().await {
         done = done.saturating_add(result?);
         // Single source of truth for progress is the shared control block.
-        callbacks.on_progress(control.done_bytes(), control.total_bytes())?;
+        // Clamp the done figure so a rare gap-fill re-send (which re-counts a
+        // few bytes) can never show a bar past 100%.
+        let total = control.total_bytes();
+        let reported_done = if total == 0 {
+            control.done_bytes()
+        } else {
+            control.done_bytes().min(total)
+        };
+        callbacks.on_progress(reported_done, total)?;
     }
     Ok(done)
 }
@@ -507,6 +559,40 @@ pub async fn upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aligned_missing_covers_full_file_when_nothing_received() {
+        let f = FileEntry {
+            path: "f.bin".into(),
+            size: 10,
+            mtime: 1,
+        };
+        let missing = aligned_missing(&f, 4, &[]);
+        assert_eq!(missing, vec![(0, 4), (4, 8), (8, 10)]);
+    }
+
+    #[test]
+    fn aligned_missing_only_gaps() {
+        let f = FileEntry {
+            path: "f.bin".into(),
+            size: 20,
+            mtime: 1,
+        };
+        // Received [0,4) and [8,12) → only the two gaps remain, aligned.
+        let missing = aligned_missing(&f, 4, &[(0, 4), (8, 12)]);
+        assert_eq!(missing, vec![(4, 8), (12, 16), (16, 20)]);
+    }
+
+    #[test]
+    fn aligned_missing_empty_when_fully_received() {
+        let f = FileEntry {
+            path: "f.bin".into(),
+            size: 12,
+            mtime: 1,
+        };
+        let missing = aligned_missing(&f, 4, &[(0, 12)]);
+        assert!(missing.is_empty());
+    }
 
     #[test]
     fn missing_ranges_none_when_fully_received() {

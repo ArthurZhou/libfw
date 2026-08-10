@@ -281,9 +281,12 @@ npm --prefix sdk run build:umd
 const client = new LibfwClient({
   baseUrl: '/api',            // where libfw-server routes are mounted
   concurrency: 4,             // max parallel file transfers (default 4)
-  uploadWindow: 8,            // in-flight chunks per single file (default 8;
-                              // raise to reduce upload stutter on high-latency
-                              // links, keep within server conn limit ~6 HTTP/1.1)
+  uploadWindow: 8,            // in-flight chunks per single file upload (default 8;
+                              // raise to reduce upload stutter on high-latency links)
+  downloadWindow: 4,          // in-flight byte-range GETs per single file download
+                              // (default 4; tus-style parallel download, so one file's
+                              // throughput isn't limited by a single connection's RTT)
+  downloadChunkSize: 256 * 1024, // byte range size for parallel downloads (default 256 KiB)
   compress: true,             // negotiate zrip compression (default true)
   chunkSize: 2 * 1024 * 1024, // upload chunk size (default 2 MiB)
   maxRetries: 3,              // retries per chunk/file (default 3)
@@ -308,6 +311,18 @@ Bytes are streamed from the server, decompressed, and written with
 with `keepExistingData: true`, an interrupted download resumes exactly where
 it stopped (`Range`/`If-Range` revalidation, IndexedDB-backed offsets).
 
+**tus-style parallel download** (default on): a large file is fetched as
+`downloadWindow` concurrent `Range` GETs, so a single file's throughput is
+bounded by bandwidth instead of one connection's `chunkSize / RTT` — the
+same bandwidth-delay-product fill that `uploadWindow` provides for uploads.
+The engine reorders in-flight chunks in memory (worst case ≈
+`downloadWindow × downloadChunkSize` bytes) so the SDK still receives bytes
+strictly in order (append-mode writes, no `.crswap` churn). Each chunk is
+retried independently, so a transient failure re-fetches only the lost part;
+on resume the client first asks the server via `HEAD` (authoritative size +
+ETag) and re-validates the persisted offset, then fetches only the chunks
+after it.
+
 ### Uploading
 
 ```js
@@ -327,10 +342,17 @@ Each file is sliced into fixed-size chunks, each chunk compressed into one
 zstd frame and POSTed with an absolute `x-libfw-offset` into a shared
 per-session temp file. Up to `uploadWindow` chunks of one file are kept in
 flight concurrently (independent of the cross-file `concurrency`), so a
-high-latency link stays saturated. Before sending, the server is probed for
-the byte ranges it already holds; only the still-missing blocks are re-sent
-(BitTorrent-style resume), and a final `x-libfw-final` request merges the temp
-into place.
+high-latency link stays saturated.
+
+Uploads are **tus-style verify-then-complete**: the server is the source of
+truth — the client probes the byte ranges the server actually persisted, and
+re-sends *only* the still-missing blocks. After each batch it re-probes and
+fills any holes that per-request retries could not confirm (e.g. a response
+lost after the server already wrote the data), and a failed commit triggers a
+fresh probe + refill instead of failing the task. A final `x-libfw-final`
+request verifies the merged size then renames the temp into place. Interrupted
+uploads leave a resumable session temp on the server, which the server
+periodically garbage-collects once it is older than the session TTL.
 
 ### Controls and state machine
 
@@ -404,6 +426,15 @@ All routes require `Authorization: Bearer <token>`.
 - `x-libfw-offset` — absent = create (`409` if exists), `0` = overwrite,
   `N > 0` = resume (size mismatch → `412`)
 - `x-libfw-compress` — `zrip` when the body is compressed
+- `x-libfw-session` — concurrent session id (the SDK sends one for every
+  upload). Each chunk carries its ABSOLUTE `x-libfw-offset` and is written
+  positionally into a shared per-session temp, so chunks can be pipelined
+  out of order; `x-libfw-session-status` probes the already-received byte
+  ranges, and `x-libfw-final: 1` commits (size-verified rename). Absent on a
+  request → legacy sequential per-request upload.
+- `HEAD /file/{*path}` is the tus-style metadata probe: the client reads the
+  authoritative `ETag` + `Content-Length` to plan parallel downloads and to
+  validate the persisted resume offset.
 
 ### Directory listing
 

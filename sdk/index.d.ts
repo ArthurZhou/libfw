@@ -61,6 +61,21 @@ export interface LibfwClientOptions {
    * (~6 for HTTP/1.1). Default `8`.
    */
   uploadWindow?: number;
+  /**
+   * In-flight byte-range window for a single file's download. Large files
+   * are fetched as `downloadWindow` concurrent `Range` GETs (tus-style
+   * parallel transfer), so a single file's throughput is bounded by
+   * bandwidth instead of one connection's `chunkSize / RTT` on high-latency
+   * links. `1` disables parallelism. Default `4`.
+   */
+  downloadWindow?: number;
+  /**
+   * Byte range size for parallel downloads. Smaller than the upload chunk
+   * on purpose: the engine reorders in-flight chunks in memory (worst case
+   * ≈ `downloadWindow * downloadChunkSize` bytes) so the SDK still receives
+   * data strictly in order. Default `262144` (256 KiB).
+   */
+  downloadChunkSize?: number;
   /** Negotiate zrip compression. Default `true`. */
   compress?: boolean;
   /** Upload chunk size in bytes. Default 2 MiB. */

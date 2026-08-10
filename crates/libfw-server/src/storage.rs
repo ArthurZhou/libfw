@@ -365,6 +365,64 @@ impl StorageBackend for FsStorage {
                 .map_err(|e| StorageError::Other(e))
         }
     }
+
+    async fn cleanup_stale_sessions(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<usize, StorageError> {
+        // tus-style expiry: a client that vanishes mid-upload leaves its
+        // `.libfw-sess-<id>-<name>` temp (and `.blocks` sidecar) behind. Walk
+        // the root, removing the ones whose last write is older than
+        // `max_age`. Only session temps are touched — never committed user
+        // files — and symlinked directories are never followed.
+        let deadline = SystemTime::now()
+            .checked_sub(max_age)
+            .unwrap_or(UNIX_EPOCH);
+        let mut removed = 0usize;
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let mut rd = match tokio::fs::read_dir(&dir).await {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let ft = match entry.file_type().await {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                if ft.is_dir() {
+                    if !ft.is_symlink() {
+                        stack.push(entry.path());
+                    }
+                    continue;
+                }
+                if ft.is_symlink() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.starts_with(".libfw-sess-") {
+                    continue;
+                }
+                let modified = entry
+                    .metadata()
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| UNIX_EPOCH + d)
+                    .unwrap_or(UNIX_EPOCH);
+                if modified < deadline {
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                    // Remove the parallel range sidecar (`<temp>.blocks`).
+                    let mut sidecar = entry.path().as_os_str().to_owned();
+                    sidecar.push(".blocks");
+                    let _ = tokio::fs::remove_file(PathBuf::from(sidecar)).await;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
+    }
 }
 
 /// A temporary path for a target, unique per attempt.
@@ -578,6 +636,14 @@ mod tests {
     use super::*;
     use libfw_core::storage::StorageBackend;
 
+    /// Force a file's mtime (used to age a fake session temp).
+    fn filetime_set(path: &Path, time: std::time::SystemTime) -> std::io::Result<()> {
+        // Open writable: on Windows, setting file times through a read-only
+        // handle is refused.
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+        file.set_times(std::fs::FileTimes::new().set_modified(time))
+    }
+
     #[tokio::test]
     async fn write_read_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -691,6 +757,43 @@ mod tests {
         let storage = FsStorage::new(dir.path());
         assert!(storage.file_meta("../etc/passwd").await.is_err());
         assert!(storage.file_meta("/etc/passwd").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_sessions_removes_old_temps_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path());
+
+        // A stale session temp (very old mtime) + its range sidecar.
+        let stale = dir.path().join(".libfw-sess-oldid-a.bin");
+        std::fs::write(&stale, b"partial").unwrap();
+        std::fs::write(dir.path().join(".libfw-sess-oldid-a.bin.blocks"), b"[[0,7]]").unwrap();
+        // Age it well beyond the 1-hour TTL (7 days old). Windows/FAT can
+        // clamp very old timestamps, so use a recent-but-stale date.
+        let old = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(7 * 24 * 3600))
+            .unwrap();
+        assert!(
+            filetime_set(&stale, old).is_ok(),
+            "failed to age the stale session temp"
+        );
+
+        // A fresh session temp (now) must be kept.
+        let fresh = dir.path().join(".libfw-sess-newid-a.bin");
+        std::fs::write(&fresh, b"partial").unwrap();
+
+        // A committed user file must never be touched.
+        std::fs::write(dir.path().join("real.txt"), b"real").unwrap();
+
+        let removed = storage
+            .cleanup_stale_sessions(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(removed, 1, "only the stale temp is removed");
+        assert!(!stale.exists());
+        assert!(!dir.path().join(".libfw-sess-oldid-a.bin.blocks").exists());
+        assert!(fresh.exists(), "fresh temp survives");
+        assert!(dir.path().join("real.txt").exists(), "user file survives");
     }
 
     #[tokio::test]

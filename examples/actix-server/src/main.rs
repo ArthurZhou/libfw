@@ -588,6 +588,26 @@ async fn main() -> std::io::Result<()> {
             .build(),
     );
 
+    // tus-style expiry: sweep abandoned session-upload temps hourly so a
+    // client that vanished mid-upload never leaves its `.libfw-sess-*` temp
+    // (or `.blocks` sidecar) behind forever.
+    {
+        let storage = state.storage.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                match storage
+                    .cleanup_stale_sessions(libfw_core::DEFAULT_SESSION_TTL)
+                    .await
+                {
+                    Ok(n) if n > 0 => println!("cleaned {n} stale upload session temp(s)"),
+                    _ => {}
+                }
+            }
+        });
+    }
+
     let addr = format!("127.0.0.1:{port}");
     println!("libfw actix-web server listening on {addr}, storage root: {root}");
     println!("dev token: `dev-token`");

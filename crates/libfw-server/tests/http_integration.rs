@@ -370,6 +370,45 @@ async fn range_requests_return_206() {
 }
 
 #[tokio::test]
+async fn head_returns_etag_and_content_length() {
+    let app = app(DevVerifier);
+    let data = b"head metadata payload".to_vec();
+    let meta = libfw_core::metadata::FileMeta::new("h.bin", data.len() as u64, 0);
+    let mut headers = auth_header("tok");
+    headers
+        .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    app.clone()
+        .oneshot(request("POST", "/file/h.bin", headers, Body::from(data.clone())))
+        .await
+        .unwrap();
+
+    // HEAD is the tus-style metadata probe the client relies on to plan
+    // parallel range downloads and to validate the persisted resume offset:
+    // it must expose the authoritative size + etag and carry no body.
+    let resp = app
+        .clone()
+        .oneshot(request("HEAD", "/file/h.bin", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_LENGTH).unwrap(),
+        data.len().to_string().as_str()
+    );
+    assert!(resp.headers().get(header::ETAG).is_some());
+    assert_eq!(resp.headers().get(header::ACCEPT_RANGES).unwrap(), "bytes");
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.is_empty());
+
+    // HEAD on a missing file → 404 (client surfaces it as an error).
+    let resp = app
+        .oneshot(request("HEAD", "/file/missing.bin", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn if_none_match_returns_304() {
     let app = app(DevVerifier);
     let meta = libfw_core::metadata::FileMeta::new("e.txt", 3, 0);

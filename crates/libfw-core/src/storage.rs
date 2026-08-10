@@ -125,4 +125,20 @@ pub trait StorageBackend: Send + Sync + 'static {
 
     /// Remove `path` (file, or directory recursively).
     async fn remove(&self, path: &str) -> Result<(), StorageError>;
+
+    /// Remove stale in-progress "session" upload temps (tus `Expiration`).
+    ///
+    /// A client that vanishes mid-upload leaves its shared session temp (and
+    /// any range sidecar) behind; this sweeps the ones whose last write is
+    /// older than `max_age`, returning how many were removed. Backends that
+    /// do not maintain long-lived session temps return `Ok(0)` (the default);
+    /// the bundled filesystem backend removes `.libfw-sess-*` temps and their
+    /// `.blocks` sidecars.
+    async fn cleanup_stale_sessions(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<usize, StorageError> {
+        let _ = max_age;
+        Ok(0)
+    }
 }

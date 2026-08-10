@@ -193,6 +193,17 @@ export class LibfwClient {
    *        single file's upload; independent of `concurrency`, keeps a
    *        high-latency link saturated (raise it to reduce upload stutter;
    *        keep within your server's connection limit, ~6 for HTTP/1.1)
+   * @param {number} [options.downloadWindow=4] in-flight byte-range window
+   *        for a single file's download. Large files are fetched as
+   *        `downloadWindow` concurrent `Range` GETs (tus-style parallel
+   *        transfer), so a single file's throughput is bounded by bandwidth
+   *        instead of one connection's `chunkSize / RTT` on high-latency
+   *        links. `1` disables parallelism (sequential downloads).
+   * @param {number} [options.downloadChunkSize=262144] byte range size for
+   *        parallel downloads (256 KiB default). Smaller than the upload
+   *        chunk on purpose: the engine reorders in-flight chunks in memory
+   *        (worst case ≈ `downloadWindow * downloadChunkSize` bytes) so the
+   *        SDK still receives data strictly in order.
    * @param {boolean} [options.compress=true] negotiate zrip compression
    * @param {number} [options.chunkSize=2097152] upload chunk size in bytes
    * @param {number} [options.maxRetries=3] retries per chunk/file before failing
@@ -221,6 +232,8 @@ export class LibfwClient {
       baseUrl: '',
       concurrency: 4,
       uploadWindow: 8,
+      downloadWindow: 4,
+      downloadChunkSize: 256 * 1024,
       compress: true,
       chunkSize: 2 * 1024 * 1024,
       maxRetries: 3,
@@ -278,6 +291,8 @@ export class LibfwClient {
     const engine = new WasmEngine({
       concurrency: this._options.concurrency,
       uploadWindow: this._options.uploadWindow,
+      downloadWindow: this._options.downloadWindow,
+      downloadChunkSize: this._options.downloadChunkSize,
       compress: this._options.compress,
       chunkSize: this._options.chunkSize,
       maxRetries: this._options.maxRetries,

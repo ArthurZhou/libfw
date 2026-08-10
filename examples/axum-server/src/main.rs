@@ -113,6 +113,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         static_dir: static_dir.clone(),
     });
 
+    // tus-style expiry: sweep abandoned session-upload temps hourly so a
+    // client that vanished mid-upload never leaves its `.libfw-sess-*` temp
+    // (or `.blocks` sidecar) behind forever.
+    {
+        let storage = state.storage.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                match storage
+                    .cleanup_stale_sessions(libfw_core::DEFAULT_SESSION_TTL)
+                    .await
+                {
+                    Ok(n) if n > 0 => {
+                        tracing::info!("cleaned {n} stale upload session temp(s)")
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
     // `GET /health` — service info (no auth required). Captures `health` by
     // value so it works on a state-less router.
     let health_route = {
