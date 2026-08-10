@@ -41,6 +41,7 @@ mod auth;
 mod handlers;
 mod http;
 mod storage;
+mod ws;
 
 pub use auth::{AuthRejection, BearerClaims};
 pub use http::{
@@ -48,6 +49,7 @@ pub use http::{
     parse_range_header, ParsedRange, RangeParseError,
 };
 pub use storage::{FsStorage, FsSink};
+pub use ws::ws_handler;
 
 use std::sync::Arc;
 
@@ -205,6 +207,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/file/{*path}", post(handlers::upload))
         .route("/dir", get(handlers::list_dir_root))
         .route("/dir/{*path}", get(handlers::list_dir))
+        .route("/ws", get(ws_handler))
         .layer(axum::middleware::from_fn(validate_protocol))
         .with_state(state)
 }

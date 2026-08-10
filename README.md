@@ -18,16 +18,25 @@ examples/
 sdk/              libfw-client npm package (ESM + TS types + wasm)
 ```
 
+
+
 ## Highlights
 
-- **Resumable**: server answers `206 Partial Content` with `Content-Range` /
-  `ETag`; supports `If-Range`, `If-None-Match` (→ `304`), `416` on
-  unsatisfiable ranges and `412` on stale upload offsets. The client persists
-  `{ etag, offset, size }` in IndexedDB and re-validates on every retry.
-- **Streaming & constant memory**: both sides use a 64 KiB sliding window;
-  the server writes uploads to a temp file and atomically renames on commit.
-- **Compression**: `zrip` streaming compressor/decompressor, negotiated via
-  `x-libfw-compress` / `Accept-Encoding: zrip`.
+- **WebSocket transport**: the browser engine talks to the server over a
+  single WebSocket (`/ws`) for **all** control commands (handshake, listing,
+  metadata) and data flow. Upload and download use the **same** no-ack block
+  protocol: the sender pipelines fixed-size blocks out of order, the receiver
+  verifies every block (CRC32) in real time, marks bad ones and asks the
+  sender to re-queue them, and a wave boundary reconciles until everything is
+  verified. The HTTP routes below remain for raw clients (curl, tests).
+- **Resumable**: the client persists `{ etag, offset, size }` in IndexedDB and
+  re-validates against the server (source of truth) on every retry; uploads
+  resume from a shared per-session temp (BitTorrent-style, only the missing
+  blocks are re-sent).
+- **Streaming & constant memory**: both sides use a bounded block window and a
+  64 KiB sliding read buffer; the server writes uploads to a temp file and
+  atomically renames on commit.
+- **Compression**: `zrip` per-block compression, negotiated per transfer.
 - **Fine-grained auth**: `Authorization: Bearer <token>` → verified claims →
   path-prefix + read/write permission validation (`401`/`403`). libfw never
   issues tokens.
@@ -42,6 +51,7 @@ sdk/              libfw-client npm package (ESM + TS types + wasm)
 - [Authorization](#authorization)
 - [Storage backends](#storage-backends)
 - [Browser SDK guide](#browser-sdk-guide)
+- [WebSocket transport](#websocket-transport)
 - [HTTP protocol](#http-protocol)
 - [Building from source](#building-from-source)
 - [Testing](#testing)
@@ -397,12 +407,53 @@ Downloading/uploading folders requires the File System Access API
 (`showDirectoryPicker`), so Chromium-based browsers only. `downloadFolder`
 throws `LibfwError` with code `unsupported` elsewhere.
 
+## WebSocket transport
+
+The browser SDK/WASM engine performs **all** communication over one WebSocket
+connection per file at `GET /ws` (`ws(s)://…/ws`; derived from `baseUrl` or
+set explicitly with the `wsUrl` option). Every message is a binary frame whose
+first byte is the frame type (see `libfw-core::ws`).
+
+### Frames
+
+| Type | Byte | Direction | Payload |
+| ---- | ---- | --------- | ------- |
+| HELLO / HELLO_OK | `0x01`/`0x02` | C→S / S→C | `{protocol, token}` / `{ok}` |
+| LIST_REQ / LIST_REPLY | `0x10`/`0x11` | C→S / S→C | directory listing (JSON) |
+| META_REQ / META_REPLY | `0x12`/`0x13` | C→S / S→C | file size/etag (JSON) |
+| START / READY | `0x20`/`0x21` | C→S / S→C | transfer setup (JSON) |
+| BLOCK | `0x30` | sender → receiver | `[index][crc32][raw_len][data]` |
+| NAK | `0x31` | receiver → sender | `[index]` (re-queue this block) |
+| REQ | `0x32` | receiver → sender | `[count][index…]` (re-send these) |
+| WAVE_DONE | `0x33` | sender → receiver | wave boundary |
+| COMPLETE | `0x34` | receiver → sender | `{ok,size,error}` |
+| ERROR | `0xFF` | either | `{code,message}` |
+
+### Transfer model (identical for upload and download)
+
+1. The sender **pipelines** up to `window` blocks with **no per-block
+   acknowledgment**, and blocks may be sent **out of order**.
+2. The receiver **verifies every block in real time** (CRC32 + length +
+   bounds), writes it at its absolute offset, and **marks bad blocks** with a
+   `NAK`.
+3. After each wave the sender sends `WAVE_DONE`; the receiver reconciles and
+   either completes (`COMPLETE`) or asks for the still-missing blocks (`REQ`),
+   which the sender **re-adds to its transfer queue** and re-sends until the
+   receiver has verified everything.
+4. Downloads are resumable by `{etag, offset}`; uploads are resumable via the
+   server's per-session temp (the `READY.received` ranges seed progress and
+   only the missing blocks are retransmitted).
+
 ## HTTP protocol
+
+The HTTP routes remain available for raw clients (curl, older builds, tests);
+the browser SDK uses the WebSocket transport above.
 
 ### Routes
 
 | Method | Route          | Purpose |
 | ------ | -------------- | ------- |
+| GET    | `/ws`           | WebSocket transport (HELLO handshake) |
 | GET    | `/file/{*path}` | download (Range, ETag, If-Range, compression) |
 | HEAD   | `/file/{*path}` | metadata only |
 | POST   | `/file/{*path}` | streaming upload (headers below) |

@@ -41,6 +41,7 @@ pub mod error;
 pub mod metadata;
 pub mod range;
 pub mod storage;
+pub mod ws;
 
 pub use auth::{Action, AuthError, PathValidator, TokenVerifier, Validator};
 pub use claims::{Permission, TokenClaims};
@@ -50,3 +51,11 @@ pub use error::{CompressError, DecompressError, StorageError};
 pub use metadata::{ChunkMeta, FileMeta, TransferPlan};
 pub use range::RangeSpec;
 pub use storage::{DirEntry, StorageBackend, UploadSink, WriteMode};
+pub use ws::{
+    Block, BlockSet, CompleteMessage, ErrorMessage, Hello, ReadyReply, StartRequest, TransferKind,
+    block_bounds, block_count, block_frame, block_offset, control_frame, crc32, frame_payload,
+    frame_type, missing_blocks, nak_frame, parse_block, parse_control, parse_nak, parse_req,
+    req_frame, wave_done_frame, FRAME_BLOCK, FRAME_COMPLETE, FRAME_ERROR, FRAME_HELLO,
+    FRAME_HELLO_OK, FRAME_LIST_REPLY, FRAME_LIST_REQ, FRAME_META_REPLY, FRAME_META_REQ, FRAME_NAK,
+    FRAME_READY, FRAME_REQ, FRAME_START, FRAME_WAVE_DONE,
+};

@@ -235,12 +235,15 @@ impl TaskControl {
             }
             return Ok(());
         }
-        let last = self.last_reported.get();
-        let done_pct = done.saturating_mul(100) / total;
+        // Clamp so a rare gap-fill re-send (which re-counts a few bytes) can
+        // never push the reported fraction past 100%.
+        let reported = done.min(total);
+        let last = self.last_reported.get().min(total);
+        let done_pct = reported.saturating_mul(100) / total;
         let last_pct = last.saturating_mul(100) / total;
-        if done_pct != last_pct || done >= total {
-            self.last_reported.set(done);
-            return callbacks.on_progress(done, total);
+        if done_pct != last_pct || reported >= total {
+            self.last_reported.set(reported);
+            return callbacks.on_progress(reported, total);
         }
         Ok(())
     }

@@ -50,35 +50,40 @@ export interface LibfwEvent {
 
 /** Options accepted by the {@link LibfwClient} constructor. */
 export interface LibfwClientOptions {
-  /** Base URL the libfw server routes are mounted under. Default `''`. */
+  /**
+   * Base URL the libfw server is served from. The engine derives the
+   * WebSocket endpoint from it (`http://h:8080` → `ws://h:8080/ws`);
+   * same-origin when empty. All control commands and data transfer travel
+   * over that WebSocket. Default `''`.
+   */
   baseUrl?: string;
   /** Max concurrently-transferring files. Default `4`. */
   concurrency?: number;
   /**
-   * In-flight chunk window for a single file's upload, independent of
-   * `concurrency`. A higher value keeps high-latency links saturated and
-   * reduces upload stutter; keep it within your server's connection limit
-   * (~6 for HTTP/1.1). Default `8`.
+   * In-flight block window for a single file's upload, independent of
+   * `concurrency`. Blocks are pipelined over one WebSocket without per-block
+   * acknowledgments; this bounds how many are in flight before a
+   * reconciliation round. A higher value keeps high-latency links saturated.
+   * Default `8`.
    */
   uploadWindow?: number;
   /**
-   * In-flight byte-range window for a single file's download. Large files
-   * are fetched as `downloadWindow` concurrent `Range` GETs (tus-style
-   * parallel transfer), so a single file's throughput is bounded by
-   * bandwidth instead of one connection's `chunkSize / RTT` on high-latency
-   * links. `1` disables parallelism. Default `4`.
+   * In-flight block window for a single file's download. The server
+   * pipelines up to this many blocks per wave; a higher value keeps
+   * high-latency links saturated. The engine reorders out-of-order blocks in
+   * memory (worst case ≈ `downloadWindow * downloadChunkSize` bytes) so the
+   * SDK still receives data strictly in order. Default `4`.
    */
   downloadWindow?: number;
   /**
-   * Byte range size for parallel downloads. Smaller than the upload chunk
-   * on purpose: the engine reorders in-flight chunks in memory (worst case
-   * ≈ `downloadWindow * downloadChunkSize` bytes) so the SDK still receives
-   * data strictly in order. Default `262144` (256 KiB).
+   * Block size for downloads. The engine reorders in-flight blocks in
+   * memory (worst case ≈ `downloadWindow * downloadChunkSize` bytes) so the
+   * SDK still receives data strictly in order. Default `262144` (256 KiB).
    */
   downloadChunkSize?: number;
   /** Negotiate zrip compression. Default `true`. */
   compress?: boolean;
-  /** Upload chunk size in bytes. Default 2 MiB. */
+  /** Upload block size in bytes. Default 2 MiB. */
   chunkSize?: number;
   /** Retries per chunk/file before failing. Default `3`. */
   maxRetries?: number;
@@ -86,8 +91,13 @@ export interface LibfwClientOptions {
   baseRetryDelayMs?: number;
   /** Backoff ceiling (ms). Default `30000`. */
   maxRetryDelayMs?: number;
-  /** Per-request timeout (ms). Default `60000`. */
+  /** Per-read timeout (ms). Default `60000`. */
   timeoutMs?: number;
+  /**
+   * Explicit WebSocket endpoint (e.g. `wss://host/ws`). When omitted it is
+   * derived from `baseUrl`.
+   */
+  wsUrl?: string;
   /**
    * Explicit URL of `libfw_client_bg.wasm`. When omitted it is resolved
    * automatically for both ESM and classic-`<script>`/UMD consumers.

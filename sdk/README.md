@@ -9,14 +9,14 @@ WASM engine, the File System Access API and IndexedDB.
 import { LibfwClient } from 'libfw-client';
 
 const client = new LibfwClient({
-  baseUrl: '/api',      // where libfw-server routes are mounted
-  concurrency: 4,       // max parallel file transfers
-  uploadWindow: 8,      // in-flight chunks per single file upload (raise to
+  baseUrl: '/',         // server origin; the engine derives ws(s)://host/ws
+                        // from it (or set wsUrl explicitly)
+  concurrency: 4,       // max parallel file transfers (one WS connection each)
+  uploadWindow: 8,      // in-flight blocks per single file upload (raise to
                         // reduce upload stutter on high-latency links)
-  downloadWindow: 4,    // in-flight byte-range GETs per single file download
-                        // (tus-style parallel download: one file's throughput
-                        // isn't bounded by a single connection's RTT)
-  compress: true,       // zrip streaming compression
+  downloadWindow: 4,    // in-flight blocks per single file download (raise to
+                        // reduce download stutter on high-latency links)
+  compress: true,       // zrip per-block compression
   onEvent: (e) => console.log(e), // { type: 'progress', done, total }
 });
 
@@ -40,28 +40,29 @@ client.cancel();
 
 ## How it works
 
+- **One WebSocket per transfer** — the engine talks to the server over
+  `ws(s)://…/ws` for **all** control commands (handshake, directory listing,
+  metadata) and data. Upload and download use the **same** block protocol:
+  the sender pipelines fixed-size blocks with **no per-block ack** (they may
+  travel out of order), and the receiver **verifies every block in real time**
+  (CRC32 + length + bounds), marks bad blocks (`NAK`) and asks the sender to
+  re-add them to its transfer queue; a wave boundary reconciles until every
+  block is verified. `downloadWindow`/`uploadWindow` bound the in-flight
+  blocks per wave (raise them on high-latency links).
 - `downloadFolder(token, dirPath?)` / `downloadFile(token, filePath)` — the
-  engine lists (for folders) and downloads each file with `Range`/`If-Range`
-  resume, decompresses the zrip stream, and pushes `Uint8Array` chunks to the
-  SDK. Large files use the **tus-style parallel path**: `downloadWindow`
-  concurrent byte-range GETs, reordered in memory so the SDK still receives
-  bytes strictly in order (append-mode `createWritable()`, no `.crswap`
-  churn), with per-chunk independent retries. With the File System Access API
-  the SDK streams them to disk via `fileHandle.createWritable()`; without it
-  (or with `downloadMode: 'browser'`) the SDK buffers the chunks and saves the
-  result through a traditional browser download — a single file as-is, a
-  folder packed into a `.zip`.
+  engine lists (for folders) and downloads each file as a receiver, reorders
+  out-of-order blocks in memory and pushes `Uint8Array` chunks to the SDK
+  strictly in order (append-mode `createWritable()`, no `.crswap` churn).
+  With the File System Access API the SDK streams them to disk via
+  `fileHandle.createWritable()`; without it (or with `downloadMode: 'browser'`)
+  the SDK buffers the chunks and saves the result through a traditional
+  browser download — a single file as-is, a folder packed into a `.zip`.
 - `upload(token, files?)` — the engine slices each file into fixed-size
-  chunks, reads them via `readFile`, compresses each chunk into one zstd
-  frame, and POSTs them with an absolute `x-libfw-offset` into a shared
-  per-session temp file. Up to `uploadWindow` chunks of one file are kept in
-  flight concurrently (independent of the cross-file `concurrency`), so a
-  high-latency link stays saturated. Uploads are **tus-style
-  verify-then-complete**: the server is the source of truth — the client
-  probes the byte ranges the server actually persisted and re-sends only the
-  still-missing blocks, filling gaps a lost response may have left (and
-  re-probing + refilling if a commit fails) before the final `x-libfw-final`
-  request merges the temp into place.
+  blocks, reads them via `readFile`, compresses each block into one zstd
+  frame, and sends them over the WebSocket as the sender. Only the blocks the
+  server still misses are sent (`READY.received` seeds resume), so a
+  high-latency link stays saturated and interrupted uploads resume
+  BitTorrent-style (only the broken/lost parts are re-transmitted).
 - Resume state (`etag`, `offset`, `size`) is persisted per path in
   IndexedDB and re-validated on every retry.
 - Pause/resume/cancel drive the WASM state machine
@@ -90,12 +91,16 @@ dist/libfw-client.umd.js   UMD bundle (after build:umd)
 ## API
 
 - `new LibfwClient(options?)`
-  - `downloadWindow: number` (default `4`) — in-flight byte-range GETs per
-    single file download; `1` disables parallelism.
-  - `downloadChunkSize: number` (default `262144`, 256 KiB) — byte range size
-    for parallel downloads; the engine reorders in-flight chunks in memory
-    (worst case ≈ `downloadWindow * downloadChunkSize` bytes) so the SDK
-    still receives data in order.
+  - `downloadWindow: number` (default `4`) — in-flight blocks per single file
+    download (how many blocks the server pipelines per wave before a
+    reconciliation round); raise it on high-latency links.
+  - `downloadChunkSize: number` (default `262144`, 256 KiB) — block size for
+    downloads; the engine reorders out-of-order blocks in memory (worst case
+    ≈ `downloadWindow * downloadChunkSize` bytes) so the SDK still receives
+    data in order.
+  - `wsUrl: string` — explicit WebSocket endpoint (`wss://host/ws`); when
+    omitted it is derived from `baseUrl` (`http://h:8080` → `ws://h:8080/ws`,
+    same-origin when empty).
   - `downloadMode: 'auto' | 'fs' | 'browser'` (default `'auto'`) — `'fs'`
     streams downloads through the File System Access API; `'browser'` buffers
     and triggers a traditional browser download (folders become `.zip`);

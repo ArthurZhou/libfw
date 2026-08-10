@@ -25,12 +25,12 @@ zrip.workspace = true
 # Keep the web-sys surface minimal and explicit.
 web-sys = { workspace = true, features = [
     "Window",
-    "Request",
-    "RequestInit",
-    "Response",
-    "Headers",
-    "ReadableStream",
-    "ReadableStreamDefaultReader",
+    "Location",
+    "WebSocket",
+    "MessageEvent",
+    "BinaryType",
+    "Event",
+    "CloseEvent",
     "console",
 ] }
 

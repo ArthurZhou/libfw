@@ -56,6 +56,11 @@ pub struct ClientConfig {
     pub max_retry_delay_ms: u32,
     /// Per-request timeout in ms (default 60s).
     pub timeout_ms: u32,
+    /// Optional explicit WebSocket endpoint (e.g. `wss://host/ws`).
+    ///
+    /// When `None` the engine derives the `ws(s)://` URL from the HTTP
+    /// `baseUrl` passed to each transfer method.
+    pub ws_url: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -71,6 +76,7 @@ impl Default for ClientConfig {
             base_retry_delay_ms: DEFAULT_BASE_RETRY_MS,
             max_retry_delay_ms: DEFAULT_MAX_RETRY_MS,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            ws_url: None,
         }
     }
 }
@@ -156,6 +162,14 @@ impl ClientConfig {
         }
         if let Some(v) = opt_u32(opts, "timeoutMs") {
             cfg.timeout_ms = v;
+        }
+        if let Some(v) = Reflect::get(opts, &JsValue::from_str("wsUrl"))
+            .ok()
+            .and_then(|v| v.as_string())
+        {
+            if !v.is_empty() {
+                cfg.ws_url = Some(v);
+            }
         }
         cfg
     }

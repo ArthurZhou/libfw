@@ -64,6 +64,10 @@ pub fn total_bytes(files: &[FileEntry]) -> u64 {
 
 /// The next chunk boundaries `[offset, end)` for `file` at `chunk_size`,
 /// starting at `from` (a resume offset).
+///
+/// Retained as a pure helper for tests; the WebSocket transport slices files
+/// into blocks via [`libfw_core::ws::block_bounds`].
+#[allow(dead_code)]
 pub fn chunk_bounds(file: &FileEntry, chunk_size: u64, from: u64) -> Vec<(u64, u64)> {
     let mut bounds = Vec::new();
     let mut offset = from.min(file.size);
