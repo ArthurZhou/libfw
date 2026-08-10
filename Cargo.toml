@@ -18,9 +18,10 @@ description = "High-performance streaming file & folder transfer library for Rus
 [workspace.dependencies]
 # NB: `version` is required so `cargo publish` can rewrite the path to a
 # crates.io dependency when publishing libfw-server / libfw-client.
-libfw-core = { path = "crates/libfw-core", version = "0.1.0" }
-libfw-server = { path = "crates/libfw-server", version = "0.1.0" }
-libfw-client = { path = "crates/libfw-client", version = "0.1.0" }
+# Keep these in sync with [workspace.package] version above.
+libfw-core = { path = "crates/libfw-core", version = "0.2.0" }
+libfw-server = { path = "crates/libfw-server", version = "0.2.0" }
+libfw-client = { path = "crates/libfw-client", version = "0.2.0" }
 
 # Core / shared
 serde = { version = "1", features = ["derive"] }
