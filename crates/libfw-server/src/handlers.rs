@@ -29,8 +29,8 @@ use crate::http::{
     if_range_matches, parse_range_header,
 };
 use crate::{
-    HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION, ServerState,
-    validate_rel_path,
+    HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION,
+    HEADER_SESSION_STATUS, ServerState, validate_rel_path,
 };
 
 /// Errors surfaced by handlers, mapped to HTTP responses.
@@ -305,6 +305,17 @@ struct UploadOk {
     file: FileMeta,
 }
 
+/// Response body for a session status probe: the byte ranges already
+/// received on the server, so the client can re-send only the missing gaps.
+///
+/// Serialized as `{"ranges": [[start, end], ...]}` with each range as a pair
+/// of arrays (not objects) to keep the wire format compact and aligned with
+/// the WASM client's parser.
+#[derive(Serialize)]
+struct SessionStatus {
+    ranges: Vec<[u64; 2]>,
+}
+
 /// Write one decompressed batch to the sink, enforcing the server's
 /// upload-size cap AND the client-declared `meta.size` bound.
 ///
@@ -397,6 +408,29 @@ async fn upload_session(
         .storage
         .write_stream_session(path, session, create_mode)
         .await?;
+
+    // A status probe (`x-libfw-session-status`) asks "which byte ranges of
+    // this session are already on disk?" without writing anything. The
+    // client uses this after an interruption to re-send only the missing
+    // blocks (BitTorrent-style resume). We drop the sink WITHOUT abort so
+    // the shared temp and its sidecar stay intact for the following chunks.
+    let status_probe = headers
+        .get(HEADER_SESSION_STATUS)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("probe")
+        })
+        .unwrap_or(false);
+    if status_probe {
+        let ranges = sink.received_ranges().await?;
+        drop(sink);
+        let ranges = ranges
+            .into_iter()
+            .map(|r| [r.start, r.end])
+            .collect::<Vec<[u64; 2]>>();
+        return Ok((StatusCode::OK, Json(SessionStatus { ranges })).into_response());
+    }
 
     let mut decomp = decompressor_with_limit(format, MAX_FRAME_OUTPUT);
     let mut out: Vec<u8> = Vec::new();

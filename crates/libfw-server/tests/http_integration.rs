@@ -13,7 +13,7 @@ use libfw_core::compress::{compressor, decompressor, CompressionFormat};
 use libfw_core::metadata::encode_file_meta_header;
 use libfw_server::{
     router, FsStorage, ServerState, HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET,
-    HEADER_SESSION,
+    HEADER_SESSION, HEADER_SESSION_STATUS,
 };
 use tower::ServiceExt;
 
@@ -167,6 +167,103 @@ async fn session_upload_writes_chunks_out_of_order_then_commits() {
 }
 
 #[tokio::test]
+async fn session_upload_probe_reports_received_ranges_and_resumes() {
+    let app = app(DevVerifier);
+    let data = b"0123456789abcdefghij".to_vec(); // 20 bytes
+    let meta = libfw_core::metadata::FileMeta::new("resume.bin", data.len() as u64, 0);
+    let session = "resume-sess-1";
+
+    // Helper to send a session data chunk.
+    async fn post_chunk(
+        app: axum::Router,
+        session: &str,
+        offset: u64,
+        chunk: &[u8],
+        final_chunk: bool,
+        meta: &libfw_core::metadata::FileMeta,
+    ) -> StatusCode {
+        let mut headers = auth_header("tok");
+        headers
+            .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(meta)).unwrap());
+        headers.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+        headers
+            .insert(HEADER_OFFSET, HeaderValue::from_str(&offset.to_string()).unwrap());
+        if final_chunk {
+            headers.insert(HEADER_FINAL, HeaderValue::from_static("1"));
+        }
+        app.oneshot(request("POST", "/file/resume.bin", headers, Body::from(chunk.to_vec())))
+            .await
+            .unwrap()
+            .status()
+    }
+
+    // Helper to send a session status probe and return the received ranges.
+    async fn probe(
+        app: axum::Router,
+        session: &str,
+        meta: &libfw_core::metadata::FileMeta,
+    ) -> Vec<[u64; 2]> {
+        let mut headers = auth_header("tok");
+        headers
+            .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(meta)).unwrap());
+        headers.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+        headers.insert(HEADER_SESSION_STATUS, HeaderValue::from_static("1"));
+        let resp = app
+            .oneshot(request("POST", "/file/resume.bin", headers, Body::empty()))
+            .await
+            .unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["ranges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let a = r.as_array().unwrap();
+                [a[0].as_u64().unwrap(), a[1].as_u64().unwrap()]
+            })
+            .collect()
+    }
+
+    // Fresh session: probe reports nothing received.
+    assert!(probe(app.clone(), session, &meta).await.is_empty());
+
+    // Send block 0..8 first.
+    assert_eq!(
+        post_chunk(app.clone(), session, 0, &data[0..8], false, &meta).await,
+        StatusCode::CREATED
+    );
+    // Send a later block so the file has a gap at [8, 16).
+    assert_eq!(
+        post_chunk(app.clone(), session, 16, &data[16..20], false, &meta).await,
+        StatusCode::CREATED
+    );
+
+    // Probe now reports [0,8) and [16,20) — the two received extents.
+    let ranges = probe(app.clone(), session, &meta).await;
+    assert_eq!(ranges, vec![[0, 8], [16, 20]]);
+
+    // "Resume": fill the missing gap [8,16) with the SAME session id.
+    assert_eq!(
+        post_chunk(app.clone(), session, 8, &data[8..16], false, &meta).await,
+        StatusCode::CREATED
+    );
+
+    // Commit; the merged file must be exactly the original data.
+    assert_eq!(
+        post_chunk(app.clone(), session, data.len() as u64, &[], true, &meta).await,
+        StatusCode::CREATED
+    );
+    let resp = app
+        .oneshot(request("GET", "/file/resume.bin", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = body_string(resp).await.into_bytes();
+    assert_eq!(got, data);
+}
+
+#[tokio::test]
 async fn session_upload_rejects_commit_with_wrong_size() {
     let app = app(DevVerifier);
     let data = b"0123456789".to_vec();
@@ -206,6 +303,45 @@ async fn session_upload_rejects_commit_with_wrong_size() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn session_probe_overwrites_existing_target() {
+    let app = app(DevVerifier);
+    let data = b"0123456789".to_vec();
+    let meta = libfw_core::metadata::FileMeta::new("sess3.bin", data.len() as u64, 0);
+    let session = "probe-overwrite-sess";
+
+    // First commit an initial version of the file.
+    let mut headers = auth_header("tok");
+    headers
+        .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    headers.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    headers.insert(HEADER_OFFSET, HeaderValue::from_static("0"));
+    headers.insert(HEADER_FINAL, HeaderValue::from_static("1"));
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/sess3.bin", headers, Body::from(data.clone())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // A probe for a NEW session over the SAME target must not 409 (probe uses
+    // Overwrite mode, so it opens a fresh temp rather than rejecting on the
+    // existing committed file).
+    let mut headers = auth_header("tok");
+    headers
+        .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    headers.insert(HEADER_SESSION, HeaderValue::from_str("probe-overwrite-sess-2").unwrap());
+    headers.insert(HEADER_SESSION_STATUS, HeaderValue::from_static("1"));
+    headers.insert(HEADER_OFFSET, HeaderValue::from_static("0"));
+    let resp = app
+        .oneshot(request("POST", "/file/sess3.bin", headers, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(String::from_utf8_lossy(&body), r#"{"ranges":[]}"#);
 }
 
 #[tokio::test]

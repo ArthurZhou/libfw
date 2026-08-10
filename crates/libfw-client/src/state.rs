@@ -177,9 +177,10 @@ impl TaskControl {
 
     /// Remove previously-counted progress (saturating).
     ///
-    /// Used when a 412 restart re-uploads bytes that were already counted,
-    /// so a single file's bytes are never double-counted in the progress
-    /// bar.
+    /// Exposed as a helper for callers (e.g. the SDK) that need to undo
+    /// progress they counted but later decided not to transfer. Not used
+    /// internally by the current engine, hence `allow(dead_code)`.
+    #[allow(dead_code)]
     pub fn subtract_progress(&self, bytes: u64) {
         self.done_bytes.set(self.done_bytes.get().saturating_sub(bytes));
     }

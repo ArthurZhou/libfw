@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::StorageError;
-use crate::metadata::FileMeta;
+use crate::metadata::{ChunkRange, FileMeta};
 use crate::range::RangeSpec;
 
 /// How an upload should open (or resume) its target stream.
@@ -57,6 +57,17 @@ pub trait UploadSink: Send {
     /// right place.
     async fn write_at(&mut self, _offset: u64, buf: &[u8]) -> Result<(), StorageError> {
         self.write(buf).await
+    }
+
+    /// The contiguous byte ranges of the destination already received.
+    ///
+    /// Used by the resumable "session" upload path: after an interruption
+    /// the client probes the server for the ranges that already landed so it
+    /// can retransmit only the missing gaps (BitTorrent-style). Sinks that
+    /// do not track received ranges return `Ok(vec![])` (the default), which
+    /// makes a resume degrade to a full re-send.
+    async fn received_ranges(&mut self) -> Result<Vec<ChunkRange>, StorageError> {
+        Ok(Vec::new())
     }
 
     /// Current length of the destination, for size validation before commit.

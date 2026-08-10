@@ -44,7 +44,27 @@ pub const HEADER_FINAL: &str = "x-libfw-final";
 /// `x-libfw-final` request commits it. This lets a client pipeline many
 /// chunks in flight (hiding round-trip latency) instead of serializing one
 /// request per chunk. Absent → legacy per-request sequential upload.
+///
+/// A session id should be **stable for a given file version** (derived from
+/// the ETag) so an interrupted upload can be found again on resume: the
+/// shared temp file is keyed by this id, and the server persists which byte
+/// ranges have already been received (see [`HEADER_SESSION_STATUS`]).
 pub const HEADER_SESSION: &str = "x-libfw-session";
+
+/// HTTP header turning a session `POST` into a **status probe**.
+///
+/// When present (value `1`/`probe`) on a session request, the server does
+/// NOT write the body. Instead it opens (creating if needed) the shared
+/// per-session temp and replies with the JSON-encoded byte ranges already
+/// received for that session: `{"ranges": [[start,end], ...]}`. The client
+/// uses this to compute which blocks are still missing and re-send only
+/// those — a BitTorrent-style "only retransmit the broken parts" resume.
+///
+/// Absent (older clients) keeps the previous behavior; legacy servers that
+/// ignore this header simply write nothing for the empty probe body and
+/// return an empty range set, which degrades to a full re-send (idempotent
+/// positional writes make that correct too).
+pub const HEADER_SESSION_STATUS: &str = "x-libfw-session-status";
 
 /// HTTP header carrying the (optional) transfer version handshake.
 pub const HEADER_PROTOCOL: &str = "x-libfw-protocol";

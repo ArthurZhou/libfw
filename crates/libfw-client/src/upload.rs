@@ -2,9 +2,8 @@
 //! fixed-size chunks, compresses each chunk into one zstd frame and POSTs
 //! them with `x-libfw-offset` so the server can resume/validate offsets.
 
-use js_sys::Reflect;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
 use futures::StreamExt;
@@ -12,11 +11,12 @@ use libfw_core::compress::{compressor, CompressionFormat};
 use libfw_core::metadata::encode_file_meta_header;
 use libfw_core::{
     HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION,
+    HEADER_SESSION_STATUS,
 };
 
 use crate::config::ClientConfig;
 use crate::error::LibfwError;
-use crate::http::{auth_headers, fetch, file_url, request};
+use crate::http::{auth_headers, fetch, file_url, read_all, request};
 use crate::js::Callbacks;
 use crate::plan::{chunk_bounds, total_bytes, FileEntry};
 use crate::state::TaskControl;
@@ -92,19 +92,105 @@ async fn post_chunk(
     }
 }
 
-/// Generate a unique per-upload session id (single-threaded WASM: a monotonic
-/// counter combined with a timestamp is unique enough for temp-file naming).
-fn new_session_id() -> String {
-    thread_local! {
-        static COUNTER: std::cell::Cell<u64> = std::cell::Cell::new(0);
+/// A deterministic, URL-safe session id for a file version.
+///
+/// Derived from the file's ETag (size + mtime) so an interrupted upload of
+/// the *same file version* finds the same shared temp on the server and can
+/// resume. A changed file produces a different ETag → a different session →
+/// a fresh temp, which naturally invalidates stale partials. The ETag is a
+/// quoted hex digest; stripping the quotes leaves only alphanumeric hex
+/// chars, which the server allows in temp filenames.
+fn session_id_for(file: &FileEntry) -> String {
+    file.to_meta().etag.trim_matches('"').to_string()
+}
+
+/// Probe the server for the byte ranges already received for `session`.
+///
+/// Returns `Ok(Some(ranges))` when the server understood the probe (it
+/// replies with `{"ranges": [[start, end], ...]}`). Returns `Ok(None)` when
+/// the response has no `ranges` field — a legacy server that ignores the
+/// probe header and simply echoes the file meta; the caller then treats the
+/// session as empty (a full re-send, which is correct thanks to idempotent
+/// positional writes).
+async fn probe_session(
+    base_url: &str,
+    token: &str,
+    file: &FileEntry,
+    session: &str,
+    timeout_ms: u32,
+) -> Result<Option<Vec<(u64, u64)>>, LibfwError> {
+    let headers = auth_headers(token, false)?;
+    headers
+        .set(HEADER_OFFSET, "0")
+        .map_err(|e| LibfwError::Js(format!("set offset header failed: {e:?}")))?;
+    headers
+        .set(HEADER_FILE_META, &encode_file_meta_header(&file.to_meta()))
+        .map_err(|e| LibfwError::Js(format!("set meta header failed: {e:?}")))?;
+    headers
+        .set(HEADER_SESSION, session)
+        .map_err(|e| LibfwError::Js(format!("set session header failed: {e:?}")))?;
+    headers
+        .set(HEADER_SESSION_STATUS, "1")
+        .map_err(|e| LibfwError::Js(format!("set session-status header failed: {e:?}")))?;
+
+    let url = file_url(base_url, &file.path);
+    let req = request(&url, "POST", &headers, None)?;
+    let resp = fetch(&req, timeout_ms).await?;
+    let status = resp.status();
+    if status != 200 && status != 201 {
+        return Err(LibfwError::Http { status, url });
     }
-    let n = COUNTER.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
-    });
-    let now = js_sys::Date::now() as u64;
-    format!("{now}-{n}")
+    let body = read_all(&resp, timeout_ms).await?;
+    #[derive(serde::Deserialize)]
+    struct Ranges {
+        #[serde(default)]
+        ranges: Vec<[u64; 2]>,
+    }
+    let parsed: Ranges = serde_json::from_slice(&body)
+        .map_err(|e| LibfwError::Protocol(format!("bad session-status JSON: {e}")))?;
+    // Empty `ranges` could mean either "nothing received yet" (legit) or a
+    // legacy server that echoed meta without a range list; in both cases the
+    // caller treats it as "nothing received", which is safe.
+    Ok(Some(
+        parsed
+            .ranges
+            .into_iter()
+            .map(|[s, e]| (s, e.max(s)))
+            .collect(),
+    ))
+}
+
+/// The sub-ranges of `[start, end)` not covered by any `received` range.
+///
+/// Used after a probe to compute exactly which bytes are still missing, so
+/// only the broken/lost parts get re-transmitted (BitTorrent-style resume).
+fn missing_ranges(start: u64, end: u64, received: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut missing = vec![(start, end)];
+    for range in received {
+        let (rs0, re0) = *range;
+        let rs = rs0.max(start);
+        let re = re0.min(end).max(rs);
+        if re <= rs {
+            continue;
+        }
+        let mut next = Vec::with_capacity(missing.len() + 1);
+        for (ms, me) in missing {
+            if re <= ms || rs >= me {
+                // No overlap with this received range.
+                next.push((ms, me));
+            } else {
+                // Keep the parts outside [rs, re).
+                if ms < rs {
+                    next.push((ms, rs));
+                }
+                if re < me {
+                    next.push((re, me));
+                }
+            }
+        }
+        missing = next;
+    }
+    missing
 }
 
 /// Read, compress and POST one chunk with per-chunk retry + backoff.
@@ -230,16 +316,17 @@ async fn commit_upload(
     }
 }
 
-/// Upload a whole file with the concurrent "session" protocol.
+/// Upload a whole file with the resumable, out-of-order "session" protocol.
 ///
-/// Chunks are sent with a bounded in-flight window (each carrying its
-/// absolute offset) so a high-latency link stays saturated — throughput is
-/// bounded by bandwidth instead of `chunk_size / RTT`. The first chunk is
-/// sent alone to create the shared temp on the server (avoiding a create
-/// race), the rest are pipelined, and a final commit request renames the
-/// temp into place. Resume state is persisted only after commit so a
-/// non-contiguous prefix is never recorded as resumable.
-async fn upload_fresh_concurrent(
+/// This is the BitTorrent-style transfer path: each block is POSTed with its
+/// ABSOLUTE `x-libfw-offset` into a shared per-session temp on the server
+/// (positional writes), so blocks may be sent out of order and pipelined with
+/// a bounded in-flight window — throughput is bounded by bandwidth instead of
+/// `chunk_size / RTT`. Before sending, the server is probed for the byte
+/// ranges it already holds (from a previous interrupted attempt); only the
+/// still-missing blocks are (re)sent. A final `x-libfw-final` commit request
+/// verifies the merged size then renames the temp into place ("merge").
+async fn upload_session_resumable(
     base_url: &str,
     token: &str,
     file: &FileEntry,
@@ -247,12 +334,37 @@ async fn upload_fresh_concurrent(
     control: &TaskControl,
     config: &ClientConfig,
 ) -> Result<u64, LibfwError> {
-    let session = new_session_id();
-    let bounds = chunk_bounds(file, config.chunk_size, 0);
+    let session = session_id_for(file);
+
+    // Probe the server for what it already has. A legacy server that ignores
+    // the probe yields an empty range list → we (correctly) re-send all
+    // blocks; positional writes are idempotent so this is always safe.
+    let received = probe_session(base_url, token, file, &session, config.timeout_ms).await?
+        .unwrap_or_default();
+
+    // Compute the missing byte ranges across the whole file, then align them
+    // to chunk boundaries so each block is a bounded request.
+    let mut missing: Vec<(u64, u64)> = Vec::new();
+    for (start, end) in chunk_bounds(file, config.chunk_size, 0) {
+        missing.extend(missing_ranges(start, end, &received));
+    }
+
     let mut uploaded = 0u64;
 
-    if bounds.is_empty() {
-        // Empty file: create + commit with no data chunks.
+    // Seed the shared progress with bytes the server already holds (from a
+    // previous interrupted attempt), so a resume reflects the true fraction
+    // done and a pure resume reaches 100% at completion. These bytes are NOT
+    // counted in the returned `uploaded` figure, which reports only what this
+    // session actually sent.
+    let covered = covered_bytes(&received).min(file.size);
+    if covered > 0 {
+        control.add_progress(covered);
+        control.report_progress_if(callbacks)?;
+    }
+
+    // Empty file, or nothing missing after a full prior attempt: just commit
+    // (merge) the already-received temp into place.
+    if missing.is_empty() {
         commit_upload(base_url, token, file, callbacks, control, config, &session).await?;
         callbacks
             .save_state(
@@ -264,19 +376,13 @@ async fn upload_fresh_concurrent(
         return Ok(0);
     }
 
-    // First chunk serial (creates the shared temp on the server).
-    let (s0, e0) = bounds[0];
-    uploaded = uploaded.saturating_add(
-        upload_one_chunk(base_url, token, file, callbacks, control, config, s0, e0, &session)
-            .await?,
-    );
-
-    // Pipeline the remaining chunks with a bounded in-flight window.
+    // Send the missing blocks concurrently (out of order) with a bounded
+    // window. No special first-chunk handling is needed: the probe already
+    // created the shared temp on the server.
     let window = config.concurrency.max(1);
     let mut stream = futures::stream::iter(
-        bounds
+        missing
             .into_iter()
-            .skip(1)
             .map(|(start, end)| {
                 let base_url = base_url.to_string();
                 let token = token.to_string();
@@ -300,7 +406,7 @@ async fn upload_fresh_concurrent(
         uploaded = uploaded.saturating_add(res?);
     }
 
-    // Commit (verify total size == meta.size, then rename into place).
+    // Commit (verify merged size == meta.size, then rename into place).
     commit_upload(base_url, token, file, callbacks, control, config, &session).await?;
 
     callbacks
@@ -313,15 +419,27 @@ async fn upload_fresh_concurrent(
     Ok(uploaded)
 }
 
-/// Upload one file, with retry + resume support.
+/// Total number of bytes covered by a set of (possibly overlapping) received
+/// byte ranges.
+fn covered_bytes(received: &[(u64, u64)]) -> u64 {
+    let mut total = 0u64;
+    for (s, e) in received {
+        if e > s {
+            total = total.saturating_add(e - s);
+        }
+    }
+    total
+}
+
+/// Upload one file with the resumable, out-of-order "session" protocol.
 ///
-/// Fresh/overwrite uploads (offset 0) use the concurrent "session" protocol
-/// so high-latency links stay saturated — throughput is bounded by bandwidth
-/// instead of `chunk_size / RTT` (see [`upload_fresh_concurrent`]).
-/// Interrupted uploads (resume offset > 0) use the legacy sequential path.
-/// When the server answers `412 Precondition Failed` (a resume offset no
-/// longer matches — e.g. the file was truncated), the persisted state is
-/// cleared and the file is re-uploaded from byte 0 (bounded to one reset).
+/// Every upload (fresh, overwrite or interrupted resume) goes through
+/// [`upload_session_resumable`]: the server is probed for which byte ranges
+/// it already holds, only the missing blocks are re-sent concurrently, and a
+/// final commit merges them. An interrupted transfer simply leaves the
+/// partially-received session temp on the server; the next attempt probes it
+/// and retransmits only the broken/lost parts (BitTorrent-style), never the
+/// whole file.
 async fn upload_file(
     base_url: &str,
     token: &str,
@@ -331,141 +449,10 @@ async fn upload_file(
     config: &ClientConfig,
 ) -> Result<u64, LibfwError> {
     callbacks.on_file_start(&file.path, file.size)?;
-
-    let mut uploaded_total = 0u64;
-    let mut restarted = false;
-
-    'file: loop {
-        // Load persisted resume state: { etag, offset }.
-        let mut offset = 0u64;
-        if let Some(state) = callbacks.load_state("upload", &file.path).await? {
-            if let Some(o) = Reflect::get(&state, &JsValue::from_str("offset"))
-                .ok()
-                .and_then(|v| v.as_f64())
-            {
-                offset = o as u64;
-            }
-        }
-        offset = offset.min(file.size);
-
-        // Fresh / overwrite → concurrent session upload (hides latency).
-        if offset == 0 {
-            let uploaded =
-                upload_fresh_concurrent(base_url, token, file, callbacks, control, config).await?;
-            uploaded_total = uploaded_total.saturating_add(uploaded);
-            break 'file;
-        }
-
-        // Resume (offset > 0): legacy sequential, per-chunk append. Seed the
-        // shared progress with the prefix already on the server so a pure
-        // resume reaches 100% at completion instead of showing only this
-        // session's delta.
-        let mut pass_added = offset;
-        control.add_progress(offset);
-        let mut pass_uploaded = 0u64;
-
-        for (start, end) in chunk_bounds(file, config.chunk_size, offset) {
-            control.wait_ready().await?;
-            control.check()?;
-
-            let len = end - start;
-            let raw = callbacks.read_file(&file.path, start, len).await?;
-            if raw.len() as u64 != len {
-                return Err(LibfwError::Storage(format!(
-                    "read {} of {} bytes for `{}`",
-                    raw.len(),
-                    len,
-                    file.path
-                )));
-            }
-
-            // Compress the chunk into a single independent zstd frame.
-            let payload: Vec<u8> = if config.compress {
-                let mut enc = compressor(CompressionFormat::Zrip)
-                    .map_err(|e| LibfwError::Compress(e.to_string()))?;
-                let mut out = Vec::with_capacity(raw.len());
-                enc.compress(&raw, &mut out)
-                    .map_err(|e| LibfwError::Compress(e.to_string()))?;
-                enc.finish(&mut out)
-                    .map_err(|e| LibfwError::Compress(e.to_string()))?;
-                out
-            } else {
-                raw
-            };
-
-            let mut attempts = 0u32;
-            loop {
-                control.wait_ready().await?;
-                control.check()?;
-                match post_chunk(
-                    base_url,
-                    token,
-                    file,
-                    start,
-                    &payload,
-                    config.compress,
-                    config.timeout_ms,
-                    end == file.size,
-                    "",
-                )
-                .await
-                {
-                    Ok(()) => break,
-                    Err(LibfwError::Http { status: 412, .. }) if !restarted => {
-                        // Server says our offset is stale → wipe state and
-                        // re-upload the whole file from byte 0. Undo this
-                        // pass's progress (resume seed + already-posted
-                        // bytes) so the file's bytes are never double-counted
-                        // in the progress bar or the returned byte count.
-                        restarted = true;
-                        callbacks.log(&format!(
-                            "server rejected offset {start} for `{}`; resetting",
-                            file.path
-                        ));
-                        control.subtract_progress(pass_added);
-                        let _ = callbacks
-                            .save_state(
-                                "upload",
-                                &file.path,
-                                &state_json(0, &file.to_meta().etag, file.size),
-                            )
-                            .await;
-                        continue 'file;
-                    }
-                    Err(e) => {
-                        if attempts >= config.max_retries {
-                            return Err(e);
-                        }
-                        attempts += 1;
-                        callbacks.log(&format!(
-                            "retrying chunk {start}..{end} of `{}` (attempt {attempts}): {e}",
-                            file.path
-                        ));
-                        sleep_ms(config.backoff_ms(attempts)).await;
-                    }
-                }
-            }
-
-            pass_uploaded = pass_uploaded.saturating_add(len);
-            pass_added = pass_added.saturating_add(len);
-            control.add_progress(len);
-            control.report_progress_if(callbacks)?;
-
-            // Persist progress so a crash/resume continues from here.
-            callbacks
-                .save_state(
-                    "upload",
-                    &file.path,
-                    &state_json(end, &file.to_meta().etag, file.size),
-                )
-                .await?;
-        }
-        uploaded_total = uploaded_total.saturating_add(pass_uploaded);
-        break 'file;
-    }
-
+    let uploaded =
+        upload_session_resumable(base_url, token, file, callbacks, control, config).await?;
     callbacks.on_file_completed(&file.path).await?;
-    Ok(uploaded_total)
+    Ok(uploaded)
 }
 
 /// Build a resume-state object for JS persistence.
@@ -511,4 +498,67 @@ pub async fn upload(
         callbacks.on_progress(control.done_bytes(), control.total_bytes())?;
     }
     Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_ranges_none_when_fully_received() {
+        let received = vec![(0, 100)];
+        assert!(missing_ranges(0, 100, &received).is_empty());
+    }
+
+    #[test]
+    fn missing_ranges_reports_only_gaps() {
+        // Received [0,40) and [60,100); missing is the gap [40,60).
+        let received = vec![(0, 40), (60, 100)];
+        let missing = missing_ranges(0, 100, &received);
+        assert_eq!(missing, vec![(40, 60)]);
+    }
+
+    #[test]
+    fn missing_ranges_splits_partial_coverage() {
+        // Desired [0,20) but only [8,16) received → [0,8) + [16,20) missing.
+        let received = vec![(8, 16)];
+        let missing = missing_ranges(0, 20, &received);
+        assert_eq!(missing, vec![(0, 8), (16, 20)]);
+    }
+
+    #[test]
+    fn missing_ranges_out_of_scope_received_ignored() {
+        // Received ranges outside the desired window are ignored.
+        let received = vec![(100, 200)];
+        let missing = missing_ranges(0, 20, &received);
+        assert_eq!(missing, vec![(0, 20)]);
+    }
+
+    #[test]
+    fn session_id_is_stable_and_safe() {
+        let a = FileEntry {
+            path: "dir/f.bin".into(),
+            size: 1024,
+            mtime: 42,
+        };
+        let id = session_id_for(&a);
+        // Deterministic: same file version → same id.
+        let again = FileEntry {
+            path: "dir/f.bin".into(),
+            size: 1024,
+            mtime: 42,
+        };
+        assert_eq!(session_id_for(&again), id);
+        // Safe chars only (server allows [A-Za-z0-9_-]).
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        // Different file version → different id (fresh session temp).
+        let changed = FileEntry {
+            path: "dir/f.bin".into(),
+            size: 2048,
+            mtime: 42,
+        };
+        assert_ne!(session_id_for(&changed), id);
+    }
 }

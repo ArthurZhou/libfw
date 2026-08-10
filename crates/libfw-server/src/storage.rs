@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use libfw_core::metadata::{etag_from_size_mtime, FileMeta};
+use libfw_core::metadata::{etag_from_size_mtime, ChunkRange, FileMeta};
 use libfw_core::range::RangeSpec;
 use libfw_core::storage::{DirEntry, StorageBackend, UploadSink, WriteMode};
 use libfw_core::StorageError;
@@ -156,6 +156,8 @@ impl StorageBackend for FsStorage {
                     rel: path.to_string(),
                     mode,
                     written: 0,
+                    blocks_path: None,
+                    ranges: Vec::new(),
                 }))
             }
             WriteMode::Resume { offset } => {
@@ -185,6 +187,8 @@ impl StorageBackend for FsStorage {
                     rel: path.to_string(),
                     mode,
                     written: offset,
+                    blocks_path: None,
+                    ranges: Vec::new(),
                 }))
             }
         }
@@ -225,8 +229,10 @@ impl StorageBackend for FsStorage {
             .await
             .map_err(|e| StorageError::Other(e))?;
         let file = if exists {
-            // Subsequent chunk of an in-flight session: open the shared temp
-            // for positional (seek + write) access. `mode` is ignored.
+            // Subsequent chunk / resume of an in-flight session: open the
+            // shared temp for positional (seek + write) access. `mode` is
+            // ignored; the already-received ranges are reloaded from the
+            // sidecar so the client can resume only the missing parts.
             tokio::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -251,15 +257,21 @@ impl StorageBackend for FsStorage {
                         .await
                         .map_err(|e| StorageError::Other(e))?
                 }
-                // Session mode has no resume semantics; callers must use the
-                // legacy `write_stream` path for resume uploads.
+                // Resumable sessions are driven by the per-block probe (the
+                // client asks "what ranges do you have?" and sends only the
+                // gaps), not by a contiguous offset append, so a legacy
+                // `Resume` mode is not applicable here.
                 WriteMode::Resume { .. } => {
                     return Err(StorageError::Unsupported(
-                        "session upload does not support resume".into(),
+                        "session upload does not support contiguous resume; use the block probe".into(),
                     ))
                 }
             }
         };
+        // Load any already-received byte ranges from the sidecar so a pause /
+        // resume only re-sends the missing blocks.
+        let blocks_path = blocks_path_for(&tmp);
+        let ranges = read_ranges(&blocks_path).await;
         Ok(Box::new(FsSink {
             file,
             tmp: Some(tmp),
@@ -267,6 +279,8 @@ impl StorageBackend for FsStorage {
             rel: path.to_string(),
             mode,
             written: 0,
+            blocks_path: Some(blocks_path),
+            ranges,
         }))
     }
 
@@ -385,6 +399,37 @@ pub struct FsSink {
     /// check at commit time).
     mode: WriteMode,
     written: u64,
+    /// Optional sidecar path tracking received byte ranges for a resumable
+    /// "session" upload (parallel to the session temp file). `None` for
+    /// ordinary (non-session) sinks.
+    blocks_path: Option<PathBuf>,
+    /// In-memory copy of the received ranges (kept in sync with
+    /// `blocks_path`).
+    ranges: Vec<ChunkRange>,
+}
+
+/// Merge `new` (a `[start, end)` half-open range) into a sorted, disjoint
+/// list of ranges, coalescing overlaps/adjacencies. Returns the updated list.
+fn merge_range(ranges: &mut Vec<ChunkRange>, new: ChunkRange) {
+    if new.is_empty() {
+        return;
+    }
+    ranges.push(new);
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<ChunkRange> = Vec::with_capacity(ranges.len());
+    for r in ranges.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            // Overlapping or adjacent ranges coalesce.
+            if r.start <= last.end {
+                if r.end > last.end {
+                    last.end = r.end;
+                }
+                continue;
+            }
+        }
+        merged.push(r);
+    }
+    *ranges = merged;
 }
 
 #[async_trait]
@@ -412,7 +457,21 @@ impl UploadSink for FsSink {
         // Track the highest extent written (used by `len`-style bookkeeping;
         // the real size for commit validation comes from file metadata).
         self.written = self.written.max(offset.saturating_add(buf.len() as u64));
+        // For a resumable session sink, record the received byte range in the
+        // sidecar so a later probe / resume knows this part is already on
+        // disk and only missing gaps need to be re-sent.
+        if let Some(blocks) = self.blocks_path.clone() {
+            merge_range(&mut self.ranges, ChunkRange {
+                start: offset,
+                end: offset.saturating_add(buf.len() as u64),
+            });
+            persist_ranges(&blocks, &self.ranges).await?;
+        }
         Ok(())
+    }
+
+    async fn received_ranges(&mut self) -> Result<Vec<ChunkRange>, StorageError> {
+        Ok(self.ranges.clone())
     }
 
     async fn len(&self) -> Result<u64, StorageError> {
@@ -431,8 +490,10 @@ impl UploadSink for FsSink {
             target,
             rel,
             mode,
+            blocks_path,
             ..
         } = *self;
+        let _ = remove_blocks_sidecar(blocks_path.as_deref()).await;
         file.flush().await.map_err(|e| StorageError::Other(e))?;
         file.sync_all().await.map_err(|e| StorageError::Other(e))?;
         drop(file);
@@ -466,13 +527,50 @@ impl UploadSink for FsSink {
     }
 
     async fn abort(self: Box<Self>) -> Result<(), StorageError> {
-        let FsSink { file, tmp, .. } = *self;
+        let FsSink {
+            file,
+            tmp,
+            blocks_path,
+            ..
+        } = *self;
         drop(file);
         if let Some(tmp) = tmp {
             let _ = tokio::fs::remove_file(&tmp).await;
         }
+        let _ = remove_blocks_sidecar(blocks_path.as_deref()).await;
         Ok(())
     }
+}
+
+/// Sidecar filename for a session temp (e.g. `<temp>.blocks`).
+fn blocks_path_for(tmp: &Path) -> PathBuf {
+    let mut name = tmp.as_os_str().to_owned();
+    name.push(".blocks");
+    PathBuf::from(name)
+}
+
+/// Read the persisted received byte ranges for a session temp sidecar.
+async fn read_ranges(blocks: &Path) -> Vec<ChunkRange> {
+    match tokio::fs::read_to_string(blocks).await {
+        Ok(text) => serde_json::from_str::<Vec<ChunkRange>>(&text).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Persist the received byte ranges to a session temp sidecar (best-effort).
+async fn persist_ranges(blocks: &Path, ranges: &[ChunkRange]) -> Result<(), StorageError> {
+    let text = serde_json::to_string(ranges).unwrap_or_else(|_| "[]".to_string());
+    tokio::fs::write(blocks, text)
+        .await
+        .map_err(|e| StorageError::Other(e))
+}
+
+/// Remove a session temp sidecar (best-effort; missing file is fine).
+async fn remove_blocks_sidecar(blocks: Option<&Path>) -> Result<(), StorageError> {
+    if let Some(blocks) = blocks {
+        let _ = tokio::fs::remove_file(blocks).await;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
