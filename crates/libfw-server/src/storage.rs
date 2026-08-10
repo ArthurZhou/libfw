@@ -190,6 +190,86 @@ impl StorageBackend for FsStorage {
         }
     }
 
+    async fn write_stream_session(
+        &self,
+        path: &str,
+        session: &str,
+        mode: WriteMode,
+    ) -> Result<Box<dyn UploadSink>, StorageError> {
+        let full = self.resolve(path)?;
+        if let Some(parent) = full.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| StorageError::Other(e))?;
+        }
+        // The session string is embedded in a temp filename, so it must never
+        // be able to inject path separators or `..` (a malicious client could
+        // otherwise write outside the mount root). Restrict to safe chars.
+        let safe: String = session
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let name = full
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "upload".to_string());
+        let tmp = full.with_file_name(format!(".libfw-sess-{safe}-{name}"));
+
+        let exists = tokio::fs::try_exists(&tmp)
+            .await
+            .map_err(|e| StorageError::Other(e))?;
+        let file = if exists {
+            // Subsequent chunk of an in-flight session: open the shared temp
+            // for positional (seek + write) access. `mode` is ignored.
+            tokio::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&tmp)
+                .await
+                .map_err(|e| StorageError::Other(e))?
+        } else {
+            // First request for this session: create the shared temp.
+            match mode {
+                WriteMode::Create | WriteMode::Overwrite => {
+                    if mode == WriteMode::Create
+                        && tokio::fs::try_exists(&full)
+                            .await
+                            .map_err(|e| StorageError::Other(e))?
+                    {
+                        return Err(StorageError::AlreadyExists(path.to_string()));
+                    }
+                    tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&tmp)
+                        .await
+                        .map_err(|e| StorageError::Other(e))?
+                }
+                // Session mode has no resume semantics; callers must use the
+                // legacy `write_stream` path for resume uploads.
+                WriteMode::Resume { .. } => {
+                    return Err(StorageError::Unsupported(
+                        "session upload does not support resume".into(),
+                    ))
+                }
+            }
+        };
+        Ok(Box::new(FsSink {
+            file,
+            tmp: Some(tmp),
+            target: full,
+            rel: path.to_string(),
+            mode,
+            written: 0,
+        }))
+    }
+
     async fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>, StorageError> {
         let full = if path.is_empty() {
             self.root.clone()
@@ -317,6 +397,30 @@ impl UploadSink for FsSink {
             .map_err(|e| StorageError::write_failed(self.written, e))?;
         self.written += buf.len() as u64;
         Ok(())
+    }
+
+    async fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), StorageError> {
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| StorageError::write_failed(offset, e))?;
+        self.file
+            .write_all(buf)
+            .await
+            .map_err(|e| StorageError::write_failed(offset, e))?;
+        // Track the highest extent written (used by `len`-style bookkeeping;
+        // the real size for commit validation comes from file metadata).
+        self.written = self.written.max(offset.saturating_add(buf.len() as u64));
+        Ok(())
+    }
+
+    async fn len(&self) -> Result<u64, StorageError> {
+        self.file
+            .metadata()
+            .await
+            .map(|m| m.len())
+            .map_err(|e| StorageError::Other(e))
     }
 
     async fn commit(self: Box<Self>) -> Result<FileMeta, StorageError> {

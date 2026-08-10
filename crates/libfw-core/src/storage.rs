@@ -49,6 +49,19 @@ pub trait UploadSink: Send {
     /// Append `buf` at the sink's current position.
     async fn write(&mut self, buf: &[u8]) -> Result<(), StorageError>;
 
+    /// Write `buf` at an absolute `offset` within the destination.
+    ///
+    /// Sequential-only sinks may ignore `offset` and append instead (the
+    /// default). Positional sinks (used by the concurrent "session" upload
+    /// path) seek to `offset` first, so out-of-order chunks land in the
+    /// right place.
+    async fn write_at(&mut self, _offset: u64, buf: &[u8]) -> Result<(), StorageError> {
+        self.write(buf).await
+    }
+
+    /// Current length of the destination, for size validation before commit.
+    async fn len(&self) -> Result<u64, StorageError>;
+
     /// Finish the stream, finalize the destination and return its metadata.
     async fn commit(self: Box<Self>) -> Result<FileMeta, StorageError>;
 
@@ -73,6 +86,24 @@ pub trait StorageBackend: Send + Sync + 'static {
 
     /// Open a write stream for `path` according to `mode`.
     async fn write_stream(&self, path: &str, mode: WriteMode) -> Result<Box<dyn UploadSink>, StorageError>;
+
+    /// Open a positional write stream for a **concurrent** "session" upload.
+    ///
+    /// All chunk requests for one file share the same `session` id and write
+    /// into a single shared temp file at absolute offsets via
+    /// [`UploadSink::write_at`]; only the final (commit) request renames it
+    /// into place. The first request (which creates the temp) uses `mode`
+    /// for the Create/Overwrite/Resume semantics; later requests ignore it.
+    async fn write_stream_session(
+        &self,
+        path: &str,
+        _session: &str,
+        mode: WriteMode,
+    ) -> Result<Box<dyn UploadSink>, StorageError> {
+        // Default: single-request path is not concurrent; behave like a
+        // normal `write_stream` for backends that don't opt into sessions.
+        self.write_stream(path, mode).await
+    }
 
     /// List the children of directory `path` (or the mount root when
     /// `path` is empty).

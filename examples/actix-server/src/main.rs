@@ -31,7 +31,7 @@ use libfw_core::{RangeSpec, StorageError, STREAM_BUF_SIZE};
 use libfw_server::{
     content_range_none_value, content_range_value, etag_matches_if_none_match, if_range_matches,
     parse_range_header, FsStorage, ParsedRange, ServerState, HEADER_COMPRESS, HEADER_FILE_META,
-    HEADER_OFFSET,
+    HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -350,6 +350,36 @@ async fn file_upload(
         .and_then(CompressionFormat::parse_header)
         .unwrap_or(CompressionFormat::None);
 
+    // `x-libfw-final` marks the request as the file's last chunk; only then
+    // can the server verify the committed size matches `meta.size`.
+    let final_chunk = headers
+        .get(HEADER_FINAL)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    // Concurrent "session" upload path: chunks carry their ABSOLUTE offset
+    // and are written into a shared per-session temp file (positional);
+    // only the final request commits. Absent → legacy sequential upload.
+    if let Some(session) = headers
+        .get(HEADER_SESSION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return upload_session_actix(
+            &state,
+            &path,
+            &session,
+            &meta,
+            format,
+            final_chunk,
+            headers,
+            body,
+        )
+        .await;
+    }
+
     let mode = match headers.get(HEADER_OFFSET).and_then(|v| v.to_str().ok()) {
         None => WriteMode::Create,
         Some(off) if off.trim().parse::<u64>().map(|n| n == 0).unwrap_or(false) => {
@@ -408,6 +438,109 @@ async fn file_upload(
         Ok(committed) => HttpResponse::Created().json(serde_json::json!({ "file": committed })),
         Err(_) => HttpResponse::InternalServerError().finish(),
     }
+}
+
+/// Handle one request of the concurrent "session" upload protocol (mirrors
+/// the axum handler). Data chunks write at their ABSOLUTE offset into a
+/// shared per-session temp; the `x-libfw-final` request verifies the size
+/// and commits.
+async fn upload_session_actix(
+    state: &ServerState,
+    path: &str,
+    session: &str,
+    meta: &FileMeta,
+    format: CompressionFormat,
+    final_chunk: bool,
+    headers: &HeaderMap,
+    mut body: web::Payload,
+) -> HttpResponse {
+    let offset_hdr = headers.get(HEADER_OFFSET).and_then(|v| v.to_str().ok());
+    let base_offset = match offset_hdr {
+        None => 0u64,
+        Some(off) => match off.trim().parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => return HttpResponse::BadRequest().body("invalid x-libfw-offset"),
+        },
+    };
+    let create_mode = if offset_hdr.is_none() {
+        WriteMode::Create
+    } else {
+        WriteMode::Overwrite
+    };
+
+    let mut sink = match state.storage.write_stream_session(path, session, create_mode).await {
+        Ok(s) => s,
+        Err(StorageError::AlreadyExists(_)) => return HttpResponse::Conflict().body("exists"),
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
+
+    let mut decomp = decompressor(format);
+    let mut out: Vec<u8> = Vec::new();
+    let mut written = 0u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(_) => {
+                let _ = sink.abort().await;
+                return HttpResponse::BadRequest().body("body stream error");
+            }
+        };
+        if let Err(e) = decomp.decompress(&chunk, &mut out) {
+            let _ = sink.abort().await;
+            return HttpResponse::BadRequest().body(format!("compressed stream invalid: {e}"));
+        }
+        let data = std::mem::take(&mut out);
+        if !data.is_empty() {
+            let abs = base_offset.saturating_add(written);
+            let end = abs.saturating_add(data.len() as u64);
+            if end > state.max_upload_size {
+                let _ = sink.abort().await;
+                return HttpResponse::PayloadTooLarge().body("upload too large");
+            }
+            if end > meta.size {
+                let _ = sink.abort().await;
+                return HttpResponse::BadRequest().body("uploaded bytes exceed declared size");
+            }
+            if sink.write_at(abs, &data).await.is_err() {
+                let _ = sink.abort().await;
+                return HttpResponse::InternalServerError().finish();
+            }
+            written = written.saturating_add(data.len() as u64);
+        }
+    }
+    if let Err(e) = decomp.finish(&mut out) {
+        let _ = sink.abort().await;
+        return HttpResponse::BadRequest().body(format!("compressed stream truncated: {e}"));
+    }
+    if !out.is_empty() {
+        let abs = base_offset.saturating_add(written);
+        let end = abs.saturating_add(out.len() as u64);
+        if end > meta.size {
+            let _ = sink.abort().await;
+            return HttpResponse::BadRequest().body("uploaded bytes exceed declared size");
+        }
+        if sink.write_at(abs, &out).await.is_err() {
+            let _ = sink.abort().await;
+            return HttpResponse::InternalServerError().finish();
+        }
+    }
+
+    if final_chunk {
+        match sink.len().await {
+            Ok(len) if len == meta.size => {}
+            _ => {
+                let _ = sink.abort().await;
+                return HttpResponse::BadRequest().body("commit size mismatch");
+            }
+        }
+        match sink.commit().await {
+            Ok(committed) => {
+                return HttpResponse::Created().json(serde_json::json!({ "file": committed }))
+            }
+            Err(_) => return HttpResponse::InternalServerError().finish(),
+        }
+    }
+    HttpResponse::Created().json(serde_json::json!({ "file": meta }))
 }
 
 // ---------------------------------------------------------------------------

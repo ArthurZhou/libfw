@@ -29,7 +29,8 @@ use crate::http::{
     if_range_matches, parse_range_header,
 };
 use crate::{
-    HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET, ServerState, validate_rel_path,
+    HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION, ServerState,
+    validate_rel_path,
 };
 
 /// Errors surfaced by handlers, mapped to HTTP responses.
@@ -333,6 +334,121 @@ async fn write_batch(
     Ok(())
 }
 
+/// Positional variant of [`write_batch`] for the concurrent session path:
+/// `data` is written at its absolute offset (`base_offset + written`), so
+/// chunks may arrive out of order and still land in the right place.
+async fn write_at_batch(
+    sink: &mut Box<dyn UploadSink>,
+    state: &ServerState,
+    base_offset: u64,
+    meta_size: u64,
+    written: &mut u64,
+    data: &[u8],
+) -> Result<(), ApiError> {
+    let abs = base_offset.saturating_add(*written);
+    let end = abs.saturating_add(data.len() as u64);
+    if end > state.max_upload_size {
+        return Err(ApiError::PayloadTooLarge(state.max_upload_size));
+    }
+    if end > meta_size {
+        return Err(ApiError::BadRequest(
+            "uploaded bytes exceed the declared file size".into(),
+        ));
+    }
+    sink.write_at(abs, data).await?;
+    *written = written.saturating_add(data.len() as u64);
+    Ok(())
+}
+
+/// Handle one request of the concurrent "session" upload protocol.
+///
+/// Data-chunk requests write their body at the ABSOLUTE `x-libfw-offset`
+/// into a shared per-session temp file and do not finalize; the
+/// `x-libfw-final` (commit) request verifies the temp holds exactly
+/// `meta.size` bytes, then atomically renames it into place.
+async fn upload_session(
+    state: &ServerState,
+    path: &str,
+    session: &str,
+    meta: &FileMeta,
+    format: CompressionFormat,
+    final_chunk: bool,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    // The first chunk (offset 0, or a Create chunk with no offset header)
+    // creates the shared temp and selects Create/Overwrite; later chunks
+    // reuse it and only supply their absolute offset.
+    let offset_hdr = headers.get(HEADER_OFFSET).and_then(|v| v.to_str().ok());
+    let base_offset = match offset_hdr {
+        None => 0u64,
+        Some(off) => off
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| ApiError::BadRequest(format!("invalid `{HEADER_OFFSET}`")))?,
+    };
+    let create_mode = if offset_hdr.is_none() {
+        WriteMode::Create
+    } else {
+        WriteMode::Overwrite
+    };
+
+    let mut sink = state
+        .storage
+        .write_stream_session(path, session, create_mode)
+        .await?;
+
+    let mut decomp = decompressor_with_limit(format, MAX_FRAME_OUTPUT);
+    let mut out: Vec<u8> = Vec::new();
+    let mut written = 0u64;
+    let mut stream = body.into_data_stream();
+
+    let write_result: Result<(), ApiError> = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ApiError::Io(std::io::Error::other(e)))?;
+            decomp
+                .decompress(&chunk, &mut out)
+                .map_err(|e| ApiError::BadRequest(format!("compressed stream invalid: {e}")))?;
+            let data = std::mem::take(&mut out);
+            if !data.is_empty() {
+                write_at_batch(&mut sink, state, base_offset, meta.size, &mut written, &data)
+                    .await?;
+            }
+        }
+        decomp
+            .finish(&mut out)
+            .map_err(|e| ApiError::BadRequest(format!("compressed stream truncated: {e}")))?;
+        if !out.is_empty() {
+            write_at_batch(&mut sink, state, base_offset, meta.size, &mut written, &out).await?;
+        }
+        Ok(())
+    }
+    .await;
+
+    if let Err(e) = write_result {
+        let _ = sink.abort().await;
+        return Err(e);
+    }
+
+    // Only the commit request finalizes: verify the shared temp holds the
+    // exact declared size (all chunks present, no truncation), then rename.
+    if final_chunk {
+        let len = sink.len().await?;
+        if len != meta.size {
+            let _ = sink.abort().await;
+            return Err(ApiError::BadRequest(format!(
+                "commit yields {} bytes but the declared file size is {}",
+                len, meta.size
+            )));
+        }
+        let committed = sink.commit().await?;
+        return Ok((StatusCode::CREATED, Json(UploadOk { file: committed })).into_response());
+    }
+
+    // Data chunk: keep the shared temp for subsequent requests.
+    Ok((StatusCode::CREATED, Json(UploadOk { file: meta.clone() })).into_response())
+}
+
 pub(crate) async fn upload(
     State(state): State<Arc<ServerState>>,
     Path(path): Path<String>,
@@ -359,6 +475,39 @@ pub(crate) async fn upload(
         .and_then(CompressionFormat::parse_header)
         .unwrap_or(CompressionFormat::None);
 
+    // `x-libfw-final` marks the request as the file's last chunk; only then
+    // can the server verify the committed size matches `meta.size`.
+    let final_chunk = headers
+        .get(HEADER_FINAL)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    // Optional per-upload session id. When present the client pipelines many
+    // chunks in flight, each carrying its ABSOLUTE `x-libfw-offset` and
+    // written into a shared per-session temp file (positional writes); only
+    // the `x-libfw-final` request commits. Absent → legacy sequential
+    // per-request upload (Create/Overwrite/Resume) — fully backward
+    // compatible with older clients.
+    if let Some(session) = headers
+        .get(HEADER_SESSION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return upload_session(
+            &state,
+            &path,
+            &session,
+            &meta,
+            format,
+            final_chunk,
+            headers,
+            body,
+        )
+        .await;
+    }
+
     // Absent offset → Create (409 if exists); `0` → Overwrite; `N>0` → Resume.
     let mode = match headers.get(HEADER_OFFSET).and_then(|v| v.to_str().ok()) {
         None => WriteMode::Create,
@@ -383,13 +532,6 @@ pub(crate) async fn upload(
     // frames in one body chunk must be rejected before it can inflate
     // memory (each frame is capped at MAX_FRAME_OUTPUT already).
     let mut decomp = decompressor_with_limit(format, MAX_FRAME_OUTPUT);
-    // `x-libfw-final` marks the request as the file's last chunk; only then
-    // can the server verify the committed size matches `meta.size`.
-    let final_chunk = headers
-        .get(HEADER_FINAL)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
     let mut out: Vec<u8> = Vec::new();
     let mut appended = 0u64;
     let mut stream = body.into_data_stream();

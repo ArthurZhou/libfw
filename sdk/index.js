@@ -188,7 +188,9 @@ export class LibfwClient {
   /**
    * @param {object} [options]
    * @param {string} [options.baseUrl=''] base URL the server routes are mounted under
-   * @param {number} [options.concurrency=4] max concurrent file transfers
+   * @param {number} [options.concurrency=4] max concurrent file transfers; also
+   *        the in-flight chunk window for a single file's upload (keeps
+   *        high-latency links saturated)
    * @param {boolean} [options.compress=true] negotiate zrip compression
    * @param {number} [options.chunkSize=2097152] upload chunk size in bytes
    * @param {number} [options.maxRetries=3] retries per chunk/file before failing

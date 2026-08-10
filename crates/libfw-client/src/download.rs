@@ -219,6 +219,17 @@ async fn stream_download(
         .and_then(|v| CompressionFormat::parse_header(&v))
         .unwrap_or(CompressionFormat::None);
 
+    // If the total wasn't known up front (single-file download), derive it
+    // from the server's `Content-Range`/`Content-Length` so the progress bar
+    // has a real denominator instead of `0`.
+    if control.total_bytes() == 0 {
+        if let Some(total) = content_range_total(resp)
+            .or_else(|| content_length(resp))
+        {
+            control.set_total(total.max(file.size));
+        }
+    }
+
     // State is shared via `Rc` so the per-chunk `FnMut` callback can move
     // owned clones into its `async move` block (single-threaded WASM).
     let decomp = Rc::new(RefCell::new(decompressor(format)));
@@ -256,6 +267,10 @@ async fn stream_download(
                     callbacks.on_write_chunk(&path, offset, &data).await?;
                     file_offset.set(offset.saturating_add(data.len() as u64));
                     control.add_progress(data.len() as u64);
+                    // Report smooth intermediate progress during a long
+                    // single-file download (throttled to whole-percent
+                    // boundaries; previously files sat at 0% → 100%).
+                    control.report_progress_if(&callbacks)?;
 
                     // Persist an absolute resume offset every so often so a
                     // crash mid-transfer can continue instead of restarting.
@@ -284,6 +299,7 @@ async fn stream_download(
         callbacks.on_write_chunk(&path, offset, &tail).await?;
         file_offset.set(offset.saturating_add(tail.len() as u64));
         control.add_progress(tail.len() as u64);
+        control.report_progress_if(&callbacks)?;
     }
 
     Ok(DownloadOutcome {
@@ -400,4 +416,17 @@ fn content_range_start(resp: &Response) -> Option<u64> {
     let after = value.split_whitespace().nth(1)?; // "start-end/total"
     let start = after.split('-').next()?;
     start.parse().ok()
+}
+
+/// Parse `Content-Range: bytes start-end/total` → `total` (the overall size).
+fn content_range_total(resp: &Response) -> Option<u64> {
+    let value = resp.headers().get("content-range").ok().flatten()?;
+    let after = value.split_whitespace().nth(1)?; // "start-end/total"
+    let total = after.split('/').nth(1)?;
+    total.parse().ok()
+}
+
+/// Parse the `Content-Length` header.
+fn content_length(resp: &Response) -> Option<u64> {
+    resp.headers().get("content-length").ok().flatten()?.parse().ok()
 }

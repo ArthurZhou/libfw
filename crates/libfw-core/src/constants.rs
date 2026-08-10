@@ -36,6 +36,16 @@ pub const HEADER_OFFSET: &str = "x-libfw-offset";
 /// the check — the header is optional and backward compatible.
 pub const HEADER_FINAL: &str = "x-libfw-final";
 
+/// HTTP header carrying a per-upload **session id**.
+///
+/// When present, the upload uses the concurrent "session" protocol: each
+/// chunk carries its ABSOLUTE `x-libfw-offset` and is written into a shared
+/// per-session temp file (positional writes), and the final
+/// `x-libfw-final` request commits it. This lets a client pipeline many
+/// chunks in flight (hiding round-trip latency) instead of serializing one
+/// request per chunk. Absent → legacy per-request sequential upload.
+pub const HEADER_SESSION: &str = "x-libfw-session";
+
 /// HTTP header carrying the (optional) transfer version handshake.
 pub const HEADER_PROTOCOL: &str = "x-libfw-protocol";
 

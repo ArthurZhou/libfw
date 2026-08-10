@@ -11,7 +11,10 @@ use libfw_core::auth::{AuthError, PathValidator, TokenVerifier};
 use libfw_core::claims::{Permission, TokenClaims};
 use libfw_core::compress::{compressor, decompressor, CompressionFormat};
 use libfw_core::metadata::encode_file_meta_header;
-use libfw_server::{router, FsStorage, ServerState, HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET};
+use libfw_server::{
+    router, FsStorage, ServerState, HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET,
+    HEADER_SESSION,
+};
 use tower::ServiceExt;
 
 /// A verifier that maps the token to a subject with full permissions.
@@ -100,6 +103,109 @@ async fn upload_then_download_roundtrip() {
     assert_eq!(resp.status(), StatusCode::OK);
     let got = body_string(resp).await.into_bytes();
     assert_eq!(got, data);
+}
+
+#[tokio::test]
+async fn session_upload_writes_chunks_out_of_order_then_commits() {
+    let app = app(DevVerifier);
+    let data = b"0123456789".to_vec();
+    let meta = libfw_core::metadata::FileMeta::new("sess.bin", data.len() as u64, 0);
+    let session = "test-sess-1";
+
+    async fn post_chunk(
+        app: axum::Router,
+        session: &str,
+        offset: u64,
+        chunk: &[u8],
+        final_chunk: bool,
+        meta: &libfw_core::metadata::FileMeta,
+    ) -> StatusCode {
+        let mut headers = auth_header("tok");
+        headers
+            .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(meta)).unwrap());
+        headers.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+        headers
+            .insert(HEADER_OFFSET, HeaderValue::from_str(&offset.to_string()).unwrap());
+        if final_chunk {
+            headers.insert(HEADER_FINAL, HeaderValue::from_static("1"));
+        }
+        let resp = app
+            .oneshot(request("POST", "/file/sess.bin", headers, Body::from(chunk.to_vec())))
+            .await
+            .unwrap();
+        resp.status()
+    }
+
+    // Chunk 0..4 (creates the shared temp).
+    assert_eq!(
+        post_chunk(app.clone(), session, 0, &data[0..4], false, &meta).await,
+        StatusCode::CREATED
+    );
+    // Chunk 8..10 arrives BEFORE 4..8 → must still land at offset 8.
+    assert_eq!(
+        post_chunk(app.clone(), session, 8, &data[8..10], false, &meta).await,
+        StatusCode::CREATED
+    );
+    // Chunk 4..8 fills the gap.
+    assert_eq!(
+        post_chunk(app.clone(), session, 4, &data[4..8], false, &meta).await,
+        StatusCode::CREATED
+    );
+    // Commit: verifies temp size == declared size, then renames into place.
+    assert_eq!(
+        post_chunk(app.clone(), session, data.len() as u64, &[], true, &meta).await,
+        StatusCode::CREATED
+    );
+
+    let resp = app
+        .oneshot(request("GET", "/file/sess.bin", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = body_string(resp).await.into_bytes();
+    assert_eq!(got, data);
+}
+
+#[tokio::test]
+async fn session_upload_rejects_commit_with_wrong_size() {
+    let app = app(DevVerifier);
+    let data = b"0123456789".to_vec();
+    // Declared size is 10 but we only upload 4 bytes.
+    let meta = libfw_core::metadata::FileMeta::new("sess2.bin", 10, 0);
+    let session = "test-sess-2";
+
+    let mut headers = auth_header("tok");
+    headers
+        .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    headers.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    headers.insert(HEADER_OFFSET, HeaderValue::from_static("0"));
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/sess2.bin", headers, Body::from(data[0..4].to_vec())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Commit with declared size 10 but only 4 bytes present → rejected.
+    let mut headers = auth_header("tok");
+    headers
+        .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    headers.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    headers.insert(HEADER_OFFSET, HeaderValue::from_static("10"));
+    headers.insert(HEADER_FINAL, HeaderValue::from_static("1"));
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/sess2.bin", headers, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The file must not exist (aborted commit leaves nothing committed).
+    let resp = app
+        .oneshot(request("GET", "/file/sess2.bin", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

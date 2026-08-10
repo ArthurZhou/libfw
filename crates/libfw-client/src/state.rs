@@ -12,6 +12,7 @@ use std::rc::Rc;
 use wasm_bindgen::JsValue;
 
 use crate::error::LibfwError;
+use crate::js::Callbacks;
 
 /// Lifecycle state of the current transfer task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +61,9 @@ pub struct TaskControl {
     cancelled: Rc<Cell<bool>>,
     done_bytes: Rc<Cell<u64>>,
     total_bytes: Rc<Cell<u64>>,
+    /// `done_bytes` the last time progress was reported to JS, used to
+    /// throttle `on_progress` events (see [`TaskControl::report_progress_if`]).
+    last_reported: Rc<Cell<u64>>,
 }
 
 impl Default for TaskControl {
@@ -77,6 +81,7 @@ impl TaskControl {
             cancelled: Rc::new(Cell::new(false)),
             done_bytes: Rc::new(Cell::new(0)),
             total_bytes: Rc::new(Cell::new(0)),
+            last_reported: Rc::new(Cell::new(0)),
         }
     }
 
@@ -87,6 +92,7 @@ impl TaskControl {
         self.cancelled.set(false);
         self.done_bytes.set(0);
         self.total_bytes.set(0);
+        self.last_reported.set(0);
     }
 
     /// Current state.
@@ -201,6 +207,41 @@ impl TaskControl {
         } else {
             (self.done_bytes.get() as f64 / total as f64).clamp(0.0, 1.0)
         }
+    }
+
+    /// Emit an `on_progress` event to JS, throttled to whole-percent
+    /// boundaries of `total` so a long single-file transfer reports smooth
+    /// intermediate values instead of only 0% then 100%.
+    ///
+    /// Uses the shared [`TaskControl`] as the single source of truth, so
+    /// concurrent per-file tasks all feed one coherent progress bar. The
+    /// final `done == total` boundary is always reported; callers that
+    /// already report after each file's completion remain correct.
+    ///
+    /// Returns `Ok(())` when nothing was emitted (still within the current
+    /// percent bucket) or when the (cheap sync) event was delivered.
+    pub fn report_progress_if(&self, callbacks: &Callbacks) -> Result<(), LibfwError> {
+        let total = self.total_bytes.get();
+        let done = self.done_bytes.get();
+        if total == 0 {
+            // Total unknown: still push a best-effort bytes-only event so
+            // consumers see *something* (e.g. single-file downloads before
+            // the server reports a size).
+            let last = self.last_reported.get();
+            if done != last {
+                self.last_reported.set(done);
+                return callbacks.on_progress(done, 0);
+            }
+            return Ok(());
+        }
+        let last = self.last_reported.get();
+        let done_pct = done.saturating_mul(100) / total;
+        let last_pct = last.saturating_mul(100) / total;
+        if done_pct != last_pct || done >= total {
+            self.last_reported.set(done);
+            return callbacks.on_progress(done, total);
+        }
+        Ok(())
     }
 }
 
