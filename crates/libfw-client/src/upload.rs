@@ -63,29 +63,53 @@ fn covered_bytes(received: &[[u64; 2]]) -> u64 {
     total
 }
 
-/// Fold the connection's ACTUAL wire progress (enqueued minus still-buffered)
-/// into the shared progress bar, emitting an `on_progress` event per block as
-/// the bytes truly leave the socket.
+/// Pop every block whose full wire span has drained and return the FILE bytes
+/// to add to progress.
+///
+/// `pending` holds `(cumulative_wire_offset_after_block, file_len)` for each
+/// block sent but not yet counted; `wire` is the connection's current
+/// transmitted count relative to the transfer start. Blocks drain in send
+/// order (WebSocket is FIFO), so popping the front while its offset is met is
+/// correct even when several drain between polls.
+fn drained_file_bytes(pending: &mut VecDeque<(u64, u64)>, wire: u64) -> u64 {
+    let mut added = 0u64;
+    while let Some(&(wire_end, file_len)) = pending.front() {
+        if wire >= wire_end {
+            pending.pop_front();
+            added = added.saturating_add(file_len);
+        } else {
+            break;
+        }
+    }
+    added
+}
+
+/// Fold per-block FILE progress as each block's compressed bytes actually
+/// leave the socket, emitting an `on_progress` event when a block completes.
 ///
 /// `send()` only queues into the WebSocket send buffer, so counting at
 /// dispatch time would jump a whole wave at once and then freeze while a slow
-/// link drains — polling [`WsConnection::transmitted_bytes`] is what makes the
-/// bar move in real time instead. `baseline` is the connection's transmitted
-/// count when this file's transfer started (the socket may already have
-/// carried an earlier file on this pooled connection); `last_synced` is the
-/// highest wire value already folded into progress.
+/// link drains. Polling [`WsConnection::transmitted_bytes`] tells us when a
+/// block's bytes are really on the wire; because compression makes wire bytes
+/// ≠ file bytes, we translate via [`drained_file_bytes`] and only add the
+/// block's FILE length. `baseline` is the connection's transmitted count when
+/// this file's transfer started (the socket may already have carried an
+/// earlier file on this pooled connection); `last_synced` is the FILE bytes
+/// already folded into progress.
 fn sync_upload_progress(
     conn: &WsConnection,
     control: &TaskControl,
     callbacks: &Callbacks,
     baseline: u64,
+    pending: &mut VecDeque<(u64, u64)>,
     last_synced: &mut u64,
 ) -> Result<(), LibfwError> {
     let wire = conn.transmitted_bytes().saturating_sub(baseline);
-    if wire > *last_synced {
-        control.add_progress(wire - *last_synced);
+    let added = drained_file_bytes(pending, wire);
+    if added > 0 {
+        control.add_progress(added);
+        *last_synced = last_synced.saturating_add(added);
         control.report_progress_if(callbacks)?;
-        *last_synced = wire;
     }
     Ok(())
 }
@@ -155,14 +179,18 @@ async fn upload_once(
     let mut queue: VecDeque<u32> = verified.missing().into_iter().collect();
     let window = config.upload_window.max(1);
 
-    // Progress is keyed to bytes that have ACTUALLY left the socket, not
-    // bytes merely handed to `send()` (which only queues into the WebSocket
-    // send buffer — on a slow link a whole wave is enqueued instantly and
-    // then drains gradually, so counting at dispatch time would jump a big
-    // chunk and then freeze). `baseline` is this connection's transmitted
-    // count right as this file's transfer starts; the socket may already
-    // have carried an earlier file on this pooled connection.
+    // Progress is keyed to FILE bytes whose compressed frames have ACTUALLY
+    // left the socket, not bytes merely handed to `send()` (which only queues
+    // into the WebSocket send buffer — on a slow link a whole wave is
+    // enqueued instantly and then drains gradually). `baseline` is this
+    // connection's transmitted count right as this file's transfer starts;
+    // the socket may already have carried an earlier file on this pooled
+    // connection. `pending` maps each block's cumulative wire offset to its
+    // FILE length, so we can count a block's file bytes exactly when its
+    // compressed bytes drain (wire bytes ≠ file bytes when compression is on).
     let baseline = conn.transmitted_bytes();
+    let mut pending: VecDeque<(u64, u64)> = VecDeque::new();
+    let mut wire_offset = 0u64;
     let mut last_synced = 0u64;
 
     loop {
@@ -193,7 +221,10 @@ async fn upload_once(
                 raw
             };
             let crc = crc32(&payload);
-            conn.send(&block_frame(idx, crc, raw_len, &payload))?;
+            let frame = block_frame(idx, crc, raw_len, &payload);
+            wire_offset = wire_offset.saturating_add(frame.len() as u64);
+            pending.push_back((wire_offset, len));
+            conn.send(&frame)?;
             sent += 1;
         }
 
@@ -209,9 +240,11 @@ async fn upload_once(
         let mut last_activity = js_sys::Date::now();
         loop {
             control.check()?;
-            let wire_before = last_synced;
-            sync_upload_progress(conn, control, callbacks, baseline, &mut last_synced)?;
-            if last_synced > wire_before {
+            let wire_before = conn.transmitted_bytes();
+            sync_upload_progress(
+                conn, control, callbacks, baseline, &mut pending, &mut last_synced,
+            )?;
+            if conn.transmitted_bytes() > wire_before {
                 // The socket is still transmitting → keep the stall deadline
                 // rolling so a long, slow wave isn't mistaken for a hang.
                 last_activity = js_sys::Date::now();
@@ -235,6 +268,26 @@ async fn upload_once(
                         let msg: CompleteMessage = parse_control(&frame, FRAME_COMPLETE)
                             .ok_or_else(|| LibfwError::Protocol("bad COMPLETE frame".into()))?;
                         if msg.ok {
+                            // The server confirms it holds every byte. Fold
+                            // anything that drained since the last poll, then
+                            // force the bar to 100% so a fast final burst is
+                            // never left unreported.
+                            sync_upload_progress(
+                                conn,
+                                control,
+                                callbacks,
+                                baseline,
+                                &mut pending,
+                                &mut last_synced,
+                            )?;
+                            let remaining = file
+                                .size
+                                .saturating_sub(initial_covered)
+                                .saturating_sub(last_synced);
+                            if remaining > 0 {
+                                control.add_progress(remaining);
+                            }
+                            control.report_progress_if(callbacks)?;
                             return Ok(file.size.saturating_sub(initial_covered));
                         }
                         return Err(LibfwError::Protocol(
@@ -399,4 +452,54 @@ pub async fn upload(
         callbacks.on_progress(reported_done, total)?;
     }
     Ok(done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drained_blocks_map_wire_to_file_bytes() {
+        let mut pending = VecDeque::new();
+        // Block A: 2 MiB file, its compressed wire span ends at offset 1500.
+        pending.push_back((1500, 2 * 1024 * 1024));
+        // Block B: 1 MiB file, its compressed wire span ends at offset 4000.
+        pending.push_back((4000, 1024 * 1024));
+
+        // Nothing on the wire yet.
+        assert_eq!(drained_file_bytes(&mut pending, 0), 0);
+        assert_eq!(pending.len(), 2);
+
+        // Only A's wire span has drained → exactly A's FILE bytes count.
+        assert_eq!(drained_file_bytes(&mut pending, 1500), 2 * 1024 * 1024);
+        assert_eq!(pending.len(), 1);
+
+        // B's span drains too.
+        assert_eq!(drained_file_bytes(&mut pending, 4000), 1024 * 1024);
+        assert!(pending.is_empty());
+
+        // Wire growing beyond nothing left can't double-count.
+        assert_eq!(drained_file_bytes(&mut pending, 999_999), 0);
+    }
+
+    #[test]
+    fn drained_blocks_batch_after_poll() {
+        let mut pending = VecDeque::new();
+        pending.push_back((100, 50));
+        pending.push_back((200, 60));
+        // Several blocks drained between polls → all count at once.
+        assert_eq!(drained_file_bytes(&mut pending, 250), 110);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn drained_blocks_are_fifo() {
+        let mut pending = VecDeque::new();
+        pending.push_back((100, 10));
+        pending.push_back((200, 20));
+        // Only the first block's offset reached → only its bytes count; the
+        // second stays queued even though its offset is just past.
+        assert_eq!(drained_file_bytes(&mut pending, 199), 10);
+        assert_eq!(pending.len(), 1);
+    }
 }
