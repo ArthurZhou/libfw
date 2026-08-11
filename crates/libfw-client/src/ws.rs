@@ -10,7 +10,7 @@
 //! control commands (handshake, directory listing, metadata) — there are no
 //! separate HTTP calls on the transfer path anymore.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 
@@ -29,6 +29,9 @@ use crate::js::u8_vec_from_js;
 #[derive(Default)]
 struct WsState {
     socket: Option<WebSocket>,
+    /// Cumulative bytes handed to the socket via [`WsConnection::send`]
+    /// (enqueued, not necessarily transmitted over the wire yet).
+    sent_bytes: Cell<u64>,
     /// Frames received but not yet consumed by [`WsConnection::next`].
     incoming: VecDeque<Vec<u8>>,
     /// Resolver of the pending `next()` promise (delivers the next frame).
@@ -182,6 +185,10 @@ impl WsConnection {
     }
 
     /// Send one raw frame as a binary WebSocket message.
+    ///
+    /// This only queues the frame into the socket's send buffer; the bytes
+    /// are counted as progress when they actually leave the socket (see
+    /// [`WsConnection::transmitted_bytes`]).
     pub fn send(&self, frame: &[u8]) -> Result<(), LibfwError> {
         let ws = self
             .state
@@ -189,9 +196,46 @@ impl WsConnection {
             .socket
             .clone()
             .ok_or_else(|| LibfwError::Network("websocket not open".into()))?;
+        self.state.borrow().sent_bytes.set(
+            self.state
+                .borrow()
+                .sent_bytes
+                .get()
+                .saturating_add(frame.len() as u64),
+        );
         let mut copy = frame.to_vec();
         ws.send_with_u8_array(&mut copy)
             .map_err(|e| LibfwError::Network(format!("ws send failed: {}", js_value_string(&e))))
+    }
+
+    /// Bytes this connection has ACTUALLY put on the wire: everything
+    /// enqueued via [`WsConnection::send`] minus what is still sitting in
+    /// the socket's send buffer (`bufferedAmount`). On a slow link this lags
+    /// `send()` and is the true measure of wire progress.
+    pub fn transmitted_bytes(&self) -> u64 {
+        let st = self.state.borrow();
+        let sent = st.sent_bytes.get();
+        let buffered = st
+            .socket
+            .as_ref()
+            .map(|ws| ws.buffered_amount() as u64)
+            .unwrap_or(0);
+        sent.saturating_sub(buffered)
+    }
+
+    /// Total bytes enqueued into the socket (for diagnostics/tests).
+    #[allow(dead_code)]
+    pub fn enqueued_bytes(&self) -> u64 {
+        self.state.borrow().sent_bytes.get()
+    }
+
+    /// Non-blocking pop of one already-buffered frame.
+    ///
+    /// Used by the upload loop to poll both incoming frames and live wire
+    /// progress without registering a promise resolver (which would risk a
+    /// frame being delivered to a stale resolver on a poll timeout).
+    pub fn try_recv(&self) -> Option<Vec<u8>> {
+        self.state.borrow_mut().incoming.pop_front()
     }
 
     /// Await the next frame, timing out after [`WsConnection::timeout_ms`].

@@ -63,6 +63,33 @@ fn covered_bytes(received: &[[u64; 2]]) -> u64 {
     total
 }
 
+/// Fold the connection's ACTUAL wire progress (enqueued minus still-buffered)
+/// into the shared progress bar, emitting an `on_progress` event per block as
+/// the bytes truly leave the socket.
+///
+/// `send()` only queues into the WebSocket send buffer, so counting at
+/// dispatch time would jump a whole wave at once and then freeze while a slow
+/// link drains — polling [`WsConnection::transmitted_bytes`] is what makes the
+/// bar move in real time instead. `baseline` is the connection's transmitted
+/// count when this file's transfer started (the socket may already have
+/// carried an earlier file on this pooled connection); `last_synced` is the
+/// highest wire value already folded into progress.
+fn sync_upload_progress(
+    conn: &WsConnection,
+    control: &TaskControl,
+    callbacks: &Callbacks,
+    baseline: u64,
+    last_synced: &mut u64,
+) -> Result<(), LibfwError> {
+    let wire = conn.transmitted_bytes().saturating_sub(baseline);
+    if wire > *last_synced {
+        control.add_progress(wire - *last_synced);
+        control.report_progress_if(callbacks)?;
+        *last_synced = wire;
+    }
+    Ok(())
+}
+
 /// One upload attempt over an open connection: send `FRAME_START`, await
 /// `FRAME_READY` (resume ranges), then run the sender role until the server
 /// commits (`FRAME_COMPLETE`).
@@ -128,6 +155,16 @@ async fn upload_once(
     let mut queue: VecDeque<u32> = verified.missing().into_iter().collect();
     let window = config.upload_window.max(1);
 
+    // Progress is keyed to bytes that have ACTUALLY left the socket, not
+    // bytes merely handed to `send()` (which only queues into the WebSocket
+    // send buffer — on a slow link a whole wave is enqueued instantly and
+    // then drains gradually, so counting at dispatch time would jump a big
+    // chunk and then freeze). `baseline` is this connection's transmitted
+    // count right as this file's transfer starts; the socket may already
+    // have carried an earlier file on this pooled connection.
+    let baseline = conn.transmitted_bytes();
+    let mut last_synced = 0u64;
+
     loop {
         control.wait_ready().await?;
         control.check()?;
@@ -157,47 +194,71 @@ async fn upload_once(
             };
             let crc = crc32(&payload);
             conn.send(&block_frame(idx, crc, raw_len, &payload))?;
-            control.add_progress(len);
-            control.report_progress_if(callbacks)?;
             sent += 1;
         }
 
         // 2. Wave boundary: the receiver reconciles.
         conn.send(&wave_done_frame())?;
 
-        // 3. Read events until the server asks for more (REQ) or finished
-        //    (COMPLETE). NAKs re-queue immediately (实时核验 → 重传队列).
+        // 3. Poll for the server's response while folding ACTUAL wire
+        //    progress into the bar every tick (see [`sync_upload_progress`]).
+        //    The poll also gives the JS event loop time to drain the socket
+        //    and queue incoming frames; a stall guard replaces the old
+        //    blocking `next()` timeout. NAKs re-queue immediately
+        //    (实时核验 → 重传队列).
+        let mut last_activity = js_sys::Date::now();
         loop {
-            let frame = conn.next().await?;
-            match frame_type(&frame) {
-                Some(FRAME_NAK) => {
-                    if let Some(idx) = parse_nak(&frame) {
-                        queue.push_back(idx);
-                    }
-                    // Keep reading: the server may NAK several blocks.
-                }
-                Some(FRAME_REQ) => {
-                    if let Some(indices) = parse_req(&frame) {
-                        queue.extend(indices);
-                    }
-                    break; // next wave
-                }
-                Some(FRAME_COMPLETE) => {
-                    let msg: CompleteMessage = parse_control(&frame, FRAME_COMPLETE)
-                        .ok_or_else(|| LibfwError::Protocol("bad COMPLETE frame".into()))?;
-                    if msg.ok {
-                        return Ok(file.size.saturating_sub(initial_covered));
-                    }
-                    return Err(LibfwError::Protocol(
-                        msg.error.unwrap_or_else(|| "upload failed".into()),
-                    ));
-                }
-                Some(FRAME_ERROR) => {
-                    return Err(parse_error(&frame)
-                        .unwrap_or_else(|| LibfwError::Protocol("upload error".into())));
-                }
-                _ => {}
+            control.check()?;
+            let wire_before = last_synced;
+            sync_upload_progress(conn, control, callbacks, baseline, &mut last_synced)?;
+            if last_synced > wire_before {
+                // The socket is still transmitting → keep the stall deadline
+                // rolling so a long, slow wave isn't mistaken for a hang.
+                last_activity = js_sys::Date::now();
             }
+            if let Some(frame) = conn.try_recv() {
+                last_activity = js_sys::Date::now();
+                match frame_type(&frame) {
+                    Some(FRAME_NAK) => {
+                        if let Some(idx) = parse_nak(&frame) {
+                            queue.push_back(idx);
+                        }
+                        // Keep polling: the server may NAK several blocks.
+                    }
+                    Some(FRAME_REQ) => {
+                        if let Some(indices) = parse_req(&frame) {
+                            queue.extend(indices);
+                        }
+                        break; // next wave
+                    }
+                    Some(FRAME_COMPLETE) => {
+                        let msg: CompleteMessage = parse_control(&frame, FRAME_COMPLETE)
+                            .ok_or_else(|| LibfwError::Protocol("bad COMPLETE frame".into()))?;
+                        if msg.ok {
+                            return Ok(file.size.saturating_sub(initial_covered));
+                        }
+                        return Err(LibfwError::Protocol(
+                            msg.error.unwrap_or_else(|| "upload failed".into()),
+                        ));
+                    }
+                    Some(FRAME_ERROR) => {
+                        return Err(parse_error(&frame)
+                            .unwrap_or_else(|| LibfwError::Protocol("upload error".into())));
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            // Stalled: no frames AND no wire progress for `timeout_ms`
+            // (`0` disables the timeout, matching `with_timeout`).
+            if config.timeout_ms > 0
+                && js_sys::Date::now() - last_activity > config.timeout_ms as f64
+            {
+                return Err(LibfwError::Network("ws read timed out".into()));
+            }
+            // Yield to the JS event loop so the socket drains and incoming
+            // messages queue up; 50 ms is a snappy, low-cost poll cadence.
+            sleep_ms(50).await;
         }
     }
 }
