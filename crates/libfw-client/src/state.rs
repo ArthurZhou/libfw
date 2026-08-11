@@ -210,17 +210,22 @@ impl TaskControl {
         }
     }
 
-    /// Emit an `on_progress` event to JS, throttled to whole-percent
-    /// boundaries of `total` so a long single-file transfer reports smooth
-    /// intermediate values instead of only 0% then 100%.
+    /// Emit an `on_progress` event to JS whenever the transferred byte count
+    /// changes (i.e. at block granularity), so uploads and downloads report
+    /// progress in real time instead of stalling on whole-percent buckets.
+    ///
+    /// Reporting per change keeps the bar moving continuously for large
+    /// files: a single block (e.g. 2 MiB) is often far less than 1% of a big
+    /// file, so bucketing to whole-percents made progress appear frozen in
+    /// coarse jumps. The event is cheap (one sync JS call), so firing once
+    /// per block is acceptable; callers that already report after each
+    /// file's completion remain correct.
     ///
     /// Uses the shared [`TaskControl`] as the single source of truth, so
-    /// concurrent per-file tasks all feed one coherent progress bar. The
-    /// final `done == total` boundary is always reported; callers that
-    /// already report after each file's completion remain correct.
+    /// concurrent per-file tasks all feed one coherent progress bar.
     ///
-    /// Returns `Ok(())` when nothing was emitted (still within the current
-    /// percent bucket) or when the (cheap sync) event was delivered.
+    /// Returns `Ok(())` when nothing was emitted (`done` unchanged) or when
+    /// the (cheap sync) event was delivered.
     pub fn report_progress_if(&self, callbacks: &Callbacks) -> Result<(), LibfwError> {
         let total = self.total_bytes.get();
         let done = self.done_bytes.get();
@@ -239,9 +244,7 @@ impl TaskControl {
         // never push the reported fraction past 100%.
         let reported = done.min(total);
         let last = self.last_reported.get().min(total);
-        let done_pct = reported.saturating_mul(100) / total;
-        let last_pct = last.saturating_mul(100) / total;
-        if done_pct != last_pct || reported >= total {
+        if reported != last {
             self.last_reported.set(reported);
             return callbacks.on_progress(reported, total);
         }
