@@ -187,10 +187,10 @@ const BUNDLE_SCRIPT_SRC =
 export class LibfwClient {
   /**
    * @param {object} [options]
-   * @param {string} [options.baseUrl=''] base URL the server is served from. The
-   *        engine derives the WebSocket endpoint from it (e.g. `http://h:8080`
-   *        → `ws://h:8080/ws`); same-origin when empty. All control commands
-   *        and data transfer travel over that WebSocket.
+   * @param {string} [options.baseUrl=''] base URL the server is served from
+   *        (same-origin when empty). The engine drives all control commands
+   *        and data transfer over plain HTTP (parallel `Range` downloads,
+   *        tus-style chunked uploads) — no WebSocket is used.
    * @param {number} [options.concurrency=4] max concurrently-transferring files
    * @param {number} [options.uploadWindow=8] in-flight chunk window for a
    *        single file's upload; independent of `concurrency`, keeps a
@@ -213,8 +213,6 @@ export class LibfwClient {
    * @param {number} [options.baseRetryDelayMs=500] initial backoff (ms)
    * @param {number} [options.maxRetryDelayMs=30000] backoff ceiling (ms)
    * @param {number} [options.timeoutMs=60000] per-read timeout (ms)
-   * @param {string} [options.wsUrl] explicit WebSocket endpoint (e.g.
-   *        `wss://host/ws`); when omitted it is derived from `baseUrl`
    * @param {string} [options.wasmUrl] explicit URL of `libfw_client_bg.wasm`;
    *        when omitted it is resolved automatically for both ESM and
    *        classic-`<script>`/UMD consumers (see {@link LibfwClient#_wasmUrl})
@@ -245,7 +243,6 @@ export class LibfwClient {
       baseRetryDelayMs: 500,
       maxRetryDelayMs: 30000,
       timeoutMs: 60000,
-      wsUrl: null,
       wasmUrl: null,
       downloadMode: 'auto',
       maxFallbackBytes: 512 * 1024 * 1024,
@@ -305,7 +302,6 @@ export class LibfwClient {
       baseRetryDelayMs: this._options.baseRetryDelayMs,
       maxRetryDelayMs: this._options.maxRetryDelayMs,
       timeoutMs: this._options.timeoutMs,
-      wsUrl: this._options.wsUrl,
     });
     engine.set_callbacks(this._makeCallbacks());
     this._engine = engine;

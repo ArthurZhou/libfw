@@ -32,11 +32,11 @@
 mod config;
 mod download;
 mod error;
+mod http;
 mod js;
 mod plan;
 mod state;
 mod upload;
-mod ws;
 
 pub use config::{backoff_ms, ClientConfig};
 pub use error::LibfwError;

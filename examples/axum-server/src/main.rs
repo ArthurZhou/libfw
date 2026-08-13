@@ -177,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("  dev token    : `dev-token`");
     tracing::info!("  protocol     : {}", libfw_core::protocol_header_value());
     tracing::info!("  health       : http://{addr}/health");
-    tracing::info!("  websocket    : ws://{addr}/ws   (SDK/engine transport)");
+    tracing::info!("  transport    : HTTP (SDK/engine; parallel Range + chunked uploads)");
     tracing::info!("  download     : GET/HEAD http://{addr}/file/{{*path}}");
     tracing::info!("  upload       : POST http://{addr}/file/{{*path}}");
     tracing::info!("  listing      : GET http://{addr}/dir/{{*path}}");
