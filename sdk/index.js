@@ -371,7 +371,7 @@ export class LibfwClient {
       onWriteChunk: (path, offset, data) => this._onWriteChunk(path, offset, data),
       onFileCompleted: (path) => this._onFileCompleted(path),
       onProgress: (done, total) => this._emit({ type: 'progress', done, total }),
-      loadState: (direction, path) => Idb.loadState(`${direction}:${path}`),
+      loadState: (direction, path) => this._loadResumeState(direction, path),
       saveState: (direction, path, state) => {
         // The in-memory browser-download fallback never commits bytes to
         // disk, so a persisted download offset would be a phantom that
@@ -787,6 +787,66 @@ export class LibfwClient {
     } catch {
       /* nothing to clean up */
     }
+  }
+
+  /**
+   * Resolve a file handle for a virtual path WITHOUT creating it, so a
+   * missing file returns `null` instead of throwing.
+   * @param {string} path
+   * @returns {Promise<FileSystemFileHandle|null>}
+   * @private
+   */
+  async _resolveFileHandle(path) {
+    if (!this._dirHandle) return null;
+    try {
+      const segments = splitPath(path);
+      if (segments.length === 0) return null;
+      let dir = this._dirHandle;
+      for (let i = 0; i < segments.length - 1; i += 1) {
+        dir = await dir.getDirectoryHandle(segments[i], { create: false });
+      }
+      return await dir.getFileHandle(segments[segments.length - 1], { create: false });
+    } catch {
+      return null; // missing dir or file, or no FS API
+    }
+  }
+
+  /**
+   * Load a persisted resume-state `{etag, offset}`, clamping the download
+   * `offset` down to the ACTUAL number of bytes committed on disk.
+   *
+   * `createWritable()` only commits to the real file on `close()`, so a
+   * download interrupted by a hard page kill leaves the persisted offset
+   * AHEAD of the bytes actually on disk. Resuming from that stale offset
+   * with `keepExistingData` would write past a prefix that isn't there,
+   * leaving a silent gap in the file. Clamping to the real on-disk length
+   * makes the resume pick up exactly where the file really ends.
+   * @param {string} direction
+   * @param {string} path
+   * @returns {Promise<object|null>}
+   * @private
+   */
+  async _loadResumeState(direction, path) {
+    const state = await Idb.loadState(`${direction}:${path}`);
+    if (!state) return null;
+    // Only downloads that will append onto an on-disk file need the clamp;
+    // uploads drive resume from the server's own received ranges.
+    if (direction !== 'download') return state;
+    const offset = Number(state.offset) || 0;
+    if (offset <= 0) return state;
+    const handle = await this._resolveFileHandle(path);
+    if (!handle) return state; // can't know the on-disk length → trust state
+    let diskLen = 0;
+    try {
+      diskLen = (await handle.getFile()).size;
+    } catch {
+      return state;
+    }
+    // Clamp to the bytes actually on disk. If nothing was committed (hard
+    // kill before any close), resume from 0 so the whole file is fetched
+    // again rather than leaving a gap.
+    const clamped = Math.min(offset, diskLen);
+    return { ...state, offset: clamped, size: clamped };
   }
 
   /**

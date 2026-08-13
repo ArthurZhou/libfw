@@ -524,6 +524,104 @@ async fn ws_upload_resume_reuses_partial_session() {
     assert_eq!(got, data);
 }
 
+/// Download the tail of a file starting at `offset` (as the browser client
+/// does after resuming an interrupted download that already has `offset`
+/// bytes committed on disk), returning only the bytes from `offset` onward.
+async fn download_file_resumed(ws: &mut Ws, path: &str, block_size: u64, offset: u64) -> Vec<u8> {
+    let start = StartRequest {
+        kind: TransferKind::Download,
+        path: path.to_string(),
+        size: 0,
+        mtime: 0,
+        etag: String::new(),
+        compress: false,
+        mode: String::new(),
+        offset,
+        block_size,
+        window: 0,
+    };
+    send(ws, control_frame(FRAME_START, &start)).await;
+    let ready = recv(ws).await;
+    let ready: ReadyReply = parse_control(&ready, FRAME_READY).unwrap();
+    // The server must echo the resume offset and index blocks from it.
+    assert_eq!(ready.offset, offset, "server must honor the resume offset");
+
+    let remaining = ready.size.saturating_sub(offset);
+    let total_blocks = block_count(remaining, block_size);
+    assert_eq!(ready.total_blocks, total_blocks, "tail block count mismatch");
+
+    let mut blocks: Vec<Option<Vec<u8>>> = vec![None; total_blocks as usize];
+    loop {
+        let f = recv(ws).await;
+        match frame_type(&f) {
+            Some(FRAME_BLOCK) => {
+                let b = parse_block(&f).unwrap();
+                assert_eq!(crc32(&b.data), b.crc);
+                assert!(b.index < total_blocks, "block index out of range");
+                if blocks[b.index as usize].is_none() {
+                    blocks[b.index as usize] = Some(b.data);
+                }
+            }
+            Some(FRAME_WAVE_DONE) => {
+                let missing: Vec<u32> = (0..total_blocks as u32)
+                    .filter(|i| blocks[*i as usize].is_none())
+                    .collect();
+                if missing.is_empty() {
+                    send(ws, control_frame(FRAME_COMPLETE, &CompleteMessage::ok(ready.size)))
+                        .await;
+                    break;
+                }
+                send(ws, req_frame(&missing)).await;
+            }
+            Some(FRAME_COMPLETE) => {
+                let msg: CompleteMessage = parse_control(&f, FRAME_COMPLETE).unwrap();
+                assert!(msg.ok, "download failed: {:?}", msg.error);
+                break;
+            }
+            other => {
+                if other == Some(FRAME_ERROR) {
+                    panic!(
+                        "download got ERROR frame: {}",
+                        String::from_utf8_lossy(frame_payload(&f))
+                    );
+                }
+                panic!("unexpected frame type {other:?} during resumed download")
+            }
+        }
+    }
+    let mut tail = Vec::new();
+    for b in blocks {
+        tail.extend_from_slice(&b.expect("block present after completion"));
+    }
+    assert_eq!(tail.len() as u64, remaining, "resumed tail length");
+    tail
+}
+
+/// A download resumed from a non-zero offset must slice `[offset, size)` and
+/// block-index from that offset, so a browser client appending the tail onto
+/// its already-on-disk prefix reproduces the file exactly (no overlap/gap).
+#[tokio::test]
+async fn ws_download_resumes_from_nonzero_offset() {
+    let state = state();
+    let mut ws = connect_ws(state.clone()).await;
+    hello(&mut ws, "tok").await;
+
+    let data: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(7) % 256) as u8).collect();
+    let block_size = 1024u64;
+    upload_file(&mut ws, "dl-resume.bin", &data, block_size, 0, false).await;
+
+    // Resume mid-file (not block-aligned on purpose) — as if an interrupted
+    // download had already committed the first 10_000 bytes on disk.
+    let offset = 10_000u64;
+    let tail = download_file_resumed(&mut ws, "dl-resume.bin", block_size, offset).await;
+    assert_eq!(tail, data[offset as usize..]);
+
+    // The full file is exactly prefix + tail (no gap, no overlap).
+    let mut reassembled = data[..offset as usize].to_vec();
+    reassembled.extend_from_slice(&tail);
+    assert_eq!(reassembled, data);
+}
+
 #[tokio::test]
 async fn ws_list_and_meta_control() {
     let mut ws = connect_ws(state()).await;
