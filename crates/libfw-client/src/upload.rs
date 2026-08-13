@@ -63,25 +63,28 @@ fn covered_bytes(received: &[[u64; 2]]) -> u64 {
     total
 }
 
-/// Pop every block whose full wire span has drained and return the FILE bytes
-/// to add to progress.
+/// File bytes newly CONFIRMED by the server between two wave reconciliations.
 ///
-/// `pending` holds `(cumulative_wire_offset_after_block, file_len)` for each
-/// block sent but not yet counted; `wire` is the connection's current
-/// transmitted count relative to the transfer start. Blocks drain in send
-/// order (WebSocket is FIFO), so popping the front while its offset is met is
-/// correct even when several drain between polls.
-fn drained_file_bytes(pending: &mut VecDeque<(u64, u64)>, wire: u64) -> u64 {
-    let mut added = 0u64;
-    while let Some(&(wire_end, file_len)) = pending.front() {
-        if wire >= wire_end {
-            pending.pop_front();
-            added = added.saturating_add(file_len);
-        } else {
-            break;
+/// Each `FRAME_REQ` from the server lists every block it has **not** yet
+/// CRC-verified. The blocks that were in the *previous* missing set but are
+/// no longer listed are exactly the ones the server just verified, so folding
+/// only those FILE bytes keeps upload progress tied to what the server has
+/// actually received and written — not to what merely left the browser's
+/// socket (`bufferedAmount` drain races the bar to ~100% on slow links).
+fn confirmed_delta(
+    prev_missing: &BlockSet,
+    new_missing: &BlockSet,
+    block_size: u64,
+    file_size: u64,
+) -> u64 {
+    let mut total = 0u64;
+    for i in 0..prev_missing.total() {
+        if prev_missing.contains(i) && !new_missing.contains(i) {
+            let (s, e) = block_bounds(i, block_size, file_size);
+            total = total.saturating_add(e.saturating_sub(s));
         }
     }
-    added
+    total
 }
 
 /// Roll the upload stall deadline forward when the connection made wire
@@ -112,35 +115,6 @@ fn roll_stall_on_wire(
     }
 }
 
-/// Fold per-block FILE progress as each block's compressed bytes actually
-/// leave the socket, emitting an `on_progress` event when a block completes.
-///
-/// `send()` only queues into the WebSocket send buffer, so counting at
-/// dispatch time would jump a whole wave at once and then freeze while a slow
-/// link drains. Polling [`WsConnection::transmitted_bytes`] tells us when a
-/// block's bytes are really on the wire; because compression makes wire bytes
-/// ≠ file bytes, we translate via [`drained_file_bytes`] and only add the
-/// block's FILE length. `baseline` is the connection's transmitted count when
-/// this file's transfer started (the socket may already have carried an
-/// earlier file on this pooled connection); `last_synced` is the FILE bytes
-/// already folded into progress.
-fn sync_upload_progress(
-    conn: &WsConnection,
-    control: &TaskControl,
-    callbacks: &Callbacks,
-    baseline: u64,
-    pending: &mut VecDeque<(u64, u64)>,
-    last_synced: &mut u64,
-) -> Result<(), LibfwError> {
-    let wire = conn.transmitted_bytes().saturating_sub(baseline);
-    let added = drained_file_bytes(pending, wire);
-    if added > 0 {
-        control.add_progress(added);
-        *last_synced = last_synced.saturating_add(added);
-        control.report_progress_if(callbacks)?;
-    }
-    Ok(())
-}
 
 /// One upload attempt over an open connection: send `FRAME_START`, await
 /// `FRAME_READY` (resume ranges), then run the sender role until the server
@@ -208,19 +182,23 @@ async fn upload_once(
     let mut queue: VecDeque<u32> = verified.missing().into_iter().collect();
     let window = config.upload_window.max(1);
 
-    // Progress is keyed to FILE bytes whose compressed frames have ACTUALLY
-    // left the socket, not bytes merely handed to `send()` (which only queues
-    // into the WebSocket send buffer — on a slow link a whole wave is
-    // enqueued instantly and then drains gradually). `baseline` is this
-    // connection's transmitted count right as this file's transfer starts;
-    // the socket may already have carried an earlier file on this pooled
-    // connection. `pending` maps each block's cumulative wire offset to its
-    // FILE length, so we can count a block's file bytes exactly when its
-    // compressed bytes drain (wire bytes ≠ file bytes when compression is on).
-    let baseline = conn.transmitted_bytes();
-    let mut pending: VecDeque<(u64, u64)> = VecDeque::new();
-    let mut wire_offset = 0u64;
-    let mut last_synced = 0u64;
+    // Upload progress is keyed to FILE bytes the server has CONFIRMED it
+    // CRC-verified and written, not to bytes that merely left the browser's
+    // socket. `send()` only queues into the WebSocket send buffer, and
+    // counting by `bufferedAmount` drain races the bar to ~100% while a slow
+    // link is still pushing bytes to the server. The server confirms a block
+    // only by no longer listing it in its `FRAME_REQ` (or by `FRAME_COMPLETE`),
+    // so we track the previously-missing set and fold in exactly the bytes
+    // newly verified between wave reconciliations (see [`confirmed_delta`]).
+    // `confirmed_bytes` is this file's total server-confirmed byte count
+    // (resume ranges + deltas), used to force an exact 100% at `FRAME_COMPLETE`.
+    let mut prev_missing = BlockSet::new(total_blocks);
+    for i in 0..total_blocks {
+        if !verified.contains(i) {
+            prev_missing.insert(i);
+        }
+    }
+    let mut confirmed_bytes = initial_covered;
 
     loop {
         control.wait_ready().await?;
@@ -251,8 +229,6 @@ async fn upload_once(
             };
             let crc = crc32(&payload);
             let frame = block_frame(idx, crc, raw_len, &payload);
-            wire_offset = wire_offset.saturating_add(frame.len() as u64);
-            pending.push_back((wire_offset, len));
             conn.send(&frame)?;
             sent += 1;
         }
@@ -260,12 +236,11 @@ async fn upload_once(
         // 2. Wave boundary: the receiver reconciles.
         conn.send(&wave_done_frame())?;
 
-        // 3. Poll for the server's response while folding ACTUAL wire
-        //    progress into the bar every tick (see [`sync_upload_progress`]).
-        //    The poll also gives the JS event loop time to drain the socket
-        //    and queue incoming frames; a stall guard replaces the old
-        //    blocking `next()` timeout. NAKs re-queue immediately
-        //    (实时核验 → 重传队列).
+        // 3. Poll for the server's response. The poll gives the JS event loop
+        //    time to drain the socket and queue incoming frames; a stall guard
+        //    replaces the old blocking `next()` timeout. Progress advances
+        //    only when the server CONFIRMS bytes (see the FRAME_REQ branch
+        //    below). NAKs re-queue immediately (实时核验 → 重传队列).
         //
         //    The stall deadline MUST roll with wire progress measured across
         //    polls (`last_wire`), not within a single poll: two reads of
@@ -286,9 +261,6 @@ async fn upload_once(
                 wire_now,
                 js_sys::Date::now(),
             );
-            sync_upload_progress(
-                conn, control, callbacks, baseline, &mut pending, &mut last_synced,
-            )?;
             if let Some(frame) = conn.try_recv() {
                 last_activity = js_sys::Date::now();
                 match frame_type(&frame) {
@@ -300,7 +272,30 @@ async fn upload_once(
                     }
                     Some(FRAME_REQ) => {
                         if let Some(indices) = parse_req(&frame) {
-                            queue.extend(indices);
+                            queue.extend(indices.iter().copied());
+                            // The REQ lists every block the server still has
+                            // not verified; the newly-confirmed set is the
+                            // part of the previous missing set it no longer
+                            // lists. Fold exactly those FILE bytes into the
+                            // bar (server-confirmed progress).
+                            let mut new_missing = BlockSet::new(total_blocks);
+                            for i in &indices {
+                                if *i < total_blocks {
+                                    new_missing.insert(*i);
+                                }
+                            }
+                            let delta = confirmed_delta(
+                                &prev_missing,
+                                &new_missing,
+                                block_size,
+                                file.size,
+                            );
+                            prev_missing = new_missing;
+                            if delta > 0 {
+                                confirmed_bytes = confirmed_bytes.saturating_add(delta);
+                                control.add_progress(delta);
+                                control.report_progress_if(callbacks)?;
+                            }
                         }
                         break; // next wave
                     }
@@ -308,22 +303,10 @@ async fn upload_once(
                         let msg: CompleteMessage = parse_control(&frame, FRAME_COMPLETE)
                             .ok_or_else(|| LibfwError::Protocol("bad COMPLETE frame".into()))?;
                         if msg.ok {
-                            // The server confirms it holds every byte. Fold
-                            // anything that drained since the last poll, then
-                            // force the bar to 100% so a fast final burst is
-                            // never left unreported.
-                            sync_upload_progress(
-                                conn,
-                                control,
-                                callbacks,
-                                baseline,
-                                &mut pending,
-                                &mut last_synced,
-                            )?;
-                            let remaining = file
-                                .size
-                                .saturating_sub(initial_covered)
-                                .saturating_sub(last_synced);
+                            // The server confirms it holds every byte: fold
+                            // any tail (blocks verified since the last REQ)
+                            // and force an exact 100%.
+                            let remaining = file.size.saturating_sub(confirmed_bytes);
                             if remaining > 0 {
                                 control.add_progress(remaining);
                             }
@@ -499,48 +482,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drained_blocks_map_wire_to_file_bytes() {
-        let mut pending = VecDeque::new();
-        // Block A: 2 MiB file, its compressed wire span ends at offset 1500.
-        pending.push_back((1500, 2 * 1024 * 1024));
-        // Block B: 1 MiB file, its compressed wire span ends at offset 4000.
-        pending.push_back((4000, 1024 * 1024));
+    fn confirmed_delta_counts_only_newly_verified_blocks() {
+        // size 10, block 4 → blocks 0 (0..4), 1 (4..8), 2 (8..10).
+        let bs = 4u64;
+        let file_size = 10u64;
 
-        // Nothing on the wire yet.
-        assert_eq!(drained_file_bytes(&mut pending, 0), 0);
-        assert_eq!(pending.len(), 2);
-
-        // Only A's wire span has drained → exactly A's FILE bytes count.
-        assert_eq!(drained_file_bytes(&mut pending, 1500), 2 * 1024 * 1024);
-        assert_eq!(pending.len(), 1);
-
-        // B's span drains too.
-        assert_eq!(drained_file_bytes(&mut pending, 4000), 1024 * 1024);
-        assert!(pending.is_empty());
-
-        // Wire growing beyond nothing left can't double-count.
-        assert_eq!(drained_file_bytes(&mut pending, 999_999), 0);
+        let mut prev = BlockSet::new(3); // nothing confirmed yet → all missing
+        for i in 0..3 {
+            prev.insert(i);
+        }
+        // Server verifies block 1 only.
+        let mut now = BlockSet::new(3);
+        now.insert(0);
+        now.insert(2);
+        assert_eq!(confirmed_delta(&prev, &now, bs, file_size), 4); // block 1
+        assert_eq!(confirmed_delta(&now, &prev, bs, file_size), 0); // reversed
     }
 
     #[test]
-    fn drained_blocks_batch_after_poll() {
-        let mut pending = VecDeque::new();
-        pending.push_back((100, 50));
-        pending.push_back((200, 60));
-        // Several blocks drained between polls → all count at once.
-        assert_eq!(drained_file_bytes(&mut pending, 250), 110);
-        assert!(pending.is_empty());
+    fn confirmed_delta_is_monotonic_and_idempotent() {
+        let bs = 4u64;
+        let file_size = 10u64;
+        let mut prev = BlockSet::new(3);
+        for i in 0..3 {
+            prev.insert(i);
+        }
+        // Wave 1: server verifies block 0 (4 bytes).
+        let mut w1 = BlockSet::new(3);
+        w1.insert(1);
+        w1.insert(2);
+        assert_eq!(confirmed_delta(&prev, &w1, bs, file_size), 4);
+        // Wave 2: server verifies block 1 as well → only block 1 is new.
+        let mut w2 = BlockSet::new(3);
+        w2.insert(2);
+        assert_eq!(confirmed_delta(&w1, &w2, bs, file_size), 4);
+        // No further confirmation → no further progress.
+        let mut w3 = BlockSet::new(3);
+        w3.insert(2);
+        assert_eq!(confirmed_delta(&w2, &w3, bs, file_size), 0);
     }
 
     #[test]
-    fn drained_blocks_are_fifo() {
-        let mut pending = VecDeque::new();
-        pending.push_back((100, 10));
-        pending.push_back((200, 20));
-        // Only the first block's offset reached → only its bytes count; the
-        // second stays queued even though its offset is just past.
-        assert_eq!(drained_file_bytes(&mut pending, 199), 10);
-        assert_eq!(pending.len(), 1);
+    fn confirmed_delta_counts_partial_last_block() {
+        // size 10, block 4 → block 2 covers only 8..10 (2 bytes).
+        let bs = 4u64;
+        let file_size = 10u64;
+        let mut prev = BlockSet::new(3);
+        for i in 0..3 {
+            prev.insert(i);
+        }
+        // Server verifies only the trailing partial block.
+        let mut now = BlockSet::new(3);
+        now.insert(0);
+        now.insert(1);
+        assert_eq!(confirmed_delta(&prev, &now, bs, file_size), 2);
     }
 
     #[test]
