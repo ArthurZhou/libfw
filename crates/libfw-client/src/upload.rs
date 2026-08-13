@@ -84,6 +84,34 @@ fn drained_file_bytes(pending: &mut VecDeque<(u64, u64)>, wire: u64) -> u64 {
     added
 }
 
+/// Roll the upload stall deadline forward when the connection made wire
+/// progress since the last poll, returning whether it rolled.
+///
+/// `last_wire` is the transmitted-byte count observed on the **previous**
+/// poll; `wire` is the current count; `last_activity` is the timestamp (ms
+/// since epoch, e.g. `js_sys::Date::now()`) of the last observed activity.
+/// The deadline rolls only when `wire` increased since that previous poll.
+///
+/// This must compare across polls, never two reads inside one poll: the
+/// socket cannot drain between synchronous reads, so comparing those would
+/// always be equal and the deadline would never roll — a slow link whose
+/// wave takes longer than `timeout_ms` to drain would then be misread as a
+/// stall and aborted with "ws read timed out" even though bytes are flowing.
+fn roll_stall_on_wire(
+    last_wire: &mut u64,
+    last_activity: &mut f64,
+    wire: u64,
+    now: f64,
+) -> bool {
+    if wire > *last_wire {
+        *last_wire = wire;
+        *last_activity = now;
+        true
+    } else {
+        false
+    }
+}
+
 /// Fold per-block FILE progress as each block's compressed bytes actually
 /// leave the socket, emitting an `on_progress` event when a block completes.
 ///
@@ -237,18 +265,29 @@ async fn upload_once(
         //    and queue incoming frames; a stall guard replaces the old
         //    blocking `next()` timeout. NAKs re-queue immediately
         //    (实时核验 → 重传队列).
+        //
+        //    The stall deadline MUST roll with wire progress measured across
+        //    polls (`last_wire`), not within a single poll: two reads of
+        //    `transmitted_bytes()` inside one iteration always agree (nothing
+        //    drains between synchronous reads), so comparing them could never
+        //    refresh the deadline. With the deadline keyed to the PREVIOUS
+        //    poll's value, a slow link whose wave takes longer than
+        //    `timeout_ms` to drain keeps the timer rolling instead of being
+        //    misread as a stall and aborted with "ws read timed out".
         let mut last_activity = js_sys::Date::now();
+        let mut last_wire = conn.transmitted_bytes();
         loop {
             control.check()?;
-            let wire_before = conn.transmitted_bytes();
+            let wire_now = conn.transmitted_bytes();
+            roll_stall_on_wire(
+                &mut last_wire,
+                &mut last_activity,
+                wire_now,
+                js_sys::Date::now(),
+            );
             sync_upload_progress(
                 conn, control, callbacks, baseline, &mut pending, &mut last_synced,
             )?;
-            if conn.transmitted_bytes() > wire_before {
-                // The socket is still transmitting → keep the stall deadline
-                // rolling so a long, slow wave isn't mistaken for a hang.
-                last_activity = js_sys::Date::now();
-            }
             if let Some(frame) = conn.try_recv() {
                 last_activity = js_sys::Date::now();
                 match frame_type(&frame) {
@@ -501,5 +540,34 @@ mod tests {
         // second stays queued even though its offset is just past.
         assert_eq!(drained_file_bytes(&mut pending, 199), 10);
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn stall_deadline_rolls_on_wire_progress_across_polls() {
+        // Regression: the stall deadline must roll forward whenever the
+        // socket keeps draining a slow wave, not only when a frame arrives.
+        // Comparing two reads within a single poll would always be equal and
+        // could never roll the deadline, falsely timing out a slow-but-
+        // progressing upload ("ws read timed out" mid-transfer).
+        let t0 = 1_000.0;
+        let mut last_activity = t0;
+        let mut last_wire = 0;
+
+        // No wire progress yet → deadline stays put.
+        assert!(!roll_stall_on_wire(&mut last_wire, &mut last_activity, 0, t0 + 10.0));
+        assert_eq!(last_activity, t0);
+
+        // Wire advances slowly (a long, slow wave draining) → the deadline
+        // rolls forward on every poll, so the transfer is never misread as
+        // a stall no matter how slow the drain is.
+        assert!(roll_stall_on_wire(&mut last_wire, &mut last_activity, 4_000, t0 + 1_000.0));
+        assert_eq!(last_activity, t0 + 1_000.0);
+        assert!(roll_stall_on_wire(&mut last_wire, &mut last_activity, 9_000, t0 + 2_000.0));
+        assert_eq!(last_activity, t0 + 2_000.0);
+
+        // Wire stops advancing (wave fully drained, awaiting the server's
+        // response) → no roll; a long silence here is a genuine stall.
+        assert!(!roll_stall_on_wire(&mut last_wire, &mut last_activity, 9_000, t0 + 90_000.0));
+        assert_eq!(last_activity, t0 + 2_000.0);
     }
 }
