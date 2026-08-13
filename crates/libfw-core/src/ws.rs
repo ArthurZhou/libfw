@@ -300,12 +300,17 @@ pub fn parse_req(frame: &[u8]) -> Option<Vec<u32>> {
         return None;
     }
     let count = u32::from_be_bytes(frame[1..5].try_into().ok()?) as usize;
+    // A REQ frame carries exactly `count` 4-byte indices after the 5-byte
+    // header. Validate the count against the ACTUAL payload length BEFORE
+    // allocating: a malformed frame claiming billions of indices must not be
+    // able to force a ~`count * 4` GiB pre-allocation (memory-exhaustion DoS,
+    // reachable from both the server and the WASM client).
+    if count > (frame.len() - 5) / 4 {
+        return None;
+    }
     let mut out = Vec::with_capacity(count);
     let mut off = 5usize;
     for _ in 0..count {
-        if off + 4 > frame.len() {
-            return None;
-        }
         out.push(u32::from_be_bytes(frame[off..off + 4].try_into().ok()?));
         off += 4;
     }
@@ -344,14 +349,24 @@ pub fn block_count(size: u64, block_size: u64) -> u32 {
     if size == 0 {
         1
     } else {
-        (size.div_ceil(bs)) as u32
+        // Saturate instead of truncating: `div_ceil == 2³²` (e.g. 4 GiB at
+        // 1-byte blocks) would otherwise wrap to 0 and silently produce an
+        // empty, forever-pending transfer.
+        size.div_ceil(bs).min(u32::MAX as u64) as u32
     }
 }
 
 /// The absolute `[start, end)` byte range of block `index`.
 pub fn block_bounds(index: u32, block_size: u64, size: u64) -> (u64, u64) {
-    let start = index as u64 * block_size;
-    let end = (start + block_size).min(size);
+    let bs = block_size.max(1);
+    let start = index as u64 * bs;
+    // Out-of-range index: return an empty range rather than letting
+    // `end - start` underflow (a caller doing `vec![0; end - start]` would
+    // then try to allocate ~u64::MAX bytes and crash).
+    if start >= size {
+        return (size, size);
+    }
+    let end = start.saturating_add(bs).min(size);
     (start, end)
 }
 
@@ -468,6 +483,17 @@ mod tests {
     }
 
     #[test]
+    fn block_math_is_saturating_for_adversarial_inputs() {
+        // Out-of-range index → empty range, never `end < start` (underflow).
+        assert_eq!(block_bounds(u32::MAX, 1, 10), (10, 10));
+        assert_eq!(block_bounds(5, 4, 10), (10, 10));
+        // A block count that would exceed u32 saturates instead of wrapping
+        // to 0 (which would silently make the transfer never complete).
+        assert_eq!(block_count(u64::MAX, 1), u32::MAX);
+        assert_eq!(block_count(4u64 * 1024 * 1024 * 1024, 1), u32::MAX);
+    }
+
+    #[test]
     fn crc_roundtrip_detects_corruption() {
         let data = b"hello libfw block";
         let crc = crc32(data);
@@ -495,6 +521,30 @@ mod tests {
         assert_eq!(parse_req(&req), Some(vec![0, 3, 7, 9]));
         let nak = nak_frame(5);
         assert_eq!(parse_nak(&nak), Some(5));
+    }
+
+    #[test]
+    fn parse_req_rejects_oversized_count_before_allocating() {
+        // A frame that CLAIMS more indices than its payload actually holds
+        // must be rejected up front (not after `Vec::with_capacity(count)`),
+        // so a crafted 9-byte frame cannot force a huge allocation.
+        let mut frame = vec![FRAME_REQ];
+        frame.extend_from_slice(&10_000_000u32.to_be_bytes());
+        for i in 0..3u32 {
+            frame.extend_from_slice(&i.to_be_bytes());
+        }
+        assert_eq!(parse_req(&frame), None);
+
+        // A well-formed frame still parses exactly.
+        let mut good = vec![FRAME_REQ];
+        good.extend_from_slice(&2u32.to_be_bytes());
+        good.extend_from_slice(&7u32.to_be_bytes());
+        good.extend_from_slice(&9u32.to_be_bytes());
+        assert_eq!(parse_req(&good), Some(vec![7, 9]));
+
+        // Truncated/empty frames are rejected.
+        assert_eq!(parse_req(&[FRAME_REQ]), None);
+        assert_eq!(parse_req(&[FRAME_REQ, 0, 0, 0, 1]), None);
     }
 
     #[test]

@@ -521,7 +521,7 @@ export class LibfwClient {
         for (const p of order) {
           entries.push({
             name: this._safeEntryName(p),
-            data: this._concatBuffers(buffers.get(p) || []),
+            data: this._concatBuffers(buffers.get(p)?.chunks || []),
           });
         }
         // Include files that were announced but produced no bytes (empty).
@@ -532,7 +532,7 @@ export class LibfwClient {
         }
         this._triggerBrowserDownload(createZip(entries), this._archiveName(path));
       } else {
-        const data = this._concatBuffers(buffers.get(path) || []);
+        const data = this._concatBuffers(buffers.get(path)?.chunks || []);
         this._triggerBrowserDownload(new Blob([data], { type: 'application/octet-stream' }), this._downloadName(path));
       }
       return total;
@@ -663,16 +663,39 @@ export class LibfwClient {
     if (this._fallback) {
       // Browser-download fallback: collect chunks in memory instead of
       // streaming to disk. Chunks arrive in order, so a plain append works.
-      let bufs = this._fallback.buffers.get(path);
-      if (!bufs) {
-        bufs = [];
-        this._fallback.buffers.set(path, bufs);
+      let buf = this._fallback.buffers.get(path);
+      if (!buf) {
+        buf = { chunks: [], len: 0 };
+        this._fallback.buffers.set(path, buf);
         this._fallback.order.push(path);
       }
-      bufs.push(data);
+      // A chunk whose absolute offset is at or before the last one delivered
+      // means the engine restarted this file (an internal retry re-delivers
+      // the same byte range) — drop the partial buffer so the prefix is not
+      // duplicated in the produced blob/zip.
+      if (offset <= buf.len) {
+        buf.chunks = [];
+        buf.len = 0;
+      }
+      buf.chunks.push(data);
+      buf.len += data.length;
       return;
     }
     let entry = this._writables.get(path);
+    if (entry && offset <= entry.lastOffset) {
+      // The engine restarted this file (a network/protocol error triggered
+      // an internal retry that re-delivers the same byte range). Abort the
+      // still-open writable — discarding its uncommitted swap file — and
+      // reopen fresh, otherwise the re-delivered prefix would be appended a
+      // second time and the committed file silently corrupted.
+      this._writables.delete(path);
+      try {
+        await entry.writable.abort();
+      } catch {
+        /* best-effort discard */
+      }
+      entry = undefined;
+    }
     if (!entry) {
       const { dir, name, handle } = await this._ensureFileHandle(path);
       this._fileHandles.set(path, handle);
@@ -687,9 +710,10 @@ export class LibfwClient {
       const writable = await handle.createWritable(
         isResume ? { keepExistingData: true } : undefined
       );
-      entry = { writable, dir, name };
+      entry = { writable, dir, name, lastOffset: offset };
       this._writables.set(path, entry);
     }
+    entry.lastOffset = offset;
     await entry.writable.write(data);
   }
 

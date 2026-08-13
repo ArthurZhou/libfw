@@ -261,11 +261,22 @@ impl WsConnection {
                 }
                 st.pending_resolve = Some(resolve);
             }
-            let value = JsFuture::from(with_timeout(promise, self.timeout_ms))
-                .await
-                .map_err(|e| {
-                    LibfwError::Network(format!("ws read timed out: {}", js_value_string(&e)))
-                })?;
+            let value = match JsFuture::from(with_timeout(promise, self.timeout_ms)).await {
+                Ok(v) => v,
+                Err(e) => {
+                    // Clear the abandoned resolver so a frame that arrives
+                    // late (after the deadline) is queued for the next
+                    // `next()`/poll instead of being delivered to the dead
+                    // promise and silently dropped. Callers normally drop
+                    // the connection on timeout, but this hardens against
+                    // reuse.
+                    self.state.borrow_mut().pending_resolve.take();
+                    return Err(LibfwError::Network(format!(
+                        "ws read timed out: {}",
+                        js_value_string(&e)
+                    )));
+                }
+            };
             if value.is_undefined() || value.is_null() {
                 continue;
             }

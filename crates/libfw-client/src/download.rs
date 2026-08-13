@@ -219,6 +219,7 @@ async fn download_once(
     conn.send(&control_frame(FRAME_START, &start))?;
 
     let ready = loop {
+        control.check()?;
         let frame = conn.next().await?;
         match frame_type(&frame) {
             Some(FRAME_READY) => {

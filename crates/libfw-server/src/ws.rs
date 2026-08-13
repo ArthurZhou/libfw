@@ -45,6 +45,22 @@ const DEFAULT_DOWNLOAD_BLOCK: u64 = 256 * 1024;
 /// (bounds the receiver's buffering; each wave costs one RTT, so raise it on
 /// high-latency links).
 const SENDER_WINDOW: usize = 16;
+/// Lower bound on a client-requested block size (kept low so small-block
+/// transfers and tests keep working). Combined with the `MAX_BLOCKS` cap,
+/// this still prevents a crafted `block_size: 1` on a huge file from forcing
+/// an absurd block count.
+const MIN_BLOCK_SIZE: u64 = 1024;
+/// Upper bound on a client-requested block size (per-block memory is one
+/// block per wave on the sender and receiver).
+const MAX_BLOCK_SIZE: u64 = 16 * 1024 * 1024;
+/// Upper bound on a client-requested in-flight window (bounds per-wave
+/// memory: `window × block_size`).
+const MAX_WINDOW: usize = 64;
+/// Maximum number of blocks a single transfer may have. The download sender
+/// eagerly materializes the full transfer queue (`VecDeque<u32>`, 4 bytes per
+/// block), so this bounds that plan: 2²⁴ blocks ≈ 67 MiB worst case, which
+/// covers ~4 TiB at the default 256 KiB block size.
+const MAX_BLOCKS: u64 = 1 << 24;
 
 /// axum route handler for `GET /ws`.
 ///
@@ -291,13 +307,17 @@ async fn run_download(
         }
     };
 
-    let block_size = if start.block_size > 0 {
+    // Clamp client-supplied sizing so a crafted START can't force an absurd
+    // block count (block_size too small) or an unbounded in-flight wave
+    // (window too large). The READY reply echoes the effective values, so a
+    // legit client adapts to them automatically.
+    let block_size = if (MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&start.block_size) {
         start.block_size
     } else {
         DEFAULT_DOWNLOAD_BLOCK
     };
     let window = if start.window > 0 {
-        start.window as usize
+        (start.window as usize).clamp(1, MAX_WINDOW)
     } else {
         SENDER_WINDOW
     };
@@ -307,6 +327,13 @@ async fn run_download(
     let start_off = start.offset.min(meta.size);
     let total = meta.size - start_off;
     let total_blocks = block_count(total, block_size);
+    // Bound the eagerly-allocated transfer queue (see `MAX_BLOCKS`); reject
+    // instead of clamping so the client's block geometry stays what it asked
+    // for whenever it is sane.
+    if total_blocks as u64 > MAX_BLOCKS {
+        let _ = send_frame(socket, error_frame("too_large", "transfer too large")).await;
+        return;
+    }
 
     let ready = ReadyReply {
         kind: TransferKind::Download,
@@ -406,12 +433,17 @@ async fn run_download(
             match frame_type(&frame) {
                 Some(FRAME_NAK) => {
                     if let Some(index) = parse_nak(&frame) {
-                        queue.push_back(index);
+                        // Ignore out-of-range indices: `block_bounds` on such
+                        // an index underflows and would allocate a huge
+                        // buffer (crash/OOM) in the wave below.
+                        if index < total_blocks {
+                            queue.push_back(index);
+                        }
                     }
                 }
                 Some(FRAME_REQ) => {
                     if let Some(indices) = parse_req(&frame) {
-                        queue.extend(indices);
+                        queue.extend(indices.into_iter().filter(|&i| i < total_blocks));
                     }
                     break; // next wave
                 }
@@ -458,12 +490,17 @@ async fn run_upload(
         return;
     }
 
-    let block_size = if start.block_size > 0 {
+    let block_size = if (MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&start.block_size) {
         start.block_size
     } else {
         libfw_core::CHUNK_SIZE
     };
     let total_blocks = block_count(start.size, block_size);
+    // Bound the receiver's verified-set allocation (see `MAX_BLOCKS`).
+    if total_blocks as u64 > MAX_BLOCKS {
+        let _ = send_frame(socket, error_frame("too_large", "transfer too large")).await;
+        return;
+    }
     let mode = if start.mode.eq_ignore_ascii_case("create") {
         WriteMode::Create
     } else {
