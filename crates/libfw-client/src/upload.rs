@@ -506,14 +506,37 @@ async fn upload_session_resumable(
     Ok(uploaded)
 }
 
-/// Total number of bytes covered by a set of (possibly overlapping) received
-/// byte ranges.
+/// Total number of bytes covered by a set of received byte ranges, treating
+/// overlapping and adjacent ranges as one contiguous span.
+///
+/// The server merges ranges before replying, but a backend that doesn't may
+/// return overlapping ranges; summing raw lengths would over-count (and in
+/// turn over-seed progress / under-report the returned `uploaded` figure).
+/// Merge first so the result is the true covered extent.
 fn covered_bytes(received: &[(u64, u64)]) -> u64 {
+    let mut ranges: Vec<(u64, u64)> = received
+        .iter()
+        .map(|&(s, e)| (s.min(e), s.max(e)))
+        .filter(|&(s, e)| e > s)
+        .collect();
+    ranges.sort_by_key(|&(s, _)| s);
     let mut total = 0u64;
-    for (s, e) in received {
-        if e > s {
-            total = total.saturating_add(e - s);
+    let mut cur: Option<(u64, u64)> = None;
+    for (s, e) in ranges {
+        match cur {
+            None => cur = Some((s, e)),
+            Some((cs, ce)) => {
+                if s <= ce {
+                    cur = Some((cs, ce.max(e)));
+                } else {
+                    total = total.saturating_add(ce.saturating_sub(cs));
+                    cur = Some((s, e));
+                }
+            }
         }
+    }
+    if let Some((cs, ce)) = cur {
+        total = total.saturating_add(ce.saturating_sub(cs));
     }
     total
 }
@@ -689,5 +712,19 @@ mod tests {
             mtime: 42,
         };
         assert_ne!(session_id_for(&changed), id);
+    }
+
+    #[test]
+    fn covered_bytes_merges_overlaps() {
+        // Disjoint ranges sum normally.
+        assert_eq!(covered_bytes(&[(0, 4), (8, 12)]), 8);
+        // Overlapping ranges are coalesced, not double-counted.
+        assert_eq!(covered_bytes(&[(0, 10), (5, 15)]), 15);
+        // Adjacent ranges coalesce too.
+        assert_eq!(covered_bytes(&[(0, 10), (10, 20)]), 20);
+        // Fully covering the span collapses to one range.
+        assert_eq!(covered_bytes(&[(0, 100), (40, 60), (60, 100)]), 100);
+        // Empty ranges are ignored.
+        assert_eq!(covered_bytes(&[(5, 5)]), 0);
     }
 }

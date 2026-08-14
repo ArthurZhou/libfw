@@ -135,6 +135,29 @@ async fn download_file(
     let mut etag = resume.as_ref().map(|(e, _)| e.clone()).unwrap_or_default();
     let mut attempts = 0u32;
 
+    // Nothing to transfer when the file is empty (`offset == size == 0`) or
+    // already fully on disk (`offset == size`). Issuing a `Range` request for
+    // either would get a 416 — an empty file would loop forever, and a
+    // complete file would be needlessly re-downloaded. A stale offset past
+    // the current size (the file shrank) restarts from byte 0 instead.
+    match classify_download(file.size, offset) {
+        DownloadDisposition::Restart => {
+            offset = 0;
+            etag = String::new();
+        }
+        DownloadDisposition::AlreadyDone => {
+            // Credit the bytes already on disk so a resumed folder download
+            // reports the true fraction (mirrors the upload path).
+            if offset > 0 {
+                control.add_progress(offset);
+                control.report_progress_if(callbacks)?;
+            }
+            return finish_download(file, callbacks, etag, DownloadOutcome { size: file.size })
+                .await;
+        }
+        DownloadDisposition::Transfer => {}
+    }
+
     loop {
         control.wait_ready().await?;
         control.check()?;
@@ -257,6 +280,28 @@ fn should_parallel(size: u64, resume_offset: u64, config: &ClientConfig) -> bool
 /// despite `If-Range`).
 fn is_restart_err(e: &LibfwError) -> bool {
     matches!(e, LibfwError::Http { status: 416 | 200, .. })
+}
+
+/// What a persisted resume offset means for a `size`-byte file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadDisposition {
+    /// The offset is beyond EOF — the remote file shrank; restart from byte 0.
+    Restart,
+    /// The offset equals the file size — empty file, or already fully on disk.
+    AlreadyDone,
+    /// There are bytes left to fetch.
+    Transfer,
+}
+
+/// Classify `offset` against a `size`-byte file.
+fn classify_download(size: u64, offset: u64) -> DownloadDisposition {
+    if offset > size {
+        DownloadDisposition::Restart
+    } else if offset == size {
+        DownloadDisposition::AlreadyDone
+    } else {
+        DownloadDisposition::Transfer
+    }
 }
 
 /// Fetch a file's authoritative `{ etag, size }` via `HEAD`.
@@ -601,6 +646,20 @@ mod tests {
         // overhead on the last few bytes).
         assert!(!should_parallel(10 * 1024 * 1024, 10 * 1024 * 1024 - 1024, &cfg));
     }
+
+    #[test]
+    fn classify_download_disposition() {
+        // Empty file: nothing to fetch.
+        assert_eq!(classify_download(0, 0), DownloadDisposition::AlreadyDone);
+        // Fresh download of a non-empty file.
+        assert_eq!(classify_download(10, 0), DownloadDisposition::Transfer);
+        // Mid-file resume.
+        assert_eq!(classify_download(10, 4), DownloadDisposition::Transfer);
+        // Fully downloaded: nothing left.
+        assert_eq!(classify_download(10, 10), DownloadDisposition::AlreadyDone);
+        // Stale offset beyond EOF (file shrank): restart.
+        assert_eq!(classify_download(10, 11), DownloadDisposition::Restart);
+    }
 }
 
 /// Stream a `200`/`206` response body, decompressing on the fly and
@@ -637,6 +696,15 @@ async fn stream_download(
         {
             control.set_total(total.max(file.size));
         }
+    }
+
+    // A resumed download starts mid-file; seed progress with the prefix
+    // already on disk so the bar reflects the true fraction (the parallel
+    // path seeds it in `download_file_parallel`). Only the bytes read after
+    // `start` are counted below.
+    if start > 0 {
+        control.add_progress(start);
+        control.report_progress_if(callbacks)?;
     }
 
     // State is shared via `Rc` so the per-chunk `FnMut` callback can move

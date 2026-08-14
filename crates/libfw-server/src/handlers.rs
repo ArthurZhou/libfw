@@ -475,6 +475,24 @@ async fn upload_session(
                 len, meta.size
             )));
         }
+        // `len() == meta.size` is NOT enough: positional writes make a
+        // missing MIDDLE chunk extend the temp to `meta.size` with a
+        // zero-filled gap, which must never be committed as a complete file.
+        // Reject a commit whose received ranges don't fully cover the file.
+        // Sinks that don't track ranges return an empty list; for those we
+        // fall back to the length-only check (backward compatibility).
+        let received = sink.received_ranges().await?;
+        if !received.is_empty() {
+            let covered: u64 = received.iter().map(|r| r.end.saturating_sub(r.start)).sum();
+            if covered != meta.size {
+                let _ = sink.abort().await;
+                return Err(ApiError::BadRequest(format!(
+                    "commit covers {covered} bytes but the declared file size is {}; \
+                     some blocks are missing",
+                    meta.size
+                )));
+            }
+        }
         let committed = sink.commit().await?;
         return Ok((StatusCode::CREATED, Json(UploadOk { file: committed })).into_response());
     }

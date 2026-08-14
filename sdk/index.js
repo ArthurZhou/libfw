@@ -725,7 +725,20 @@ export class LibfwClient {
       this._emit({ type: 'fileCompleted', path });
       return;
     }
-    await this._closeWritable(path);
+    if (this._writables.has(path)) {
+      await this._closeWritable(path);
+    } else {
+      // No bytes were written this run — either a zero-byte file or a file
+      // already fully on disk from a resume. Materialize the target so an
+      // empty file still appears on disk. `getFileHandle({ create: true })`
+      // only creates a missing file, so an already-complete (resumed) file
+      // is never truncated here.
+      try {
+        await this._ensureFileHandle(path);
+      } catch {
+        /* best-effort: never fail the transfer on materialization errors */
+      }
+    }
     this._emit({ type: 'fileCompleted', path });
   }
 

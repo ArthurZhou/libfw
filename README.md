@@ -447,6 +447,20 @@ Both sides stay resumable: downloads by `{etag, offset}` and uploads via the
 server's per-session temp (BitTorrent-style, only the missing parts are
 re-transmitted).
 
+### HTTP/3 & QUIC
+
+The library does **not** implement QUIC itself — it has no need to. The
+browser engine uses the standard `fetch`/`ReadableStream` APIs, so when the
+server (or an edge/CDN in front of it) negotiates **HTTP/3**, every parallel
+`Range` GET and chunked POST automatically rides an independent QUIC stream
+with no head-of-line blocking. That is the single most effective upgrade for
+lossy, high-latency networks, and it requires no client change.
+
+The bundled example servers (`axum-server`, `actix-server`) serve HTTP/1.1.
+To get HTTP/3 end-to-end, front them with a QUIC-capable reverse proxy
+(Cloudflare, Caddy, nginx ≥ 1.25 with `http3 on;`, …) or an HTTP/3 load
+balancer; `libfw` itself stays transport-agnostic.
+
 ## HTTP protocol
 
 The HTTP routes are the transport the browser SDK uses (see

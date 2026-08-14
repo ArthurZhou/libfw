@@ -306,6 +306,63 @@ async fn session_upload_rejects_commit_with_wrong_size() {
 }
 
 #[tokio::test]
+async fn session_commit_rejects_sparse_hole_in_middle() {
+    let app = app(DevVerifier);
+    let data = b"0123456789".to_vec(); // 10 bytes
+    let meta = libfw_core::metadata::FileMeta::new("sess-hole.bin", 10, 0);
+    let session = "sess-hole";
+
+    // Send [0,4) and [8,10), leaving a zero-filled gap at [4,8). The temp
+    // file's length is 10 (the 8..10 write extends it), so a length-only
+    // commit check would wrongly accept the gap — the coverage check must
+    // reject it.
+    let mut headers = auth_header("tok");
+    headers
+        .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    headers.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    headers.insert(HEADER_OFFSET, HeaderValue::from_static("0"));
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/sess-hole.bin", headers, Body::from(data[0..4].to_vec())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let mut headers = auth_header("tok");
+    headers
+        .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    headers.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    headers.insert(HEADER_OFFSET, HeaderValue::from_static("8"));
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/sess-hole.bin", headers, Body::from(data[8..10].to_vec())))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Commit: only 6 of 10 bytes are covered → rejected.
+    let mut headers = auth_header("tok");
+    headers
+        .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    headers.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    headers.insert(HEADER_OFFSET, HeaderValue::from_static("10"));
+    headers.insert(HEADER_FINAL, HeaderValue::from_static("1"));
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/sess-hole.bin", headers, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Nothing may be committed.
+    let resp = app
+        .oneshot(request("GET", "/file/sess-hole.bin", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn session_probe_overwrites_existing_target() {
     let app = app(DevVerifier);
     let data = b"0123456789".to_vec();
