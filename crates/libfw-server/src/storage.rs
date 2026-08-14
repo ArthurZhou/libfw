@@ -6,6 +6,7 @@
 
 use std::io::{Read, SeekFrom};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -21,12 +22,20 @@ use libfw_core::StorageError;
 #[derive(Debug, Clone)]
 pub struct FsStorage {
     root: PathBuf,
+    /// Serializes read-merge-write of the per-session `.blocks` sidecars so
+    /// concurrent chunk requests never clobber each other's received-range
+    /// bookkeeping (a lost update here makes the commit coverage check reject
+    /// a fully-written file).
+    sidecar_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl FsStorage {
     /// Create a backend serving files under `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        FsStorage { root: root.into() }
+        FsStorage {
+            root: root.into(),
+            sidecar_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     /// Resolve a virtual path against the root, rejecting traversal.
@@ -158,6 +167,7 @@ impl StorageBackend for FsStorage {
                     written: 0,
                     blocks_path: None,
                     ranges: Vec::new(),
+                    sidecar_lock: self.sidecar_lock.clone(),
                 }))
             }
             WriteMode::Resume { offset } => {
@@ -189,6 +199,7 @@ impl StorageBackend for FsStorage {
                     written: offset,
                     blocks_path: None,
                     ranges: Vec::new(),
+                    sidecar_lock: self.sidecar_lock.clone(),
                 }))
             }
         }
@@ -271,7 +282,18 @@ impl StorageBackend for FsStorage {
         // Load any already-received byte ranges from the sidecar so a pause /
         // resume only re-sends the missing blocks.
         let blocks_path = blocks_path_for(&tmp);
-        let ranges = read_ranges(&blocks_path).await;
+        // A freshly-created temp means nothing has been received yet: a stale
+        // `.blocks` sidecar left behind by an earlier aborted attempt must not
+        // make the probe report phantom ranges (the client would then skip
+        // chunks and commit an empty / zero-filled file).
+        if !exists {
+            let _ = tokio::fs::remove_file(&blocks_path).await;
+        }
+        let ranges = if exists {
+            read_ranges(&blocks_path).await
+        } else {
+            Vec::new()
+        };
         Ok(Box::new(FsSink {
             file,
             tmp: Some(tmp),
@@ -281,6 +303,7 @@ impl StorageBackend for FsStorage {
             written: 0,
             blocks_path: Some(blocks_path),
             ranges,
+            sidecar_lock: self.sidecar_lock.clone(),
         }))
     }
 
@@ -464,6 +487,8 @@ pub struct FsSink {
     /// In-memory copy of the received ranges (kept in sync with
     /// `blocks_path`).
     ranges: Vec<ChunkRange>,
+    /// Shared lock serializing sidecar read-merge-write (see `FsStorage`).
+    sidecar_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Merge `new` (a `[start, end)` half-open range) into a sorted, disjoint
@@ -518,12 +543,22 @@ impl UploadSink for FsSink {
         // For a resumable session sink, record the received byte range in the
         // sidecar so a later probe / resume knows this part is already on
         // disk and only missing gaps need to be re-sent.
+        //
+        // The read-merge-write is serialized under the storage-wide lock:
+        // concurrent chunk requests each hold a *stale* in-memory `ranges`
+        // copy loaded when their sink was opened, so a bare `persist_ranges`
+        // would clobber other chunks' ranges (lost update) and make the
+        // commit coverage check reject a fully-written file.
         if let Some(blocks) = self.blocks_path.clone() {
-            merge_range(&mut self.ranges, ChunkRange {
+            let guard = self.sidecar_lock.lock().await;
+            let mut current = read_ranges(&blocks).await;
+            merge_range(&mut current, ChunkRange {
                 start: offset,
                 end: offset.saturating_add(buf.len() as u64),
             });
-            persist_ranges(&blocks, &self.ranges).await?;
+            persist_ranges(&blocks, &current).await?;
+            self.ranges = current;
+            drop(guard);
         }
         Ok(())
     }

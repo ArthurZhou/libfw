@@ -844,7 +844,13 @@ export class LibfwClient {
     const offset = Number(state.offset) || 0;
     if (offset <= 0) return state;
     const handle = await this._resolveFileHandle(path);
-    if (!handle) return state; // can't know the on-disk length → trust state
+    if (!handle) {
+      // No on-disk file to resume from: whatever offset was persisted has
+      // nothing behind it. Restart from 0 instead of trusting a stale offset
+      // that would make the engine skip the download entirely (producing an
+      // empty/missing file while reporting "complete").
+      return { ...state, offset: 0, size: 0 };
+    }
     let diskLen = 0;
     try {
       diskLen = (await handle.getFile()).size;

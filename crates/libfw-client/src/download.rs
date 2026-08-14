@@ -874,6 +874,11 @@ pub async fn download_single(
     // source of truth), so a large single file can use the tus-style
     // parallel byte-range path instead of a single slow connection.
     let (_etag, size) = fetch_meta(base_url, token, path, config.timeout_ms).await?;
+    // Seed the total up front so every progress event for a single-file
+    // download has a real denominator (the parallel/sequential paths also
+    // set it, but the already-done/early paths and the first chunk would
+    // otherwise report `bytes/0`).
+    control.set_total(size);
     let file = FileEntry {
         path: path.to_string(),
         size,
