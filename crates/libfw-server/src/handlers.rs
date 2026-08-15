@@ -12,9 +12,11 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures::stream::{BoxStream, Stream, StreamExt};
 use libfw_core::auth::{Action, AuthError};
+use libfw_core::capabilities::Capabilities;
 use libfw_core::claims::TokenClaims;
 use libfw_core::compress::{
-    CompressionFormat, Compressor, MAX_OUTPUT_PER_CALL, decompressor_with_limit,
+    CompressionFormat, Compressor, MAX_OUTPUT_PER_CALL, ZRIP_DEFAULT_LEVEL,
+    compressor_with_level, decompressor_with_limit, negotiate_level,
 };
 use libfw_core::metadata::{FileMeta, decode_file_meta_header};
 use libfw_core::storage::{UploadSink, WriteMode};
@@ -29,8 +31,8 @@ use crate::http::{
     if_range_matches, parse_range_header,
 };
 use crate::{
-    HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION,
-    HEADER_SESSION_STATUS, ServerState, validate_rel_path,
+    HEADER_COMPRESS, HEADER_COMPRESS_LEVEL, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET,
+    HEADER_SESSION, HEADER_SESSION_STATUS, ServerState, validate_rel_path,
 };
 
 /// Errors surfaced by handlers, mapped to HTTP responses.
@@ -132,7 +134,24 @@ struct DownloadPlan {
     status: StatusCode,
     headers: Vec<(&'static str, String)>,
     format: CompressionFormat,
+    /// Zrip level the body is (or would be) compressed with.
+    level: i32,
     reader: Option<Box<dyn Read + Send>>,
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities (public, no auth)
+// ---------------------------------------------------------------------------
+
+/// `GET /capabilities` — the server's capability advertisement.
+///
+/// Deliberately **public**: the payload contains no secrets and adaptive
+/// clients need it before any authentication. Requests without credentials
+/// (or without the protocol handshake) are served identically.
+pub(crate) async fn capabilities(
+    State(state): State<Arc<ServerState>>,
+) -> Json<Capabilities> {
+    Json(state.capabilities())
 }
 
 fn authorize_request(
@@ -207,6 +226,7 @@ async fn plan_download(
     };
 
     let format = negotiate_download_format(state, req_headers);
+    let (level, echo_level) = negotiate_download_level(state, format, req_headers);
     let reader = if with_reader {
         Some(state.storage.read_stream(&path, spec).await?)
     } else {
@@ -222,6 +242,9 @@ async fn plan_download(
         (header::ETAG.as_str(), meta.etag),
         (HEADER_COMPRESS, format.as_str().to_string()),
     ];
+    if echo_level {
+        headers.push((HEADER_COMPRESS_LEVEL, level.to_string()));
+    }
     if is_partial {
         headers.push((
             header::CONTENT_RANGE.as_str(),
@@ -240,6 +263,7 @@ async fn plan_download(
         },
         headers,
         format,
+        level,
         reader,
     })
 }
@@ -261,6 +285,34 @@ fn negotiate_download_format(state: &ServerState, req_headers: &HeaderMap) -> Co
     }
 }
 
+/// Resolve the zrip level for a download from the `x-libfw-compress-level`
+/// request header, clamping it into the server's advertised range.
+///
+/// Returns `(level, echo)`: `echo` is true when the server actively
+/// negotiated a level and the response must carry the actual level back on
+/// [`HEADER_COMPRESS_LEVEL`]. When the builder left `zrip_levels` unset
+/// (legacy mode) the header is ignored, downloads use the default level and
+/// nothing is echoed — exactly the pre-0.3.3 behavior. Identity responses
+/// never echo (there is no compression to negotiate).
+fn negotiate_download_level(
+    state: &ServerState,
+    format: CompressionFormat,
+    req_headers: &HeaderMap,
+) -> (i32, bool) {
+    let Some(levels) = state.zrip_levels else {
+        return (ZRIP_DEFAULT_LEVEL, false);
+    };
+    if format != CompressionFormat::Zrip {
+        return (ZRIP_DEFAULT_LEVEL, false);
+    }
+    let requested = req_headers
+        .get(HEADER_COMPRESS_LEVEL)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i32>().ok());
+    let level = negotiate_level(requested, levels.min, levels.max, levels.default);
+    (level, true)
+}
+
 pub(crate) async fn download(
     State(state): State<Arc<ServerState>>,
     Path(path): Path<String>,
@@ -271,7 +323,7 @@ pub(crate) async fn download(
     let plan = plan_download(&state, &path, &req_headers, true).await?;
 
     let reader = plan.reader.expect("reader requested");
-    let stream = body_stream(reader, plan.format);
+    let stream = body_stream(reader, plan.format, plan.level);
     let mut builder = Response::builder().status(plan.status);
     for (name, value) in plan.headers {
         builder = builder.header(name, value);
@@ -789,12 +841,13 @@ where
 fn body_stream(
     reader: Box<dyn Read + Send>,
     format: CompressionFormat,
+    level: i32,
 ) -> BoxStream<'static, Result<Bytes, io::Error>> {
     let raw = reader_stream(reader);
     match format {
         CompressionFormat::None => raw,
         CompressionFormat::Zrip => {
-            let compressor = libfw_core::compress::compressor(CompressionFormat::Zrip)
+            let compressor = compressor_with_level(CompressionFormat::Zrip, level)
                 .expect("zrip compressor available");
             CompressedStream {
                 inner: raw,

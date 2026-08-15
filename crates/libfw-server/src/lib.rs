@@ -59,12 +59,13 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use libfw_core::auth::{AuthError, TokenVerifier, Validator};
+use libfw_core::capabilities::{Capabilities, Limits, ZripLevels};
 use libfw_core::compress::CompressionFormat;
 use libfw_core::storage::StorageBackend;
 use libfw_core::{protocol_compatible, protocol_header_value, DEFAULT_MAX_UPLOAD_SIZE, HEADER_PROTOCOL};
 pub use libfw_core::{
-    HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION,
-    HEADER_SESSION_STATUS,
+    HEADER_COMPRESS, HEADER_COMPRESS_LEVEL, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET,
+    HEADER_SESSION, HEADER_SESSION_STATUS,
 };
 
 /// Immutable server configuration shared by all handlers.
@@ -79,6 +80,13 @@ pub struct ServerState {
     pub compression: CompressionFormat,
     /// Upper bound for a single upload body.
     pub max_upload_size: u64,
+    /// Advertised tuning-parameter ranges; `None` exports the libfw
+    /// built-in defaults (and enforces nothing beyond existing hard caps).
+    pub limits: Option<Limits>,
+    /// Advertised zrip level range; `None` keeps the legacy behavior:
+    /// the level header is ignored and downloads always use
+    /// [`ZRIP_DEFAULT_LEVEL`](libfw_core::ZRIP_DEFAULT_LEVEL).
+    pub zrip_levels: Option<ZripLevels>,
 }
 
 impl ServerState {
@@ -105,6 +113,8 @@ pub struct ServerStateBuilder {
     validator: Option<Arc<dyn Validator>>,
     compression: CompressionFormat,
     max_upload_size: u64,
+    limits: Option<Limits>,
+    zrip_levels: Option<ZripLevels>,
 }
 
 impl Default for ServerStateBuilder {
@@ -115,6 +125,8 @@ impl Default for ServerStateBuilder {
             validator: None,
             compression: CompressionFormat::Zrip,
             max_upload_size: DEFAULT_MAX_UPLOAD_SIZE,
+            limits: None,
+            zrip_levels: None,
         }
     }
 }
@@ -150,6 +162,26 @@ impl ServerStateBuilder {
         self
     }
 
+    /// Tuning-parameter ranges advertised at `GET /capabilities`.
+    ///
+    /// `None` (default) exports the libfw built-in defaults. The server
+    /// never hard-enforces these beyond existing caps (frame size, upload
+    /// body limit); they are an advisory contract for adaptive clients.
+    pub fn limits(mut self, limits: Limits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
+    /// Zrip level range for downloads: validates/clamps the
+    /// `x-libfw-compress-level` request header and echoes the actual level.
+    ///
+    /// `None` (default) keeps the legacy behavior — the header is ignored
+    /// and every zrip download uses [`ZRIP_DEFAULT_LEVEL`].
+    pub fn zrip_levels(mut self, levels: ZripLevels) -> Self {
+        self.zrip_levels = Some(levels);
+        self
+    }
+
     /// Build the state, panicking if required fields are missing.
     pub fn build(self) -> ServerState {
         ServerState {
@@ -158,7 +190,33 @@ impl ServerStateBuilder {
             validator: self.validator.expect("validator is required"),
             compression: self.compression,
             max_upload_size: self.max_upload_size,
+            limits: self.limits,
+            zrip_levels: self.zrip_levels,
         }
+    }
+}
+
+impl ServerState {
+    /// The capability advertisement served at `GET /capabilities`.
+    ///
+    /// Filters the compression formats by the configured download
+    /// compression and overlays the optional builder overrides; unset
+    /// dimensions fall back to the libfw built-in defaults.
+    pub fn capabilities(&self) -> Capabilities {
+        let mut caps = Capabilities::default();
+        if let Some(limits) = &self.limits {
+            caps.limits = limits.clone();
+        }
+        if let Some(levels) = &self.zrip_levels {
+            caps.compression.zrip_levels = *levels;
+        }
+        caps.compression.formats = match self.compression {
+            CompressionFormat::Zrip => {
+                vec![CompressionFormat::None, CompressionFormat::Zrip]
+            }
+            CompressionFormat::None => vec![CompressionFormat::None],
+        };
+        caps
     }
 }
 
@@ -196,6 +254,8 @@ async fn validate_protocol(req: Request, next: Next) -> Response {
 /// - `POST /file/{*path}` — streaming upload (headers: `x-libfw-file-meta`,
 ///   optional `x-libfw-offset`, optional `x-libfw-compress`)
 /// - `GET  /dir/{*path}`  — directory listing (JSON)
+/// - `GET  /capabilities` — capability advertisement (JSON, **public**:
+///   no auth — the payload is a non-sensitive contract for adaptive clients)
 ///
 /// All routes first pass through [`validate_protocol`], which enforces the
 /// `x-libfw-protocol` handshake shared with the WASM client.
@@ -207,6 +267,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/file/{*path}", post(handlers::upload))
         .route("/dir", get(handlers::list_dir_root))
         .route("/dir/{*path}", get(handlers::list_dir))
+        .route("/capabilities", get(handlers::capabilities))
         .route("/ws", get(ws_handler))
         .layer(axum::middleware::from_fn(validate_protocol))
         .with_state(state)
