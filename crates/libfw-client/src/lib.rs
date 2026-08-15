@@ -66,9 +66,11 @@ impl LibfwClient {
     pub fn new(opts: JsValue) -> LibfwClient {
         let config = ClientConfig::from_js(&opts);
         LibfwClient {
-            config,
+            config: config.clone(),
             callbacks: Callbacks::new(),
-            control: TaskControl::new(),
+            // The global in-flight HTTP pool is sized by `concurrency`, so it
+            // bounds total network parallelism (not just concurrent files).
+            control: TaskControl::with_max_parallel(config.concurrency.max(1)),
         }
     }
 

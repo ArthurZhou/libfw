@@ -21,7 +21,13 @@ pub const DEFAULT_TIMEOUT_MS: u32 = 60_000;
 /// Runtime configuration of the WASM engine.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
-    /// Maximum number of concurrently-transferring files (default 4).
+    /// Global cap on concurrent in-flight HTTP transfers (default 4).
+    ///
+    /// Every upload chunk POST and download range GET acquires a permit from
+    /// a shared pool, so this bounds the engine's TOTAL network parallelism
+    /// — across all files AND all per-file windows combined (a single file
+    /// can still open up to `upload_window` / `download_window` requests, but
+    /// never more than `concurrency` in total).
     pub concurrency: usize,
     /// In-flight chunk window for a single file's upload (default 8).
     ///
@@ -47,6 +53,11 @@ pub struct ClientConfig {
     /// Request `zrip` compression from the server / compress uploads.
     pub compress: bool,
     /// Fixed chunk size used to slice files (default 2 MiB).
+    ///
+    /// Each chunk is compressed into many small (~64 KiB) zstd frames, so
+    /// this value is decoupled from the per-frame wire size and may be set
+    /// freely (larger = fewer, bigger POST requests; bounded only by
+    /// `maxRetries`/memory and the server's upload-size limit).
     pub chunk_size: u64,
     /// Maximum retries per chunk/file (default 3).
     pub max_retries: u32,

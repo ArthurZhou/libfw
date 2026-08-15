@@ -16,10 +16,10 @@ use libfw_core::{
 
 use crate::config::ClientConfig;
 use crate::error::LibfwError;
-use crate::http::{auth_headers, fetch, file_url, read_all, request};
+use crate::http::{auth_headers, fetch, file_url, read_all, request, xhr_post};
 use crate::js::Callbacks;
 use crate::plan::{chunk_bounds, total_bytes, FileEntry};
-use crate::state::TaskControl;
+use crate::state::{Semaphore, TaskControl};
 
 /// Sleep for `ms` milliseconds on the JS event loop (shared with download).
 pub(crate) async fn sleep_ms(ms: u32) {
@@ -42,6 +42,10 @@ pub(crate) async fn sleep_ms(ms: u32) {
 /// temp file and does NOT commit unless `final_chunk` is set. When `session`
 /// is empty the legacy sequential protocol is used (offset = resume point,
 /// commit on `final_chunk`).
+///
+/// `semaphore` is the engine-wide in-flight HTTP pool (sized by
+/// `concurrency`): every data request takes a permit so `concurrency` bounds
+/// the TOTAL number of parallel transfers, not just concurrent files.
 async fn post_chunk(
     base_url: &str,
     token: &str,
@@ -52,39 +56,45 @@ async fn post_chunk(
     timeout_ms: u32,
     final_chunk: bool,
     session: &str,
+    semaphore: &Semaphore,
 ) -> Result<(), LibfwError> {
-    let headers = auth_headers(token, false)?;
-    headers
-        .set(HEADER_OFFSET, &offset.to_string())
-        .map_err(|e| LibfwError::Js(format!("set offset header failed: {e:?}")))?;
-    headers
-        .set(HEADER_FILE_META, &encode_file_meta_header(&file.to_meta()))
-        .map_err(|e| LibfwError::Js(format!("set meta header failed: {e:?}")))?;
+    // Header pairs for the XHR upload path (XHR cannot consume a `Headers`).
+    let mut headers: Vec<(String, String)> = vec![
+        ("Authorization".to_string(), format!("Bearer {token}")),
+        (
+            libfw_core::HEADER_PROTOCOL.to_string(),
+            libfw_core::protocol_header_value().to_string(),
+        ),
+    ];
+    headers.push((HEADER_OFFSET.to_string(), offset.to_string()));
+    headers.push((HEADER_FILE_META.to_string(), encode_file_meta_header(&file.to_meta())));
     if !session.is_empty() {
-        headers
-            .set(HEADER_SESSION, session)
-            .map_err(|e| LibfwError::Js(format!("set session header failed: {e:?}")))?;
+        headers.push((HEADER_SESSION.to_string(), session.to_string()));
     }
     // Only advertise zrip when there is a body to compress (the commit
     // request carries an empty body and is always identity).
     if compress && !body.is_empty() {
-        headers
-            .set(HEADER_COMPRESS, "zrip")
-            .map_err(|e| LibfwError::Js(format!("set compress header failed: {e:?}")))?;
+        headers.push((HEADER_COMPRESS.to_string(), "zrip".to_string()));
     }
     // Mark the final chunk so the server can verify the committed size
     // matches the declared `meta.size` (and reject truncated uploads).
     if final_chunk {
-        headers
-            .set(HEADER_FINAL, "1")
-            .map_err(|e| LibfwError::Js(format!("set final header failed: {e:?}")))?;
+        headers.push((HEADER_FINAL.to_string(), "1".to_string()));
     }
 
     let url = file_url(base_url, &file.path);
-    let body_value = js_sys::Uint8Array::from(body);
-    let req = request(&url, "POST", &headers, Some(&body_value.into()))?;
-    let resp = fetch(&req, timeout_ms).await?;
-    let status = resp.status();
+    // Hold the permit for the whole request so the global cap is respected.
+    let _permit = semaphore.acquire().await;
+    // XHR-based upload with a NO-PROGRESS timeout: `fetch` cannot observe
+    // upload progress, so a slow-but-active upload on a low-bandwidth link
+    // (e.g. through a CF tunnel) would be killed by a wall clock. The XHR
+    // path only aborts when nothing has moved for `timeout_ms`.
+    let promise = xhr_post(&url, &headers, body, timeout_ms)?;
+    let status = JsFuture::from(promise)
+        .await
+        .map_err(|e| LibfwError::Network(format!("upload request failed: {e:?}")))?
+        .as_f64()
+        .unwrap_or(0.0) as u16;
     if status == 201 {
         Ok(())
     } else {
@@ -232,13 +242,20 @@ async fn upload_one_chunk(
         )));
     }
 
-    // Compress the chunk into a single independent zstd frame.
+    // Compress the chunk into many small (~64 KiB) independent zstd frames
+    // rather than one frame per chunk. The wire format is a concatenation of
+    // frames, and the server caps each *frame* (MAX_FRAME_OUTPUT), so this
+    // keeps the frame size independent of the configured `chunkSize` — a
+    // larger `chunkSize` then just means more frames per request instead of a
+    // frame the server would reject.
     let payload: Vec<u8> = if config.compress {
         let mut enc = compressor(CompressionFormat::Zrip)
             .map_err(|e| LibfwError::Compress(e.to_string()))?;
         let mut out = Vec::with_capacity(raw.len());
-        enc.compress(&raw, &mut out)
-            .map_err(|e| LibfwError::Compress(e.to_string()))?;
+        for window in raw.chunks(libfw_core::STREAM_BUF_SIZE) {
+            enc.compress(window, &mut out)
+                .map_err(|e| LibfwError::Compress(e.to_string()))?;
+        }
         enc.finish(&mut out)
             .map_err(|e| LibfwError::Compress(e.to_string()))?;
         out
@@ -260,6 +277,7 @@ async fn upload_one_chunk(
             config.timeout_ms,
             false,
             session,
+            control.semaphore(),
         )
         .await
         {
@@ -310,6 +328,7 @@ async fn commit_upload(
             config.timeout_ms,
             true,
             session,
+            control.semaphore(),
         )
         .await
         {

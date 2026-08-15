@@ -6,8 +6,12 @@
 //! because WASM is single-threaded and each flag read is a cheap copy (no
 //! borrows span `.await` points).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::task::{Context, Poll, Waker};
 
 use wasm_bindgen::JsValue;
 
@@ -45,6 +49,100 @@ impl TaskState {
     }
 }
 
+/// A bounded async semaphore (single-threaded WASM friendly).
+///
+/// Grants at most `max` outstanding permits. The engine uses one shared
+/// pool (sized by `concurrency`) so `concurrency` bounds the TOTAL number of
+/// in-flight HTTP transfers — regardless of how many files or per-file
+/// windows are active — which is what actually controls network parallelism.
+#[derive(Debug, Clone)]
+pub struct Semaphore {
+    inner: Rc<SemaphoreInner>,
+}
+
+#[derive(Debug)]
+struct SemaphoreInner {
+    max: usize,
+    available: Cell<usize>,
+    waiters: RefCell<VecDeque<Waker>>,
+}
+
+impl Semaphore {
+    /// Create a pool with `max` permits (clamped to at least 1).
+    pub fn new(max: usize) -> Self {
+        let max = max.max(1);
+        Semaphore {
+            inner: Rc::new(SemaphoreInner {
+                max,
+                available: Cell::new(max),
+                waiters: RefCell::new(VecDeque::new()),
+            }),
+        }
+    }
+
+    /// Reset to a full pool (called at the start of each transfer).
+    pub fn reset(&self) {
+        self.inner.available.set(self.inner.max);
+        self.inner.waiters.borrow_mut().clear();
+    }
+
+    /// Acquire one permit, waiting asynchronously when the pool is empty.
+    pub fn acquire(&self) -> Acquire<'_> {
+        Acquire { sem: self }
+    }
+
+    fn try_acquire(&self) -> bool {
+        let avail = self.inner.available.get();
+        if avail > 0 {
+            self.inner.available.set(avail - 1);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&self) {
+        let avail = self.inner.available.get();
+        self.inner.available.set((avail + 1).min(self.inner.max));
+        // Wake every waiter; each re-poll re-checks the pool and either
+        // acquires (removed from the queue) or re-queues itself.
+        let waiters = std::mem::take(&mut *self.inner.waiters.borrow_mut());
+        for w in waiters {
+            w.wake();
+        }
+    }
+}
+
+/// Future returned by [`Semaphore::acquire`].
+pub struct Acquire<'a> {
+    sem: &'a Semaphore,
+}
+
+impl Future for Acquire<'_> {
+    type Output = Permit;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Permit> {
+        if self.sem.try_acquire() {
+            return Poll::Ready(Permit {
+                sem: self.sem.clone(),
+            });
+        }
+        self.sem.inner.waiters.borrow_mut().push_back(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// RAII permit; the held slot is returned to the pool on drop.
+pub struct Permit {
+    sem: Semaphore,
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.sem.release();
+    }
+}
+
 /// Shared, mutable task control state.
 ///
 /// Every field is `Rc<Cell<_>>` so that **clones share the same state**.
@@ -64,6 +162,8 @@ pub struct TaskControl {
     /// `done_bytes` the last time progress was reported to JS, used to
     /// throttle `on_progress` events (see [`TaskControl::report_progress_if`]).
     last_reported: Rc<Cell<u64>>,
+    /// Global cap on in-flight HTTP transfers (see [`Semaphore`]).
+    semaphore: Semaphore,
 }
 
 impl Default for TaskControl {
@@ -73,8 +173,14 @@ impl Default for TaskControl {
 }
 
 impl TaskControl {
-    /// Create a fresh, idle control block.
+    /// Create a fresh, idle control block (default global parallelism).
     pub fn new() -> Self {
+        TaskControl::with_max_parallel(libfw_core::DEFAULT_CONCURRENCY)
+    }
+
+    /// Create a fresh control block whose global in-flight HTTP transfer pool
+    /// is capped at `max_parallel` (from the client's `concurrency` option).
+    pub fn with_max_parallel(max_parallel: usize) -> Self {
         TaskControl {
             state: Rc::new(Cell::new(TaskState::Idle)),
             active: Rc::new(Cell::new(TaskState::Idle)),
@@ -82,10 +188,11 @@ impl TaskControl {
             done_bytes: Rc::new(Cell::new(0)),
             total_bytes: Rc::new(Cell::new(0)),
             last_reported: Rc::new(Cell::new(0)),
+            semaphore: Semaphore::new(max_parallel),
         }
     }
 
-    /// Reset everything for a new transfer.
+    /// Reset everything for a new transfer (refills the permit pool).
     pub fn reset(&self) {
         self.state.set(TaskState::Idle);
         self.active.set(TaskState::Idle);
@@ -93,6 +200,12 @@ impl TaskControl {
         self.done_bytes.set(0);
         self.total_bytes.set(0);
         self.last_reported.set(0);
+        self.semaphore.reset();
+    }
+
+    /// The global in-flight transfer pool (shared by every file/chunk task).
+    pub fn semaphore(&self) -> &Semaphore {
+        &self.semaphore
     }
 
     /// Current state.
@@ -264,6 +377,56 @@ async fn yield_to_event_loop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::pin;
+    use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+
+    /// A waker that does nothing (manual-poll tests only).
+    fn noop_waker() -> Waker {
+        fn noop(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        static VTABLE: RawWakerVTable =
+            RawWakerVTable::new(clone, noop, noop, noop);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    #[test]
+    fn semaphore_blocks_when_exhausted_and_recovers() {
+        let sem = Semaphore::new(2);
+        let p1 = futures::executor::block_on(sem.acquire());
+        let p2 = futures::executor::block_on(sem.acquire());
+
+        // Pool exhausted → a third acquire must stay Pending.
+        let mut fut = pin!(sem.acquire());
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        // Freeing one permit lets the waiter proceed.
+        drop(p1);
+        assert!(fut.as_mut().poll(&mut cx).is_ready());
+        drop(p2);
+
+        // reset() restores the full pool.
+        sem.reset();
+        let _ = futures::executor::block_on(sem.acquire());
+        let _ = futures::executor::block_on(sem.acquire());
+    }
+
+    #[test]
+    fn semaphore_clones_share_the_pool() {
+        let a = Semaphore::new(1);
+        let b = a.clone();
+        let p = futures::executor::block_on(a.acquire());
+        // A clone of the pool sees the same exhaustion.
+        let mut fut = pin!(b.acquire());
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+        drop(p);
+        assert!(fut.as_mut().poll(&mut cx).is_ready());
+    }
 
     #[test]
     fn idle_state_machine() {

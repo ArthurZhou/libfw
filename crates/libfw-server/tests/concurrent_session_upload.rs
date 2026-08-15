@@ -130,3 +130,65 @@ async fn concurrent_compressed_chunks_then_commit() {
     let commit = app.clone().oneshot(request("POST", "/file/c.bin", hdr, Body::empty())).await.unwrap();
     assert_eq!(commit.status(), StatusCode::CREATED, "commit: {:?}", commit.into_body().collect().await.unwrap().to_bytes());
 }
+#[tokio::test(flavor = "multi_thread")]
+async fn chunk_larger_than_frame_cap_commits_when_split_into_small_frames() {
+    // Regression for the `chunkSize` config: a 4 MiB chunk (larger than the
+    // server's MAX_FRAME_OUTPUT == 2 MiB) must still upload. The client splits
+    // each chunk into ~64 KiB frames, so no single frame exceeds the cap and
+    // the per-call decompression budget (MAX_OUTPUT_PER_CALL) is never hit.
+    let app = app();
+    let data: Vec<u8> = (0..(libfw_core::CHUNK_SIZE as usize * 2 + 12_345))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let meta = libfw_core::metadata::FileMeta::new("big.bin", data.len() as u64, 0);
+    let session = "big-frame-sess";
+
+    // Compress the whole chunk the way the client does: many ~64 KiB frames.
+    let mut enc = compressor(CompressionFormat::Zrip).unwrap();
+    let mut payload = Vec::new();
+    for w in data.chunks(libfw_core::STREAM_BUF_SIZE) {
+        enc.compress(w, &mut payload).unwrap();
+    }
+    enc.finish(&mut payload).unwrap();
+    assert!(!payload.is_empty(), "compressed payload must be non-empty");
+
+    let mut hdr = auth_header();
+    hdr.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    hdr.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    hdr.insert(HEADER_OFFSET, HeaderValue::from_static("0"));
+    hdr.insert(HEADER_COMPRESS, HeaderValue::from_static("zrip"));
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/big.bin", hdr, Body::from(payload)))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "chunk larger than MAX_FRAME_OUTPUT must be accepted: {:?}",
+        resp.into_body().collect().await.unwrap().to_bytes()
+    );
+
+    let mut hdr = auth_header();
+    hdr.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    hdr.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    hdr.insert(HEADER_OFFSET, HeaderValue::from_str(&data.len().to_string()).unwrap());
+    hdr.insert(HEADER_FINAL, HeaderValue::from_static("1"));
+    let commit = app
+        .clone()
+        .oneshot(request("POST", "/file/big.bin", hdr, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(commit.status(), StatusCode::CREATED, "commit: {:?}", commit.into_body().collect().await.unwrap().to_bytes());
+
+    // The committed file must round-trip byte-for-byte.
+    let resp = app
+        .clone()
+        .oneshot(request("GET", "/file/big.bin", auth_header(), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(got.to_vec(), data, "downloaded content must match the source");
+}
+

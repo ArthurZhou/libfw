@@ -21,7 +21,7 @@ use crate::error::LibfwError;
 use crate::http::{auth_headers, dir_url, fetch, file_url, read_all, request, stream_body};
 use crate::js::Callbacks;
 use crate::plan::{total_bytes, FileEntry};
-use crate::state::TaskControl;
+use crate::state::{Semaphore, TaskControl};
 
 /// A single file download outcome, used for resume-state bookkeeping.
 struct DownloadOutcome {
@@ -354,7 +354,15 @@ async fn download_chunk_with_retry(
         control.wait_ready().await?;
         control.check()?;
         match download_chunk_once(
-            base_url, token, path, etag, start, end, config.compress, config.timeout_ms,
+            base_url,
+            token,
+            path,
+            etag,
+            start,
+            end,
+            config.compress,
+            config.timeout_ms,
+            control.semaphore(),
         )
         .await
         {
@@ -385,6 +393,10 @@ async fn download_chunk_with_retry(
 
 /// A single `GET` with `Range: bytes=start-(end-1)`, decompressing the
 /// response body into one `Vec<u8>`.
+///
+/// `semaphore` is the engine-wide in-flight HTTP pool (sized by
+/// `concurrency`): every range GET takes a permit so `concurrency` bounds
+/// the TOTAL number of parallel transfers, not just concurrent files.
 async fn download_chunk_once(
     base_url: &str,
     token: &str,
@@ -394,6 +406,7 @@ async fn download_chunk_once(
     end: u64,
     compress: bool,
     timeout_ms: u32,
+    semaphore: &Semaphore,
 ) -> Result<Vec<u8>, LibfwError> {
     let headers = auth_headers(token, compress)?;
     let last = end.saturating_sub(1);
@@ -407,6 +420,8 @@ async fn download_chunk_once(
     }
     let url = file_url(base_url, path);
     let req = request(&url, "GET", &headers, None)?;
+    // Hold the permit for the whole request so the global cap is respected.
+    let _permit = semaphore.acquire().await;
     let resp = fetch(&req, timeout_ms).await?;
     match resp.status() {
         206 => collect_chunk(&resp, timeout_ms).await,

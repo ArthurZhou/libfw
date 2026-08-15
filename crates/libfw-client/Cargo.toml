@@ -31,6 +31,9 @@ web-sys = { workspace = true, features = [
     "Headers",
     "ReadableStream",
     "ReadableStreamDefaultReader",
+    "XmlHttpRequest",
+    "XmlHttpRequestUpload",
+    "XmlHttpRequestEventTarget",
     "console",
 ] }
 

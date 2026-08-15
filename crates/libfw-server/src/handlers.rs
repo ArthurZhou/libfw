@@ -14,7 +14,7 @@ use futures::stream::{BoxStream, Stream, StreamExt};
 use libfw_core::auth::{Action, AuthError};
 use libfw_core::claims::TokenClaims;
 use libfw_core::compress::{
-    CompressionFormat, Compressor, MAX_FRAME_OUTPUT, decompressor_with_limit,
+    CompressionFormat, Compressor, MAX_OUTPUT_PER_CALL, decompressor_with_limit,
 };
 use libfw_core::metadata::{FileMeta, decode_file_meta_header};
 use libfw_core::storage::{UploadSink, WriteMode};
@@ -432,7 +432,12 @@ async fn upload_session(
         return Ok((StatusCode::OK, Json(SessionStatus { ranges })).into_response());
     }
 
-    let mut decomp = decompressor_with_limit(format, MAX_FRAME_OUTPUT);
+    // Per-frame safety is enforced by the decompressor itself (each frame is
+    // capped at MAX_FRAME_OUTPUT); the per-CALL budget here is deliberately
+    // generous so a body chunk carrying many small frames (e.g. a client that
+    // slices each upload chunk into ~64 KiB frames to decouple frame size
+    // from its configured `chunkSize`) is never rejected.
+    let mut decomp = decompressor_with_limit(format, MAX_OUTPUT_PER_CALL);
     let mut out: Vec<u8> = Vec::new();
     let mut written = 0u64;
     let mut stream = body.into_data_stream();
@@ -580,10 +585,11 @@ pub(crate) async fn upload(
     };
 
     let mut sink = state.storage.write_stream(&path, mode).await?;
-    // Tight per-call output budget: a hostile client sending many small
-    // frames in one body chunk must be rejected before it can inflate
-    // memory (each frame is capped at MAX_FRAME_OUTPUT already).
-    let mut decomp = decompressor_with_limit(format, MAX_FRAME_OUTPUT);
+    // Per-frame safety is enforced by the decompressor itself (each frame is
+    // capped at MAX_FRAME_OUTPUT); the per-CALL budget here is deliberately
+    // generous so a body chunk carrying many small frames (e.g. a client that
+    // slices each upload chunk into ~64 KiB frames) is never rejected.
+    let mut decomp = decompressor_with_limit(format, MAX_OUTPUT_PER_CALL);
     let mut out: Vec<u8> = Vec::new();
     let mut appended = 0u64;
     let mut stream = body.into_data_stream();

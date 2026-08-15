@@ -1,6 +1,6 @@
 {
   "name": "libfw-client",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "High-performance streaming file & folder transfer SDK for the browser (libfw WASM engine + File System Access API + IndexedDB resume).",
   "license": "MIT",
   "type": "module",

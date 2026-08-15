@@ -191,11 +191,16 @@ export class LibfwClient {
    *        (same-origin when empty). The engine drives all control commands
    *        and data transfer over plain HTTP (parallel `Range` downloads,
    *        tus-style chunked uploads) — no WebSocket is used.
-   * @param {number} [options.concurrency=4] max concurrently-transferring files
-   * @param {number} [options.uploadWindow=8] in-flight chunk window for a
-   *        single file's upload; independent of `concurrency`, keeps a
-   *        high-latency link saturated (raise it to reduce upload stutter;
-   *        keep within your server's connection limit, ~6 for HTTP/1.1)
+   * @param {number} [options.concurrency=4] global cap on concurrent
+   *        in-flight HTTP transfers (files and per-file chunk/range windows
+   *        combined). Every chunk upload and range download takes a shared
+   *        permit, so this is what actually bounds the engine's network
+   *        parallelism — set it to your server/browser connection budget
+   *        (e.g. 1 = strictly one transfer at a time).
+   * @param {number} [options.uploadWindow=8] per-file scheduling window for a
+   *        single file's upload: keeps that file's read/compress pipeline
+   *        full on high-latency links, but the TOTAL in-flight requests never
+   *        exceed `concurrency`
    * @param {number} [options.downloadWindow=4] in-flight byte-range window
    *        for a single file's download. Large files are fetched as
    *        `downloadWindow` concurrent `Range` GETs (tus-style parallel
@@ -209,6 +214,9 @@ export class LibfwClient {
    *        SDK still receives data strictly in order.
    * @param {boolean} [options.compress=true] negotiate zrip compression
    * @param {number} [options.chunkSize=2097152] upload chunk size in bytes
+   *        (each chunk is split into many small ~64 KiB compressed frames, so
+   *        any value works; larger = fewer, bigger POST requests — bounded
+   *        only by the server's upload limit and client memory)
    * @param {number} [options.maxRetries=3] retries per chunk/file before failing
    * @param {number} [options.baseRetryDelayMs=500] initial backoff (ms)
    * @param {number} [options.maxRetryDelayMs=30000] backoff ceiling (ms)

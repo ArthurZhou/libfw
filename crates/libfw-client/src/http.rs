@@ -4,11 +4,15 @@
 //! the WASM engine never allocates more than a bounded read buffer per
 //! transfer.
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use js_sys::Reflect;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Headers, Request, RequestInit, Response};
+use web_sys::{Headers, Request, RequestInit, Response, XmlHttpRequest, XmlHttpRequestEventTarget};
 
 use crate::error::{js_value_string, LibfwError};
 
@@ -118,6 +122,207 @@ where
         }
     }
     Ok(())
+}
+
+/// POST `body` to `url` via `XMLHttpRequest`, resolving with the HTTP status.
+///
+/// `fetch` cannot observe upload progress, so a slow-but-active upload on a
+/// low-bandwidth link would be killed by a wall-clock timeout. XHR exposes
+/// `upload.onprogress`, which lets us implement a **no-progress** timeout: a
+/// rolling deadline that is pushed forward on every upload/response progress
+/// tick, and only a transfer that has stalled for `timeout_ms` (nothing
+/// moving) is aborted.
+///
+/// `header_pairs` is copied onto the XHR (XHR cannot consume a `Headers`
+/// object). The promise resolves with the HTTP status (u16 as f64) and
+/// rejects on network error or no-progress timeout.
+pub fn xhr_post(
+    url: &str,
+    header_pairs: &[(String, String)],
+    body: &[u8],
+    timeout_ms: u32,
+) -> Result<js_sys::Promise, LibfwError> {
+    let xhr = XmlHttpRequest::new()
+        .map_err(|e| LibfwError::Js(format!("XmlHttpRequest::new failed: {e:?}")))?;
+    xhr.open_with_async("POST", url, true)
+        .map_err(|e| LibfwError::Js(format!("xhr open failed: {e:?}")))?;
+    for (name, value) in header_pairs {
+        xhr.set_request_header(name, value)
+            .map_err(|e| LibfwError::Js(format!("xhr set_request_header failed: {e:?}")))?;
+    }
+    let window = web_sys::window()
+        .ok_or_else(|| LibfwError::Js("no window available".into()))?;
+    let upload = xhr
+        .upload()
+        .map_err(|e| LibfwError::Js(format!("xhr.upload() failed: {e:?}")))?;
+
+    // Rolling deadline (ms epoch). Anything that moves data refreshes it.
+    let deadline: Rc<Cell<f64>> = Rc::new(Cell::new(js_sys::Date::now()));
+    // True once the promise has settled (resolve or reject) — guards against
+    // double-settling from racing event handlers / the watchdog.
+    let finished: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let watchdog_id: Rc<Cell<i32>> = Rc::new(Cell::new(0));
+    // All event closures must stay alive until the request settles; the
+    // settle path clears this to release them (no per-chunk leaks).
+    let holders: Rc<RefCell<Vec<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        let xhr = xhr.clone();
+        let window = window.clone();
+        let deadline = deadline.clone();
+        let finished = finished.clone();
+        let watchdog_id = watchdog_id.clone();
+        let holders = holders.clone();
+        let resolve = resolve.clone();
+        let reject = reject.clone();
+        let timeout_ms = timeout_ms;
+
+        // No-progress watchdog: polls the deadline every 500 ms and aborts +
+        // rejects when nothing has moved for `timeout_ms`.
+        let watchdog = {
+            let xhr = xhr.clone();
+            let window = window.clone();
+            let deadline = deadline.clone();
+            let finished = finished.clone();
+            let watchdog_id = watchdog_id.clone();
+            let reject = reject.clone();
+            let holders = holders.clone();
+            Closure::wrap(Box::new(move || {
+                if finished.get() {
+                    return;
+                }
+                if js_sys::Date::now() - deadline.get() > timeout_ms as f64 {
+                    finished.set(true);
+                    window.clear_interval_with_handle(watchdog_id.get());
+                    let _ = xhr.abort();
+                    let _ = reject.call1(
+                        &JsValue::NULL,
+                        &JsValue::from_str(&format!(
+                            "libfw upload stalled for {timeout_ms}ms (no progress)"
+                        )),
+                    );
+                    holders.borrow_mut().clear();
+                }
+            }) as Box<dyn FnMut()>)
+        };
+        let id = match window.set_interval_with_callback_and_timeout_and_arguments_0(
+            watchdog.as_ref().unchecked_ref(),
+            500,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = reject.call1(
+                    &JsValue::NULL,
+                    &JsValue::from_str(&format!("libfw setInterval failed: {e:?}")),
+                );
+                return;
+            }
+        };
+        watchdog_id.set(id);
+        holders.borrow_mut().push(watchdog);
+
+        // Upload body progress: any movement refreshes the deadline.
+        let on_upload_progress = {
+            let deadline = deadline.clone();
+            Closure::wrap(Box::new(move || {
+                deadline.set(js_sys::Date::now());
+            }) as Box<dyn FnMut()>)
+        };
+        let upload_target: &XmlHttpRequestEventTarget = upload.unchecked_ref();
+        upload_target.set_onprogress(Some(on_upload_progress.as_ref().unchecked_ref()));
+        holders.borrow_mut().push(on_upload_progress);
+
+        // Response phase: refresh the deadline once headers/body start
+        // arriving, and settle when the request is DONE.
+        let on_readystatechange = {
+            let xhr = xhr.clone();
+            let window = window.clone();
+            let deadline = deadline.clone();
+            let finished = finished.clone();
+            let watchdog_id = watchdog_id.clone();
+            let resolve = resolve.clone();
+            let reject = reject.clone();
+            let holders = holders.clone();
+            Closure::wrap(Box::new(move || {
+                if finished.get() {
+                    return;
+                }
+                let state = xhr.ready_state();
+                if state >= 2 {
+                    deadline.set(js_sys::Date::now());
+                }
+                if state == 4 {
+                    finished.set(true);
+                    window.clear_interval_with_handle(watchdog_id.get());
+                    let status = xhr.status().unwrap_or(0);
+                    if status > 0 {
+                        let _ = resolve.call1(&JsValue::NULL, &JsValue::from_f64(status as f64));
+                    } else {
+                        let _ = reject.call1(
+                            &JsValue::NULL,
+                            &JsValue::from_str("libfw upload network error (empty status)"),
+                        );
+                    }
+                    holders.borrow_mut().clear();
+                }
+            }) as Box<dyn FnMut()>)
+        };
+        xhr.set_onreadystatechange(Some(on_readystatechange.as_ref().unchecked_ref()));
+        holders.borrow_mut().push(on_readystatechange);
+
+        // Network error.
+        let on_error = {
+            let window = window.clone();
+            let finished = finished.clone();
+            let watchdog_id = watchdog_id.clone();
+            let reject = reject.clone();
+            let holders = holders.clone();
+            Closure::wrap(Box::new(move || {
+                if finished.get() {
+                    return;
+                }
+                finished.set(true);
+                window.clear_interval_with_handle(watchdog_id.get());
+                let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("libfw upload network error"));
+                holders.borrow_mut().clear();
+            }) as Box<dyn FnMut()>)
+        };
+        let xhr_target: &XmlHttpRequestEventTarget = xhr.unchecked_ref();
+        xhr_target.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+        holders.borrow_mut().push(on_error);
+
+        // Abort (only reachable when the watchdog already rejected, thanks to
+        // the `finished` guard).
+        let on_abort = {
+            let window = window.clone();
+            let finished = finished.clone();
+            let watchdog_id = watchdog_id.clone();
+            let reject = reject.clone();
+            let holders = holders.clone();
+            Closure::wrap(Box::new(move || {
+                if finished.get() {
+                    return;
+                }
+                finished.set(true);
+                window.clear_interval_with_handle(watchdog_id.get());
+                let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("libfw upload aborted"));
+                holders.borrow_mut().clear();
+            }) as Box<dyn FnMut()>)
+        };
+        xhr_target.set_onabort(Some(on_abort.as_ref().unchecked_ref()));
+        holders.borrow_mut().push(on_abort);
+
+        // Fire the request (web-sys accepts the raw byte slice directly).
+        if let Err(e) = xhr.send_with_opt_u8_array(Some(body)) {
+            let _ = reject.call1(
+                &JsValue::NULL,
+                &JsValue::from_str(&format!("libfw xhr.send failed: {e:?}")),
+            );
+            holders.borrow_mut().clear();
+        }
+    });
+
+    Ok(promise)
 }
 
 /// Header map helper: `Authorization: Bearer <token>` plus the protocol

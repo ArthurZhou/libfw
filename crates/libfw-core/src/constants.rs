@@ -6,16 +6,19 @@ pub const CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 /// Constant sliding-window size for streaming (64 KiB).
 pub const STREAM_BUF_SIZE: usize = 64 * 1024;
 
-/// Maximum default concurrent connections in the WASM engine.
+/// Maximum default concurrent in-flight HTTP transfers in the WASM engine.
+///
+/// Used both as the cross-file fan-out bound and as the global permit-pool
+/// size that caps the TOTAL number of parallel chunk/range requests.
 pub const DEFAULT_CONCURRENCY: usize = 4;
 
 /// Default in-flight chunk window for a single file's upload.
 ///
-/// Kept independent of (and larger than) [`DEFAULT_CONCURRENCY`] so one file
-/// keeps many chunks in flight on high-latency links — enough to fill the
-/// bandwidth-delay product and avoid the "fill, drain, fill" stutter that a
-/// tiny window (== concurrency) causes. It also sets an upper bound that
-/// still works within browser per-origin connection limits (~6 for HTTP/1.1).
+/// A per-file streaming bound: one file schedules up to `upload_window`
+/// chunk tasks at once, each of which then acquires a global permit before
+/// sending, so the TOTAL in-flight HTTP requests never exceed
+/// [`DEFAULT_CONCURRENCY`]. The window keeps a file's read/compress pipeline
+/// saturated on high-latency links without exceeding the global cap.
 pub const DEFAULT_UPLOAD_WINDOW: usize = 8;
 
 /// Default in-flight chunk window for a single file's **download**.
