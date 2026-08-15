@@ -673,11 +673,14 @@ export class LibfwClient {
         this._fallback.buffers.set(path, buf);
         this._fallback.order.push(path);
       }
-      // A chunk whose absolute offset is at or before the last one delivered
-      // means the engine restarted this file (an internal retry re-delivers
-      // the same byte range) — drop the partial buffer so the prefix is not
-      // duplicated in the produced blob/zip.
-      if (offset <= buf.len) {
+      // A chunk whose absolute offset is BEFORE the buffered span means the
+      // engine restarted this file (an internal retry re-delivers the same
+      // byte range) — drop the partial buffer so the prefix is not duplicated
+      // in the produced blob/zip. Note: `offset === buf.len` is the NORMAL
+      // next-chunk case (chunk N ends exactly where chunk N+1 begins), so it
+      // must NOT be treated as a restart — otherwise the first chunk of every
+      // browser-mode download is silently dropped.
+      if (offset < buf.len) {
         buf.chunks = [];
         buf.len = 0;
       }
