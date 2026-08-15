@@ -39,9 +39,11 @@ use crate::error::{CompressError, DecompressError};
 use crate::{CHUNK_SIZE, STREAM_BUF_SIZE};
 
 /// Compression formats understood by libfw.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CompressionFormat {
     /// No compression; the body passes through verbatim.
+    #[serde(rename = "identity")]
     None,
     /// zstd via the [`zrip`] codec (levels -8..=4).
     Zrip,
@@ -93,6 +95,29 @@ pub const MAX_OUTPUT_PER_CALL: usize = MAX_FRAME_OUTPUT.saturating_mul(8);
 /// Default zrip compression level (Fast strategy, good for network transfer).
 pub const ZRIP_DEFAULT_LEVEL: i32 = 1;
 
+/// Lowest zrip compression level (Fast strategy; least CPU, worst ratio).
+pub const ZRIP_MIN_LEVEL: i32 = -8;
+
+/// Highest zrip compression level (bounded memory, best ratio).
+pub const ZRIP_MAX_LEVEL: i32 = 4;
+
+/// Whether `level` is an addressable zrip compression level.
+pub fn is_valid_zrip_level(level: i32) -> bool {
+    (ZRIP_MIN_LEVEL..=ZRIP_MAX_LEVEL).contains(&level)
+}
+
+/// Clamp a requested zrip level into `min..=max`.
+///
+/// Servers must never trust a client-supplied level: out-of-range requests
+/// are clamped (and the actual level echoed back on the response header),
+/// keeping the wire format honest without hard-failing older clients.
+pub fn negotiate_level(req: Option<i32>, min: i32, max: i32, default: i32) -> i32 {
+    match req {
+        None => default,
+        Some(l) => l.clamp(min, max),
+    }
+}
+
 /// Streaming compressor. Feed it bounded input chunks; it appends the
 /// compressed bytes produced so far to the provided output buffer.
 pub trait Compressor: Send {
@@ -133,9 +158,23 @@ pub trait Decompressor: Send {
 
 /// Construct a compressor for `format`.
 pub fn compressor(format: CompressionFormat) -> Result<Box<dyn Compressor>, CompressError> {
+    compressor_with_level(format, ZRIP_DEFAULT_LEVEL)
+}
+
+/// Construct a compressor for `format` at an explicit zrip level.
+///
+/// The level is only meaningful for [`CompressionFormat::Zrip`]; for
+/// [`CompressionFormat::None`] the body passes through verbatim regardless
+/// of `level`. Callers should pre-validate/clamp `level` with
+/// [`negotiate_level`] before constructing (constructors still error on
+/// out-of-range levels from zrip itself).
+pub fn compressor_with_level(
+    format: CompressionFormat,
+    level: i32,
+) -> Result<Box<dyn Compressor>, CompressError> {
     match format {
         CompressionFormat::None => Ok(Box::new(PassthroughCompressor)),
-        CompressionFormat::Zrip => Ok(Box::new(ZripCompressor::new(ZRIP_DEFAULT_LEVEL)?)),
+        CompressionFormat::Zrip => Ok(Box::new(ZripCompressor::new(level)?)),
     }
 }
 

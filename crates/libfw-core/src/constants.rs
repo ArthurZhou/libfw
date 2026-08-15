@@ -68,6 +68,14 @@ pub const DEFAULT_MAX_UPLOAD_SIZE: u64 = 100 * 1024 * 1024 * 1024;
 /// name (e.g. `zrip`). Mirrored by `Content-Encoding` when applicable.
 pub const HEADER_COMPRESS: &str = "x-libfw-compress";
 
+/// HTTP header carrying the requested zrip compression level.
+///
+/// Sent by the client on both upload and download; on download the server
+/// validates/clamps it and **echoes the actual level used** back on the same
+/// header, so a client can never assume its request was honored verbatim.
+/// Absent (older clients) → the server's default level.
+pub const HEADER_COMPRESS_LEVEL: &str = "x-libfw-compress-level";
+
 /// HTTP header carrying JSON-encoded [`FileMeta`](crate::metadata::FileMeta)
 /// for an upload or download.
 pub const HEADER_FILE_META: &str = "x-libfw-file-meta";

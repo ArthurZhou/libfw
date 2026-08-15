@@ -34,6 +34,7 @@
 //! ```
 
 pub mod auth;
+pub mod capabilities;
 pub mod claims;
 pub mod compress;
 pub mod constants;
@@ -44,8 +45,12 @@ pub mod storage;
 pub mod ws;
 
 pub use auth::{Action, AuthError, PathValidator, TokenVerifier, Validator};
+pub use capabilities::{Capabilities, CompressionCaps, IntRange, Limits, ZripLevels};
 pub use claims::{Permission, TokenClaims};
-pub use compress::{CompressionFormat, Compressor, Decompressor};
+pub use compress::{
+    CompressionFormat, Compressor, Decompressor, ZRIP_DEFAULT_LEVEL, ZRIP_MAX_LEVEL,
+    ZRIP_MIN_LEVEL, compressor_with_level, is_valid_zrip_level, negotiate_level,
+};
 pub use constants::*;
 pub use error::{CompressError, DecompressError, StorageError};
 pub use metadata::{ChunkMeta, FileMeta, TransferPlan};
