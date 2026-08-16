@@ -21,10 +21,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 zrip.workspace = true
+sha2.workspace = true
 
 # Keep the web-sys surface minimal and explicit.
 web-sys = { workspace = true, features = [
     "Window",
+    "Storage",
     "Request",
     "RequestInit",
     "Response",

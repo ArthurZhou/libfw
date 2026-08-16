@@ -11,6 +11,8 @@ use libfw_core::{
     DEFAULT_UPLOAD_WINDOW, MAX_RETRIES,
 };
 
+use crate::tune::{CompressLevel, DEFAULT_TUNE_TTL_MS};
+
 /// Default delay before the first retry (milliseconds).
 pub const DEFAULT_BASE_RETRY_MS: u32 = 500;
 /// Upper bound for exponential backoff (milliseconds).
@@ -67,6 +69,18 @@ pub struct ClientConfig {
     pub max_retry_delay_ms: u32,
     /// Per-request timeout in ms (default 60s).
     pub timeout_ms: u32,
+    /// Adaptive tuning (TCP-style ramp over real transfers). Off by default
+    /// so legacy callers behave exactly as before.
+    pub auto_tune: bool,
+    /// TTL of the persisted tuning cache (default 1h).
+    pub tune_ttl_ms: u64,
+    /// Client-side compression level policy.
+    ///
+    /// Absent config resolves to [`CompressLevel::Balanced`] (the server's
+    /// advertised default = the historical level-1 behavior), so callers
+    /// that never set it are byte-identical to pre-0.3.3. `compress: false`
+    /// still forces identity regardless of this field.
+    pub compress_level: CompressLevel,
 }
 
 impl Default for ClientConfig {
@@ -82,6 +96,9 @@ impl Default for ClientConfig {
             base_retry_delay_ms: DEFAULT_BASE_RETRY_MS,
             max_retry_delay_ms: DEFAULT_MAX_RETRY_MS,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            auto_tune: false,
+            tune_ttl_ms: DEFAULT_TUNE_TTL_MS,
+            compress_level: CompressLevel::Balanced,
         }
     }
 }
@@ -117,6 +134,22 @@ fn opt_bool(obj: &JsValue, key: &str) -> Option<bool> {
         .and_then(|v| v.as_bool())
 }
 
+/// Read an optional `compressLevel` field: a string name
+/// (`auto|fast|balanced|max`) or a numeric level.
+fn opt_compress_level(obj: &JsValue) -> Option<CompressLevel> {
+    let v = Reflect::get(obj, &JsValue::from_str("compressLevel")).ok()?;
+    if let Some(s) = v.as_string() {
+        return Some(match s.to_ascii_lowercase().as_str() {
+            "auto" => CompressLevel::Auto,
+            "fast" => CompressLevel::Fast,
+            "balanced" => CompressLevel::Balanced,
+            "max" => CompressLevel::Max,
+            _ => CompressLevel::Auto,
+        });
+    }
+    v.as_f64().map(|f| CompressLevel::Fixed(f as i32))
+}
+
 impl ClientConfig {
     /// Parse configuration from a JS object literal, e.g.
     /// `{ concurrency: 4, compress: true, chunkSize: 2097152 }`.
@@ -127,6 +160,18 @@ impl ClientConfig {
         let mut cfg = ClientConfig::default();
         if !opts.is_object() {
             return cfg;
+        }
+        // Legacy `compress: bool` compatibility: when `compressLevel` is
+        // absent, `compress: true` maps to Balanced (the old fixed level-1
+        // behavior) and `compress: false` maps to identity (the level is
+        // then unused anyway). An explicit `compressLevel` wins.
+        if let Some(level) = opt_compress_level(opts) {
+            cfg.compress_level = level;
+        } else if let Some(compress) = opt_bool(opts, "compress") {
+            cfg.compress = compress;
+            if compress {
+                cfg.compress_level = CompressLevel::Balanced;
+            }
         }
         if let Some(v) = opt_usize(opts, "concurrency") {
             if v > 0 {
@@ -167,6 +212,12 @@ impl ClientConfig {
         }
         if let Some(v) = opt_u32(opts, "timeoutMs") {
             cfg.timeout_ms = v;
+        }
+        if let Some(v) = opt_bool(opts, "autoTune") {
+            cfg.auto_tune = v;
+        }
+        if let Some(v) = opt_u64(opts, "tuneTtlMs").filter(|&v| v > 0) {
+            cfg.tune_ttl_ms = v;
         }
         cfg
     }

@@ -62,7 +62,7 @@ pub struct Semaphore {
 
 #[derive(Debug)]
 struct SemaphoreInner {
-    max: usize,
+    max: Cell<usize>,
     available: Cell<usize>,
     waiters: RefCell<VecDeque<Waker>>,
 }
@@ -73,7 +73,7 @@ impl Semaphore {
         let max = max.max(1);
         Semaphore {
             inner: Rc::new(SemaphoreInner {
-                max,
+                max: Cell::new(max),
                 available: Cell::new(max),
                 waiters: RefCell::new(VecDeque::new()),
             }),
@@ -82,8 +82,31 @@ impl Semaphore {
 
     /// Reset to a full pool (called at the start of each transfer).
     pub fn reset(&self) {
-        self.inner.available.set(self.inner.max);
+        self.inner.available.set(self.inner.max.get());
         self.inner.waiters.borrow_mut().clear();
+    }
+
+    /// Resize the pool at runtime (adaptive tuning).
+    ///
+    /// Growing adds permits immediately; shrinking clamps outstanding
+    /// availability so `available` never exceeds the new max (in-flight
+    /// permits already granted are unaffected and release back into the
+    /// smaller pool). Wakes waiters so a grow can unblock queued acquirers.
+    pub fn set_max(&self, max: usize) {
+        let max = max.max(1);
+        let inner = &self.inner;
+        let old = inner.max.get();
+        let avail = inner.available.get();
+        if max > old {
+            inner.available.set((avail + (max - old)).min(max));
+        } else {
+            inner.available.set(avail.min(max));
+        }
+        inner.max.set(max);
+        let waiters = std::mem::take(&mut *inner.waiters.borrow_mut());
+        for w in waiters {
+            w.wake();
+        }
     }
 
     /// Acquire one permit, waiting asynchronously when the pool is empty.
@@ -103,7 +126,7 @@ impl Semaphore {
 
     fn release(&self) {
         let avail = self.inner.available.get();
-        self.inner.available.set((avail + 1).min(self.inner.max));
+        self.inner.available.set((avail + 1).min(self.inner.max.get()));
         // Wake every waiter; each re-poll re-checks the pool and either
         // acquires (removed from the queue) or re-queues itself.
         let waiters = std::mem::take(&mut *self.inner.waiters.borrow_mut());
@@ -206,6 +229,12 @@ impl TaskControl {
     /// The global in-flight transfer pool (shared by every file/chunk task).
     pub fn semaphore(&self) -> &Semaphore {
         &self.semaphore
+    }
+
+    /// Resize the global pool at runtime (adaptive tuning changes the
+    /// concurrency dimension mid-transfer).
+    pub fn set_max_parallel(&self, max_parallel: usize) {
+        self.semaphore.set_max(max_parallel);
     }
 
     /// Current state.

@@ -326,8 +326,11 @@ pub fn xhr_post(
 }
 
 /// Header map helper: `Authorization: Bearer <token>` plus the protocol
-/// handshake and optional `Accept-Encoding`.
-pub fn auth_headers(token: &str, accept_zrip: bool) -> Result<Headers, LibfwError> {
+/// handshake and optional `Accept-Encoding` / zrip level.
+///
+/// `level` is only sent when `accept_zrip` is true (a level without a zrip
+/// request is meaningless — and identity responses never echo one).
+pub fn auth_headers(token: &str, accept_zrip: bool, level: Option<i32>) -> Result<Headers, LibfwError> {
     let headers = Headers::new()
         .map_err(|e| LibfwError::Js(format!("Headers::new failed: {e:?}")))?;
     headers
@@ -345,8 +348,36 @@ pub fn auth_headers(token: &str, accept_zrip: bool) -> Result<Headers, LibfwErro
         headers
             .set("Accept-Encoding", "zrip")
             .map_err(|e| LibfwError::Js(format!("set Accept-Encoding failed: {e:?}")))?;
+        if let Some(l) = level {
+            headers
+                .set(libfw_core::HEADER_COMPRESS_LEVEL, &l.to_string())
+                .map_err(|e| LibfwError::Js(format!("set compress-level header failed: {e:?}")))?;
+        }
     }
     Ok(headers)
+}
+
+/// Fetch the server's capability advertisement (`GET /capabilities`).
+///
+/// The endpoint is public by design (no credentials needed — the payload is
+/// a non-sensitive contract for adaptive clients). A 404 means a legacy
+/// server without the route; the caller decides how to fall back.
+pub async fn fetch_capabilities(
+    base_url: &str,
+    timeout_ms: u32,
+) -> Result<libfw_core::Capabilities, LibfwError> {
+    let url = format!("{}/capabilities", base_url.trim_end_matches('/'));
+    let headers = Headers::new()
+        .map_err(|e| LibfwError::Js(format!("Headers::new failed: {e:?}")))?;
+    let req = request(&url, "GET", &headers, None)?;
+    let resp = fetch(&req, timeout_ms).await?;
+    let status = resp.status();
+    if status != 200 {
+        return Err(LibfwError::Http { status, url });
+    }
+    let body = read_all(&resp, timeout_ms).await?;
+    serde_json::from_slice(&body)
+        .map_err(|e| LibfwError::Protocol(format!("bad /capabilities JSON: {e}")))
 }
 
 /// Percent-encode a virtual path for use in a URL, preserving `/`.

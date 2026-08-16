@@ -22,6 +22,8 @@ use crate::http::{auth_headers, dir_url, fetch, file_url, read_all, request, str
 use crate::js::Callbacks;
 use crate::plan::{total_bytes, FileEntry};
 use crate::state::{Semaphore, TaskControl};
+use crate::tune::{TuneHandle, now_ms};
+use crate::upload::tune_tick;
 
 /// A single file download outcome, used for resume-state bookkeeping.
 struct DownloadOutcome {
@@ -41,7 +43,7 @@ async fn list_dir(
     path: &str,
     timeout_ms: u32,
 ) -> Result<Vec<DirEntry>, LibfwError> {
-    let headers = auth_headers(token, false)?;
+    let headers = auth_headers(token, false, None)?;
     let url = dir_url(base_url, path);
     let req = request(&url, "GET", &headers, None)?;
     let resp = fetch(&req, timeout_ms).await?;
@@ -105,6 +107,9 @@ async fn sleep_ms(ms: u32) {
 /// sequential single-connection path. Both paths resume from the persisted
 /// contiguous offset and re-validate it against the server (which is the
 /// source of truth for what exists).
+// M3 tuning plumbing (tune handle + negotiated level) pushed this past the
+// 7-arg lint; grouping them would churn every call site for no gain.
+#[allow(clippy::too_many_arguments)]
 async fn download_file(
     base_url: &str,
     token: &str,
@@ -112,6 +117,8 @@ async fn download_file(
     callbacks: &Callbacks,
     control: &TaskControl,
     config: &ClientConfig,
+    tune: &TuneHandle,
+    level: i32,
 ) -> Result<DownloadOutcome, LibfwError> {
     callbacks.on_file_start(&file.path, file.size)?;
 
@@ -163,9 +170,10 @@ async fn download_file(
         control.check()?;
 
         // 2. Parallel path for large remaining transfers (tus-style).
-        if should_parallel(file.size, offset, config) {
+        let window = tune.borrow().params().download_window;
+        if should_parallel(file.size, offset, window) {
             match download_file_parallel(
-                base_url, token, file, &etag, offset, callbacks, control, config,
+                base_url, token, file, &etag, offset, callbacks, control, config, tune, level,
             )
             .await
             {
@@ -193,6 +201,9 @@ async fn download_file(
                         "retrying `{}` (attempt {attempts}): {e}",
                         file.path
                     ));
+                    if tune.borrow().enabled() {
+                        tune_tick(tune, control, control.done_bytes(), None, true);
+                    }
                     sleep_ms(config.backoff_ms(attempts)).await;
                 }
             }
@@ -201,7 +212,7 @@ async fn download_file(
 
         // 3. Sequential single-connection path (small files / tails).
         // Re-validate the offset on every (re)try via If-Range.
-        let headers = auth_headers(token, config.compress)?;
+        let headers = auth_headers(token, config.compress, Some(level))?;
         headers
             .set("Range", &format!("bytes={offset}-"))
             .map_err(|e| LibfwError::Js(format!("set Range failed: {e:?}")))?;
@@ -213,41 +224,50 @@ async fn download_file(
         let url = file_url(base_url, &file.path);
         let req = request(&url, "GET", &headers, None)?;
 
+        let t0 = now_ms();
         match fetch(&req, config.timeout_ms).await {
-            Ok(resp) => match resp.status() {
-                200 => {
-                    // Full content: the file changed (or first attempt).
-                    etag = response_etag(&resp).unwrap_or(etag);
-                    let outcome =
-                        stream_download(&resp, file, callbacks, control, 0, &etag, config.timeout_ms)
+            Ok(resp) => {
+                let rtt = now_ms() - t0;
+                match resp.status() {
+                    200 => {
+                        // Full content: the file changed (or first attempt).
+                        etag = response_etag(&resp).unwrap_or(etag);
+                        let outcome = stream_download(&resp, file, callbacks, control, 0, &etag, config.timeout_ms)
                             .await?;
-                    return finish_download(file, callbacks, etag, outcome).await;
-                }
-                206 => {
-                    if etag.is_empty() {
-                        etag = response_etag(&resp).unwrap_or_default();
+                        if tune.borrow().enabled() {
+                            tune_tick(tune, control, control.done_bytes(), Some(rtt), false);
+                        }
+                        return finish_download(file, callbacks, etag, outcome).await;
                     }
-                    let start = content_range_start(&resp).unwrap_or(offset);
-                    let outcome = stream_download(
-                        &resp,
-                        file,
-                        callbacks,
-                        control,
-                        start,
-                        &etag,
-                        config.timeout_ms,
-                    )
-                    .await?;
-                    return finish_download(file, callbacks, etag, outcome).await;
+                    206 => {
+                        if etag.is_empty() {
+                            etag = response_etag(&resp).unwrap_or_default();
+                        }
+                        let start = content_range_start(&resp).unwrap_or(offset);
+                        let outcome = stream_download(
+                            &resp,
+                            file,
+                            callbacks,
+                            control,
+                            start,
+                            &etag,
+                            config.timeout_ms,
+                        )
+                        .await?;
+                        if tune.borrow().enabled() {
+                            tune_tick(tune, control, control.done_bytes(), Some(rtt), false);
+                        }
+                        return finish_download(file, callbacks, etag, outcome).await;
+                    }
+                    416 => {
+                        // Offset beyond EOF → the file shrank; restart cleanly.
+                        offset = 0;
+                        attempts = 0;
+                        continue;
+                    }
+                    code => return Err(LibfwError::Http { status: code, url }),
                 }
-                416 => {
-                    // Offset beyond EOF → the file shrank; restart cleanly.
-                    offset = 0;
-                    attempts = 0;
-                    continue;
-                }
-                code => return Err(LibfwError::Http { status: code, url }),
-            },
+            }
             Err(e) => {
                 // Network failure → exponential backoff and retry.
                 if attempts >= config.max_retries {
@@ -258,6 +278,9 @@ async fn download_file(
                     "retrying `{}` (attempt {attempts}): {e}",
                     file.path
                 ));
+                if tune.borrow().enabled() {
+                    tune_tick(tune, control, control.done_bytes(), None, true);
+                }
                 sleep_ms(config.backoff_ms(attempts)).await;
             }
         }
@@ -269,8 +292,8 @@ async fn download_file(
 /// Requires a per-file window > 1 and enough remaining bytes that the extra
 /// per-request overhead pays off. Small files (and the tail of a large one)
 /// stay on the sequential single-connection path.
-fn should_parallel(size: u64, resume_offset: u64, config: &ClientConfig) -> bool {
-    config.download_window > 1
+fn should_parallel(size: u64, resume_offset: u64, window: usize) -> bool {
+    window > 1
         && size >= MIN_PARALLEL_DOWNLOAD_BYTES
         && size.saturating_sub(resume_offset) >= MIN_PARALLEL_DOWNLOAD_BYTES
 }
@@ -317,7 +340,7 @@ async fn fetch_meta(
     path: &str,
     timeout_ms: u32,
 ) -> Result<(String, u64), LibfwError> {
-    let headers = auth_headers(token, false)?;
+    let headers = auth_headers(token, false, None)?;
     let url = file_url(base_url, path);
     let req = request(&url, "HEAD", &headers, None)?;
     let resp = fetch(&req, timeout_ms).await?;
@@ -348,7 +371,8 @@ async fn download_chunk_with_retry(
     callbacks: &Callbacks,
     control: &TaskControl,
     config: &ClientConfig,
-) -> Result<Vec<u8>, LibfwError> {
+    level: i32,
+) -> Result<(Vec<u8>, f64), LibfwError> {
     let mut attempts = 0u32;
     loop {
         control.wait_ready().await?;
@@ -361,12 +385,13 @@ async fn download_chunk_with_retry(
             start,
             end,
             config.compress,
+            Some(level),
             config.timeout_ms,
             control.semaphore(),
         )
         .await
         {
-            Ok(data) => {
+            Ok((data, rtt)) => {
                 if data.len() as u64 != end - start {
                     return Err(LibfwError::Protocol(format!(
                         "chunk {start}..{end} of `{path}` yielded {} bytes, expected {}",
@@ -374,7 +399,7 @@ async fn download_chunk_with_retry(
                         end - start
                     )));
                 }
-                return Ok(data);
+                return Ok((data, rtt));
             }
             Err(e) if is_restart_err(&e) => return Err(e),
             Err(e) => {
@@ -392,7 +417,8 @@ async fn download_chunk_with_retry(
 }
 
 /// A single `GET` with `Range: bytes=start-(end-1)`, decompressing the
-/// response body into one `Vec<u8>`.
+/// response body into one `Vec<u8>`. Returns the chunk plus its TTFB (ms)
+/// for the tuning engine's RTT EWMA.
 ///
 /// `semaphore` is the engine-wide in-flight HTTP pool (sized by
 /// `concurrency`): every range GET takes a permit so `concurrency` bounds
@@ -405,10 +431,11 @@ async fn download_chunk_once(
     start: u64,
     end: u64,
     compress: bool,
+    level: Option<i32>,
     timeout_ms: u32,
     semaphore: &Semaphore,
-) -> Result<Vec<u8>, LibfwError> {
-    let headers = auth_headers(token, compress)?;
+) -> Result<(Vec<u8>, f64), LibfwError> {
+    let headers = auth_headers(token, compress, level)?;
     let last = end.saturating_sub(1);
     headers
         .set("Range", &format!("bytes={start}-{last}"))
@@ -422,9 +449,11 @@ async fn download_chunk_once(
     let req = request(&url, "GET", &headers, None)?;
     // Hold the permit for the whole request so the global cap is respected.
     let _permit = semaphore.acquire().await;
+    let t0 = now_ms();
     let resp = fetch(&req, timeout_ms).await?;
+    let rtt = now_ms() - t0;
     match resp.status() {
-        206 => collect_chunk(&resp, timeout_ms).await,
+        206 => Ok((collect_chunk(&resp, timeout_ms).await?, rtt)),
         // Full body despite a Range + If-Range → the file changed; 416 → it
         // shrank. Both mean "restart from byte 0" (handled by the caller).
         code => Err(LibfwError::Http {
@@ -513,6 +542,8 @@ async fn download_file_parallel(
     callbacks: &Callbacks,
     control: &TaskControl,
     config: &ClientConfig,
+    tune: &TuneHandle,
+    level: i32,
 ) -> Result<(String, DownloadOutcome), LibfwError> {
     let (meta_etag, size) = fetch_meta(base_url, token, &file.path, config.timeout_ms).await?;
     if size == 0 {
@@ -539,10 +570,13 @@ async fn download_file_parallel(
         control.report_progress_if(callbacks)?;
     }
 
-    let window = config.download_window.max(1);
+    // Live parameter reads: the tuning engine may have changed the window or
+    // chunk size since this file's transfer began.
+    let window = tune.borrow().params().download_window.max(1);
+    let chunk_size = tune.borrow().params().download_chunk_size.max(1);
 
     // Plan chunks from the resume point to EOF.
-    let chunks = parallel_chunks(start, size, config.download_chunk_size);
+    let chunks = parallel_chunks(start, size, chunk_size);
 
     // Give the stream its own ETag copy so `meta_etag` stays free for the
     // return value (the stream borrows the closure until it is dropped).
@@ -556,11 +590,11 @@ async fn download_file_parallel(
         let control = control.clone();
         let config = config.clone();
         async move {
-            let data = download_chunk_with_retry(
-                &base_url, &token, &path, &etag, s, e, &callbacks, &control, &config,
+            let (data, rtt) = download_chunk_with_retry(
+                &base_url, &token, &path, &etag, s, e, &callbacks, &control, &config, level,
             )
             .await?;
-            Ok::<_, LibfwError>((s, data))
+            Ok::<_, LibfwError>((s, data, rtt))
         }
     }))
     .buffer_unordered(window);
@@ -574,7 +608,7 @@ async fn download_file_parallel(
     while let Some(res) = stream.next().await {
         control.wait_ready().await?;
         control.check()?;
-        let (chunk_start, data) = res?;
+        let (chunk_start, data, rtt) = res?;
         pending.insert(chunk_start, data);
         // Emit strictly in order (append-safe for the SDK's writable).
         while let Some(data) = pending.remove(&contiguous) {
@@ -590,6 +624,11 @@ async fn download_file_parallel(
                 let _ = callbacks
                     .save_state("download", &file.path, &resume_state_obj(&meta_etag, contiguous))
                     .await;
+            }
+            // Feed the tuning engine: one measurement per emitted chunk
+            // (coalesced into 1 s windows by the engine).
+            if tune.borrow().enabled() {
+                tune_tick(tune, control, control.done_bytes(), Some(rtt), false);
             }
         }
     }
@@ -644,22 +683,15 @@ mod tests {
 
     #[test]
     fn should_parallel_requires_size_and_window() {
-        let mut cfg = ClientConfig {
-            download_window: 4,
-            download_chunk_size: 256 * 1024,
-            ..ClientConfig::default()
-        };
         // Large file, fresh → parallel.
-        assert!(should_parallel(10 * 1024 * 1024, 0, &cfg));
+        assert!(should_parallel(10 * 1024 * 1024, 0, 4));
         // Window of 1 → sequential.
-        cfg.download_window = 1;
-        assert!(!should_parallel(10 * 1024 * 1024, 0, &cfg));
-        cfg.download_window = 4;
+        assert!(!should_parallel(10 * 1024 * 1024, 0, 1));
         // Small file → sequential.
-        assert!(!should_parallel(64 * 1024, 0, &cfg));
+        assert!(!should_parallel(64 * 1024, 0, 4));
         // Large file, only a tiny tail left → sequential (avoid per-request
         // overhead on the last few bytes).
-        assert!(!should_parallel(10 * 1024 * 1024, 10 * 1024 * 1024 - 1024, &cfg));
+        assert!(!should_parallel(10 * 1024 * 1024, 10 * 1024 * 1024 - 1024, 4));
     }
 
     #[test]
@@ -844,6 +876,9 @@ async fn finish_download(
 }
 
 /// Download an entire folder (or the root when `path` is empty).
+// M3 tuning plumbing (tune handle + negotiated level) pushed this past the
+// 7-arg lint; grouping them would churn every call site for no gain.
+#[allow(clippy::too_many_arguments)]
 pub async fn download_folder(
     base_url: &str,
     token: &str,
@@ -851,6 +886,8 @@ pub async fn download_folder(
     callbacks: &Callbacks,
     control: &TaskControl,
     config: &ClientConfig,
+    tune: &TuneHandle,
+    level: i32,
 ) -> Result<u64, LibfwError> {
     let files = collect_files(base_url, token, path, config.timeout_ms).await?;
     let total = total_bytes(&files);
@@ -863,12 +900,26 @@ pub async fn download_folder(
         let callbacks = callbacks.clone();
         let control = control.clone();
         let config = config.clone();
-        async move { download_file(&base_url, &token, &file, &callbacks, &control, &config).await }
+        let tune = tune.clone();
+        async move {
+            download_file(
+                &base_url, &token, &file, &callbacks, &control, &config, &tune, level,
+            )
+            .await
+        }
     }))
-    .buffer_unordered(config.concurrency);
+    .buffer_unordered(tune.borrow().params().concurrency);
 
     while let Some(result) = stream.next().await {
-        result?;
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                if tune.borrow().enabled() {
+                    tune_tick(tune, control, control.done_bytes(), None, true);
+                }
+                return Err(e);
+            }
+        }
         // Report progress from the shared control block so pause/resume and
         // the onProgress events stay consistent (one source of truth).
         callbacks.on_progress(control.done_bytes(), control.total_bytes())?;
@@ -877,6 +928,9 @@ pub async fn download_folder(
 }
 
 /// Download a single file at `path` (size/etag discovered from the server).
+// M3 tuning plumbing (tune handle + negotiated level) pushed this past the
+// 7-arg lint; grouping them would churn every call site for no gain.
+#[allow(clippy::too_many_arguments)]
 pub async fn download_single(
     base_url: &str,
     token: &str,
@@ -884,6 +938,8 @@ pub async fn download_single(
     callbacks: &Callbacks,
     control: &TaskControl,
     config: &ClientConfig,
+    tune: &TuneHandle,
+    level: i32,
 ) -> Result<u64, LibfwError> {
     // Discover the authoritative size/etag via HEAD (the server is the
     // source of truth), so a large single file can use the tus-style
@@ -899,7 +955,8 @@ pub async fn download_single(
         size,
         mtime: 0,
     };
-    let outcome = download_file(base_url, token, &file, callbacks, control, config).await?;
+    let outcome =
+        download_file(base_url, token, &file, callbacks, control, config, tune, level).await?;
     // Return the ABSOLUTE byte count (the final offset), consistent with
     // `download_folder`, rather than this response's delta (which would be
     // misleading on a resumed download).

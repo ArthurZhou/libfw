@@ -36,17 +36,23 @@ mod http;
 mod js;
 mod plan;
 mod state;
+mod tune;
 mod upload;
 
 pub use config::{backoff_ms, ClientConfig};
 pub use error::LibfwError;
 pub use plan::FileEntry;
+pub use tune::{
+    CompressLevel, LocalStore, TuneCache, TuneEvent, TuneHandle, TuneParams, TunePhase,
+    TuneStats, TuneStore, TransferKind, tune_key,
+};
 
 use js_sys::Reflect;
 use wasm_bindgen::prelude::*;
 
 use crate::js::Callbacks;
 use crate::state::{TaskControl, TaskState};
+use crate::tune::{TuningEngine, now_ms};
 
 /// WASM engine facade. Construct via `new LibfwClient(options)`.
 #[wasm_bindgen]
@@ -54,14 +60,15 @@ pub struct LibfwClient {
     config: ClientConfig,
     callbacks: Callbacks,
     control: TaskControl,
+    tune: TuneHandle,
 }
 
 #[wasm_bindgen]
 impl LibfwClient {
     /// Create an engine. `options` may include:
     /// `{ concurrency, uploadWindow, downloadWindow, downloadChunkSize,
-    /// compress, chunkSize, maxRetries, baseRetryDelayMs, maxRetryDelayMs,
-    /// timeoutMs }`.
+    /// compress, compressLevel, chunkSize, maxRetries, baseRetryDelayMs,
+    /// maxRetryDelayMs, timeoutMs, autoTune, tuneTtlMs }`.
     #[wasm_bindgen(constructor)]
     pub fn new(opts: JsValue) -> LibfwClient {
         let config = ClientConfig::from_js(&opts);
@@ -71,12 +78,29 @@ impl LibfwClient {
             // The global in-flight HTTP pool is sized by `concurrency`, so it
             // bounds total network parallelism (not just concurrent files).
             control: TaskControl::with_max_parallel(config.concurrency.max(1)),
+            tune: std::rc::Rc::new(std::cell::RefCell::new(TuningEngine::new(
+                config.auto_tune,
+                config.tune_ttl_ms,
+                config.compress_level,
+            ))),
         }
     }
 
     /// Install the JS callbacks object (required before any transfer).
     pub fn set_callbacks(&self, callbacks: JsValue) {
         self.callbacks.set(callbacks);
+    }
+
+    /// Install an `onTuning(phase, params, stats)` callback, invoked on
+    /// every tuning state change (phase transitions and window evaluations).
+    pub fn set_tune_callback(&self, cb: JsValue) {
+        let f = cb.dyn_ref::<js_sys::Function>().cloned();
+        self.tune.borrow_mut().set_on_tuning(f);
+    }
+
+    /// Snapshot the tuning engine: `{ phase, params, stats, capsHash }`.
+    pub fn tune_state(&self) -> JsValue {
+        self.tune.borrow().state_js()
     }
 
     /// Download every file under the virtual `dirPath` (empty = root).
@@ -89,10 +113,22 @@ impl LibfwClient {
         let config = self.config.clone();
         let callbacks = self.callbacks.clone();
         let control = self.control.clone();
+        let tune = self.tune.clone();
 
         wasm_bindgen_futures::future_to_promise(async move {
             control.reset();
             control.begin(TaskState::Downloading);
+            let level = match prepare_transfer(
+                &base_url, &config, &tune, &control, TransferKind::Download,
+            )
+            .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    control.fail();
+                    return Err(e.to_js());
+                }
+            };
             match download::download_folder(
                 &base_url,
                 &token,
@@ -100,14 +136,18 @@ impl LibfwClient {
                 &callbacks,
                 &control,
                 &config,
+                &tune,
+                level,
             )
             .await
             {
                 Ok(total) => {
+                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), true);
                     control.complete();
                     Ok(JsValue::from_f64(total as f64))
                 }
                 Err(e) => {
+                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), false);
                     control.fail();
                     Err(e.to_js())
                 }
@@ -125,10 +165,22 @@ impl LibfwClient {
         let config = self.config.clone();
         let callbacks = self.callbacks.clone();
         let control = self.control.clone();
+        let tune = self.tune.clone();
 
         wasm_bindgen_futures::future_to_promise(async move {
             control.reset();
             control.begin(TaskState::Downloading);
+            let level = match prepare_transfer(
+                &base_url, &config, &tune, &control, TransferKind::Download,
+            )
+            .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    control.fail();
+                    return Err(e.to_js());
+                }
+            };
             match download::download_single(
                 &base_url,
                 &token,
@@ -136,14 +188,18 @@ impl LibfwClient {
                 &callbacks,
                 &control,
                 &config,
+                &tune,
+                level,
             )
             .await
             {
                 Ok(total) => {
+                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), true);
                     control.complete();
                     Ok(JsValue::from_f64(total as f64))
                 }
                 Err(e) => {
+                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), false);
                     control.fail();
                     Err(e.to_js())
                 }
@@ -160,16 +216,30 @@ impl LibfwClient {
         let config = self.config.clone();
         let callbacks = self.callbacks.clone();
         let control = self.control.clone();
+        let tune = self.tune.clone();
 
         wasm_bindgen_futures::future_to_promise(async move {
             control.reset();
             control.begin(TaskState::Uploading);
-            match upload::upload(&base_url, &token, &callbacks, &control, &config).await {
+            let _level = match prepare_transfer(
+                &base_url, &config, &tune, &control, TransferKind::Upload,
+            )
+            .await
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    control.fail();
+                    return Err(e.to_js());
+                }
+            };
+            match upload::upload(&base_url, &token, &callbacks, &control, &config, &tune).await {
                 Ok(total) => {
+                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), true);
                     control.complete();
                     Ok(JsValue::from_f64(total as f64))
                 }
                 Err(e) => {
+                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), false);
                     control.fail();
                     Err(e.to_js())
                 }
@@ -225,6 +295,55 @@ pub fn js_option_string(obj: &JsValue, key: &str) -> Option<String> {
     Reflect::get(obj, &JsValue::from_str(key))
         .ok()
         .and_then(|v| v.as_string())
+}
+
+/// Shared transfer preamble.
+///
+/// 1. Fetch `/capabilities` when auto-tuning (a 404 means a legacy server —
+///    tuning is disabled for this client's lifetime and defaults are used).
+/// 2. Seed the tuning engine (cache reuse → Settled, else Ramping from the
+///    advertised minimums), returning the starting parameter table.
+/// 3. Apply the starting concurrency to the global permit pool.
+///
+/// Returns the resolved download compression level.
+async fn prepare_transfer(
+    base_url: &str,
+    config: &ClientConfig,
+    tune: &TuneHandle,
+    control: &TaskControl,
+    direction: TransferKind,
+) -> Result<i32, LibfwError> {
+    let caps = if config.auto_tune {
+        match http::fetch_capabilities(base_url, config.timeout_ms).await {
+            Ok(c) => c,
+            Err(LibfwError::Http { status: 404, .. }) => {
+                // Legacy server without the /capabilities route: no tuning.
+                tune.borrow_mut().set_enabled(false);
+                libfw_core::Capabilities::default()
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        libfw_core::Capabilities::default()
+    };
+
+    let level = tune::resolve_level(config.compress_level, &caps);
+    let static_params = TuneParams::from_config(
+        config.concurrency,
+        config.upload_window,
+        config.download_window,
+        config.chunk_size,
+        config.download_chunk_size,
+        level,
+        &caps,
+    );
+    let params = {
+        let mut t = tune.borrow_mut();
+        t.set_direction(direction);
+        t.begin_transfer(base_url, &caps, &LocalStore, now_ms(), &static_params)
+    };
+    control.set_max_parallel(params.concurrency);
+    Ok(params.compress_level)
 }
 
 #[cfg(test)]

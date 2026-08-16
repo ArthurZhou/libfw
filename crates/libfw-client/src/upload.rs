@@ -7,7 +7,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
 use futures::StreamExt;
-use libfw_core::compress::{compressor, CompressionFormat};
+use libfw_core::compress::{CompressionFormat, compressor_with_level};
 use libfw_core::metadata::encode_file_meta_header;
 use libfw_core::{
     HEADER_COMPRESS, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION,
@@ -20,6 +20,22 @@ use crate::http::{auth_headers, fetch, file_url, read_all, request, xhr_post};
 use crate::js::Callbacks;
 use crate::plan::{chunk_bounds, total_bytes, FileEntry};
 use crate::state::{Semaphore, TaskControl};
+use crate::tune::{LEVEL_SAMPLE_SIZE, TuneEvent, TuneHandle, now_ms};
+
+/// Feed one tuning sample and apply any emitted event (semaphore resize).
+pub(crate) fn tune_tick(
+    tune: &TuneHandle,
+    control: &TaskControl,
+    done_bytes: u64,
+    rtt_ms: Option<f64>,
+    error: bool,
+) -> Option<TuneEvent> {
+    let event = tune.borrow_mut().tick(now_ms(), done_bytes, rtt_ms, error);
+    if let Some(ev) = &event {
+        control.set_max_parallel(ev.params.concurrency);
+    }
+    event
+}
 
 /// Sleep for `ms` milliseconds on the JS event loop (shared with download).
 pub(crate) async fn sleep_ms(ms: u32) {
@@ -129,7 +145,7 @@ async fn probe_session(
     session: &str,
     timeout_ms: u32,
 ) -> Result<Option<Vec<(u64, u64)>>, LibfwError> {
-    let headers = auth_headers(token, false)?;
+    let headers = auth_headers(token, false, None)?;
     headers
         .set(HEADER_OFFSET, "0")
         .map_err(|e| LibfwError::Js(format!("set offset header failed: {e:?}")))?;
@@ -217,6 +233,8 @@ fn missing_ranges(start: u64, end: u64, received: &[(u64, u64)]) -> Vec<(u64, u6
 }
 
 /// Read, compress and POST one chunk with per-chunk retry + backoff.
+///
+/// `level` is the negotiated zrip level (only used when `compress` is true).
 async fn upload_one_chunk(
     base_url: &str,
     token: &str,
@@ -227,6 +245,8 @@ async fn upload_one_chunk(
     start: u64,
     end: u64,
     session: &str,
+    compress: bool,
+    level: i32,
 ) -> Result<u64, LibfwError> {
     control.wait_ready().await?;
     control.check()?;
@@ -248,8 +268,8 @@ async fn upload_one_chunk(
     // keeps the frame size independent of the configured `chunkSize` — a
     // larger `chunkSize` then just means more frames per request instead of a
     // frame the server would reject.
-    let payload: Vec<u8> = if config.compress {
-        let mut enc = compressor(CompressionFormat::Zrip)
+    let payload: Vec<u8> = if compress {
+        let mut enc = compressor_with_level(CompressionFormat::Zrip, level)
             .map_err(|e| LibfwError::Compress(e.to_string()))?;
         let mut out = Vec::with_capacity(raw.len());
         for window in raw.chunks(libfw_core::STREAM_BUF_SIZE) {
@@ -273,7 +293,7 @@ async fn upload_one_chunk(
             file,
             start,
             &payload,
-            config.compress,
+            compress,
             config.timeout_ms,
             false,
             session,
@@ -377,6 +397,9 @@ async fn commit_upload(
 ///
 /// A legacy server that ignores the probe yields an empty range list → a
 /// full re-send, which is correct thanks to idempotent positional writes.
+// M3 tuning plumbing (tune handle + negotiated level) pushed this past the
+// 7-arg lint; grouping them would churn every call site for no gain.
+#[allow(clippy::too_many_arguments)]
 async fn upload_session_resumable(
     base_url: &str,
     token: &str,
@@ -384,9 +407,11 @@ async fn upload_session_resumable(
     callbacks: &Callbacks,
     control: &TaskControl,
     config: &ClientConfig,
+    tune: &TuneHandle,
+    compress: bool,
+    level: i32,
 ) -> Result<u64, LibfwError> {
     let session = session_id_for(file);
-    let window = config.upload_window.max(1);
 
     // Initial probe: bytes the server already holds (from a previous
     // interrupted attempt) are seeded into progress so a resume reflects the
@@ -406,6 +431,11 @@ async fn upload_session_resumable(
         control.wait_ready().await?;
         control.check()?;
 
+        // Live parameter reads: the tuning engine may have raised/lowered
+        // the window or chunk size since the last round.
+        let window = tune.borrow().params().upload_window.max(1);
+        let chunk_size = tune.borrow().params().chunk_size.max(1);
+
         // 1. Server is the source of truth for what it already holds. Round
         //    0 reuses the initial probe result — we never probe twice before
         //    the first send — and later rounds ask afresh.
@@ -413,7 +443,7 @@ async fn upload_session_resumable(
             received = probe_session(base_url, token, file, &session, config.timeout_ms).await?
                 .unwrap_or_default();
         }
-        let missing = aligned_missing(file, config.chunk_size, &received);
+        let missing = aligned_missing(file, chunk_size, &received);
 
         // 2. Everything already present → commit directly (a resume whose
         //    partial covers the whole file, or a converged retry). A commit
@@ -457,15 +487,18 @@ async fn upload_session_resumable(
             let session = session.clone();
             async move {
                 upload_one_chunk(
-                    &base_url, &token, &file, &callbacks, &control, &config, start, end, &session,
+                    &base_url, &token, &file, &callbacks, &control, &config, start, end,
+                    &session, compress, level,
                 )
                 .await
             }
         }))
         .buffer_unordered(window);
 
+        let mut round_errors = 0u32;
         while let Some(res) = stream.next().await {
             if let Err(e) = res {
+                round_errors += 1;
                 first_error.get_or_insert(e);
             }
         }
@@ -494,7 +527,7 @@ async fn upload_session_resumable(
                     )
                     .await?
                     .unwrap_or_default();
-                    if aligned_missing(file, config.chunk_size, &received).is_empty() {
+                    if aligned_missing(file, chunk_size, &received).is_empty() {
                         commit_upload(base_url, token, file, callbacks, control, config, &session)
                             .await?;
                         break file.size.saturating_sub(initial_covered);
@@ -512,6 +545,12 @@ async fn upload_session_resumable(
                 ));
                 first_error.get_or_insert(e);
             }
+        }
+
+        // Feed the tuning engine: one measurement per round (XHR cannot
+        // expose TTFB, so no RTT sample), with this round's error count.
+        if tune.borrow().enabled() {
+            tune_tick(tune, control, control.done_bytes(), None, round_errors > 0);
         }
     };
 
@@ -569,6 +608,9 @@ fn covered_bytes(received: &[(u64, u64)]) -> u64 {
 /// partially-received session temp on the server; the next attempt probes it
 /// and retransmits only the broken/lost parts (BitTorrent-style), never the
 /// whole file.
+// M3 tuning plumbing (tune handle + negotiated level) pushed this past the
+// 7-arg lint; grouping them would churn every call site for no gain.
+#[allow(clippy::too_many_arguments)]
 async fn upload_file(
     base_url: &str,
     token: &str,
@@ -576,10 +618,14 @@ async fn upload_file(
     callbacks: &Callbacks,
     control: &TaskControl,
     config: &ClientConfig,
+    tune: &TuneHandle,
+    compress: bool,
+    level: i32,
 ) -> Result<u64, LibfwError> {
     callbacks.on_file_start(&file.path, file.size)?;
     let uploaded =
-        upload_session_resumable(base_url, token, file, callbacks, control, config).await?;
+        upload_session_resumable(base_url, token, file, callbacks, control, config, tune, compress, level)
+            .await?;
     callbacks.on_file_completed(&file.path).await?;
     Ok(uploaded)
 }
@@ -604,11 +650,39 @@ pub async fn upload(
     callbacks: &Callbacks,
     control: &TaskControl,
     config: &ClientConfig,
+    tune: &TuneHandle,
 ) -> Result<u64, LibfwError> {
     let files = callbacks.file_list().await?;
     let total = total_bytes(&files);
     control.set_total(total);
     callbacks.on_progress(0, total)?;
+
+    // Resolve the compression level once per session: `Auto` micro-benchmarks
+    // a 256 KiB sample of the first file against the advertised candidates.
+    let caps = tune.borrow().caps().unwrap_or_default();
+    let (compress, level) = if config.compress {
+        let sample = if tune.borrow().enabled() {
+            match files.first() {
+                Some(f) if f.size > 0 => {
+                    let len = (f.size as usize).min(LEVEL_SAMPLE_SIZE);
+                    callbacks
+                        .read_file(&f.path, 0, len as u64)
+                        .await
+                        .ok()
+                        .filter(|b| !b.is_empty())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let level = tune
+            .borrow_mut()
+            .upload_compress_level(&caps, sample.as_deref(), tune.borrow().stats().mbps);
+        (true, level)
+    } else {
+        (false, caps.compression.zrip_levels.default)
+    };
 
     let mut stream = futures::stream::iter(files.into_iter().map(|file| {
         let base_url = base_url.to_string();
@@ -616,13 +690,27 @@ pub async fn upload(
         let callbacks = callbacks.clone();
         let control = control.clone();
         let config = config.clone();
-        async move { upload_file(&base_url, &token, &file, &callbacks, &control, &config).await }
+        let tune = tune.clone();
+        async move {
+            upload_file(
+                &base_url, &token, &file, &callbacks, &control, &config, &tune, compress, level,
+            )
+            .await
+        }
     }))
-    .buffer_unordered(config.concurrency);
+    .buffer_unordered(tune.borrow().params().concurrency);
 
     let mut done = 0u64;
     while let Some(result) = stream.next().await {
-        done = done.saturating_add(result?);
+        match result {
+            Ok(bytes) => done = done.saturating_add(bytes),
+            Err(e) => {
+                if tune.borrow().enabled() {
+                    tune_tick(tune, control, control.done_bytes(), None, true);
+                }
+                return Err(e);
+            }
+        }
         // Single source of truth for progress is the shared control block.
         // Clamp the done figure so a rare gap-fill re-send (which re-counts a
         // few bytes) can never show a bar past 100%.
