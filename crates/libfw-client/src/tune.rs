@@ -54,7 +54,14 @@ pub const RTT_DRIFT_RE_RAMP: f64 = 0.50;
 /// Consecutive failed transfers that invalidate the cache.
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 /// Sample size for the compression-level micro-benchmark.
-pub const LEVEL_SAMPLE_SIZE: usize = 256 * 1024;
+///
+/// 64 KiB rather than 256 KiB: the benchmark runs synchronously on the WASM
+/// main thread (no worker threads available), so a large sample would block
+/// the JS event loop for a noticeable period (50 ms+) on slow devices. 64 KiB
+/// is sufficient for zstd's dictionary-learning stage to converge and gives a
+/// representative ratio without the UI stutter. The caller is expected to
+/// pass `sample[..LEVEL_SAMPLE_SIZE.min(sample.len())]`.
+pub const LEVEL_SAMPLE_SIZE: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -507,6 +514,10 @@ pub struct TuningEngine {
     dim: RampDim,
     degraded_windows: u32,
     consecutive_failures: u32,
+    /// Whether we settled from a Degraded hold (not from a full ramp).
+    /// When true, `transfer_end` skips cache persistence so a halved
+    /// parameter set is never written as the settled baseline.
+    post_degrade_settle: bool,
     /// Which direction is ramping (drives window/chunk dimension selection).
     direction: TransferKind,
     // JS callback for tuning events (SDK `onTuning`).
@@ -545,6 +556,7 @@ impl TuningEngine {
             dim: RampDim::Window,
             degraded_windows: 0,
             consecutive_failures: 0,
+            post_degrade_settle: false,
             direction: TransferKind::Download,
             on_tuning: None,
         }
@@ -656,6 +668,7 @@ impl TuningEngine {
         self.window_start_ms = now_ms;
         self.auto_level_benchmarked = false;
         self.auto_level = None;
+        self.post_degrade_settle = false;
 
         if !self.enabled {
             self.phase = TunePhase::Uninitialized;
@@ -720,11 +733,24 @@ impl TuningEngine {
                 // from the *cached* stats means the link changed → force
                 // a re-ramp. Compare against `self.stats.rtt_ms` before
                 // it is overwritten by this window's own reading.
+                //
+                // Guard: on the first window (windows_closed == 0) the EWMA
+                // equals the raw sample and has not been smoothed at all.
+                // Only accept a drift signal on window 0 when the deviation
+                // is substantial enough (> 2×) to be obviously real; for
+                // smaller drifts wait until window 1 so the EWMA has at
+                // least one alpha-blend pass before we compare.
+                let drift_ratio = if self.stats.rtt_ms > 0.0 {
+                    (new_ewma - self.stats.rtt_ms).abs() / self.stats.rtt_ms
+                } else {
+                    0.0
+                };
+                let drift_visible = drift_ratio > RTT_DRIFT_RE_RAMP
+                    && (self.windows_closed >= 1 || drift_ratio > 1.0);
                 if let Some(caps) = self.caps.as_ref().filter(|_| {
                     self.phase == TunePhase::Settled
                         && self.stats.rtt_ms > 0.0
-                        && (new_ewma - self.stats.rtt_ms).abs() / self.stats.rtt_ms
-                            > RTT_DRIFT_RE_RAMP
+                        && drift_visible
                 }) {
                     self.params = TuneParams::from_caps_mins(caps);
                     self.stats = TuneStats::default();
@@ -806,6 +832,12 @@ impl TuningEngine {
                     self.degraded_windows += 1;
                     if self.degraded_windows >= 2 {
                         self.phase = TunePhase::Settled;
+                        // Mark that we settled from a degraded hold so that
+                        // `transfer_end` does NOT persist the reduced params
+                        // as the tuned baseline — the next ramp will
+                        // re-explore from the minimums and cache only after
+                        // a full convergence.
+                        self.post_degrade_settle = true;
                     }
                 }
             }
@@ -840,7 +872,14 @@ impl TuningEngine {
         }
         if ok {
             self.consecutive_failures = 0;
-            if self.phase == TunePhase::Settled && self.windows_closed >= MIN_WINDOWS_TO_PERSIST {
+            // Only persist a genuine full-ramp settle, not a conservative
+            // post-degrade settle (which ends with halved params — persisting
+            // those would make every subsequent transfer start below the
+            // optimal point and skip the ramp entirely).
+            if self.phase == TunePhase::Settled
+                && !self.post_degrade_settle
+                && self.windows_closed >= MIN_WINDOWS_TO_PERSIST
+            {
                 self.persist(base_url, store, now_ms);
             }
         } else {
@@ -887,6 +926,10 @@ impl TuningEngine {
                     self.auto_level_benchmarked = true;
                     self.auto_level = Some(match sample {
                         Some(s) if !s.is_empty() => {
+                            // Limit the sample to LEVEL_SAMPLE_SIZE so the
+                            // synchronous benchmark does not stall the WASM
+                            // main thread for too long on large files.
+                            let s = &s[..LEVEL_SAMPLE_SIZE.min(s.len())];
                             let candidates = auto_candidates(caps);
                             let results = benchmark_levels(s, &candidates);
                             choose_auto_level(&results, s.len(), mbps.max(1.0))
@@ -1042,6 +1085,10 @@ fn next_dim(dim: RampDim) -> RampDim {
     match dim {
         RampDim::Window => RampDim::Concurrency,
         RampDim::Concurrency => RampDim::ChunkSize,
+        // ChunkSize is the terminal dimension: `ramp_action` returns
+        // `Settle` (not `AdvanceDim`) when it is at cap, so this arm is
+        // unreachable in practice. It is kept for exhaustiveness; if a new
+        // dimension is added, the compiler will force updating this function.
         RampDim::ChunkSize => RampDim::ChunkSize,
     }
 }

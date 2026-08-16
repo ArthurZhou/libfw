@@ -429,10 +429,30 @@ async fn write_at_batch(
 /// into a shared per-session temp file and do not finalize; the
 /// `x-libfw-final` (commit) request verifies the temp holds exactly
 /// `meta.size` bytes, then atomically renames it into place.
+/// Derive a short, stable owner tag from a token subject.
+///
+/// The tag is embedded in the session temp filename so that sessions belonging
+/// to different authenticated principals never collide — even if a client
+/// sends a session id it guessed or observed from another user. We use the
+/// first 16 hex chars of the SHA-256 of `sub` (64 bits of collision
+/// resistance, sufficient for this discrimination role).
+fn owner_tag(sub: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(sub.as_bytes());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(16);
+    for &b in digest.iter().take(8) {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
 async fn upload_session(
     state: &ServerState,
     path: &str,
     session: &str,
+    claims: &TokenClaims,
     meta: &FileMeta,
     format: CompressionFormat,
     final_chunk: bool,
@@ -456,9 +476,10 @@ async fn upload_session(
         WriteMode::Overwrite
     };
 
+    let owner = owner_tag(&claims.sub);
     let mut sink = state
         .storage
-        .write_stream_session(path, session, create_mode)
+        .write_stream_session(path, session, &owner, create_mode)
         .await?;
 
     // A status probe (`x-libfw-session-status`) asks "which byte ranges of
@@ -608,6 +629,7 @@ pub(crate) async fn upload(
             &state,
             &path,
             &session,
+            &claims,
             &meta,
             format,
             final_chunk,

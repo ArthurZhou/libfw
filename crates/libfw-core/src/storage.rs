@@ -105,10 +105,18 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// [`UploadSink::write_at`]; only the final (commit) request renames it
     /// into place. The first request (which creates the temp) uses `mode`
     /// for the Create/Overwrite/Resume semantics; later requests ignore it.
+    ///
+    /// `owner` is a stable, server-assigned per-token identifier (typically
+    /// a short hash of the bearer-token subject) that is embedded in the
+    /// session temp filename. This isolates sessions belonging to different
+    /// authenticated users: a client that sends a session ID it observed from
+    /// another user's upload will be routed to a different temp file and
+    /// cannot read or corrupt the other user's in-progress data.
     async fn write_stream_session(
         &self,
         path: &str,
         _session: &str,
+        _owner: &str,
         mode: WriteMode,
     ) -> Result<Box<dyn UploadSink>, StorageError> {
         // Default: single-request path is not concurrent; behave like a

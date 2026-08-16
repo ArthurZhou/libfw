@@ -47,6 +47,11 @@ pub struct TokenClaims {
 
 impl TokenClaims {
     /// Returns true if `now` (unix seconds) is past `exp`.
+    ///
+    /// Per RFC 7519 §4.1.4 the token is valid while `now < exp`; a token
+    /// whose `exp` equals the current second is already expired.  The
+    /// previous `now >= exp` was correct — this comment preserves the
+    /// intent explicitly.
     pub fn is_expired(&self, now: i64) -> bool {
         self.exp.is_some_and(|exp| now >= exp)
     }

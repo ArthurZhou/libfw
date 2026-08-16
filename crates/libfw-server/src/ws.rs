@@ -510,7 +510,20 @@ async fn run_upload(
     // same file version resumes the same shared temp on the server.
     let session = start.etag.trim_matches('"');
 
-    let mut sink = match state.storage.write_stream_session(&path, session, mode).await {
+    // Derive an owner tag so two users with the same session id do not
+    // share the same temp file (mirrors the HTTP handler's isolation).
+    let owner: String = {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(claims.sub.as_bytes());
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(16);
+        for &b in digest.iter().take(8) {
+            s.push(HEX[(b >> 4) as usize] as char);
+            s.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        s
+    };
+    let mut sink = match state.storage.write_stream_session(&path, session, &owner, mode).await {
         Ok(s) => s,
         Err(e) => {
             let _ = send_frame(socket, error_frame("storage", &e.to_string())).await;

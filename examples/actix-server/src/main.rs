@@ -325,9 +325,10 @@ async fn file_upload(
         Ok(p) => p,
         Err(resp) => return resp,
     };
-    if let Err(resp) = authorize(&req, &state, &path, libfw_core::auth::Action::Write) {
-        return resp;
-    }
+    let claims = match authorize(&req, &state, &path, libfw_core::auth::Action::Write) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
 
     let headers: &HeaderMap = req.headers();
     let meta_header = match headers.get(HEADER_FILE_META).and_then(|v| v.to_str().ok()) {
@@ -367,10 +368,23 @@ async fn file_upload(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     {
+        // Derive owner tag to isolate sessions per authenticated principal.
+        let owner: String = {
+            use sha2::Digest;
+            let digest = sha2::Sha256::digest(claims.sub.as_bytes());
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut s = String::with_capacity(16);
+            for &b in digest.iter().take(8) {
+                s.push(HEX[(b >> 4) as usize] as char);
+                s.push(HEX[(b & 0x0f) as usize] as char);
+            }
+            s
+        };
         return upload_session_actix(
             &state,
             &path,
             &session,
+            &owner,
             &meta,
             format,
             final_chunk,
@@ -448,6 +462,7 @@ async fn upload_session_actix(
     state: &ServerState,
     path: &str,
     session: &str,
+    owner: &str,
     meta: &FileMeta,
     format: CompressionFormat,
     final_chunk: bool,
@@ -468,7 +483,7 @@ async fn upload_session_actix(
         WriteMode::Overwrite
     };
 
-    let mut sink = match state.storage.write_stream_session(path, session, create_mode).await {
+    let mut sink = match state.storage.write_stream_session(path, session, owner, create_mode).await {
         Ok(s) => s,
         Err(StorageError::AlreadyExists(_)) => return HttpResponse::Conflict().body("exists"),
         Err(_) => return HttpResponse::InternalServerError().finish(),

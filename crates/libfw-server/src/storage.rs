@@ -38,11 +38,13 @@ impl FsStorage {
         }
     }
 
-    /// Resolve a virtual path against the root, rejecting traversal.
+    /// Resolve a virtual path against the root (pure text — no I/O).
     ///
-    /// Both textual `..` segments and symlinked path components are
-    /// rejected so a read/write can never escape the mount root through a
-    /// symlink planted inside it.
+    /// Rejects absolute paths, `..` segments and `CurDir` (`.`) other than
+    /// the root-relative segments accepted by `Component::Normal`. Symlink
+    /// checking is async and is done by the callers via
+    /// [`FsStorage::check_symlinks`] when they need it (file/dir open paths
+    /// that may traverse existing directory structure).
     fn resolve(&self, path: &str) -> Result<PathBuf, StorageError> {
         let rel = Path::new(path);
         if rel.is_absolute() {
@@ -53,20 +55,6 @@ impl FsStorage {
             match component {
                 Component::Normal(seg) => {
                     joined.push(seg);
-                    // Reject any component that is itself a symlink.
-                    match std::fs::symlink_metadata(&joined) {
-                        Ok(m) if m.file_type().is_symlink() => {
-                            return Err(StorageError::Unsupported(
-                                "path must not traverse a symlink",
-                            ))
-                        }
-                        Ok(_) => {}
-                        // A not-yet-existing component is fine (e.g. a new
-                        // upload target); it will be validated as it is
-                        // created component by component.
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(StorageError::Other(e)),
-                    }
                 }
                 Component::CurDir => {}
                 _ => {
@@ -77,6 +65,36 @@ impl FsStorage {
             }
         }
         Ok(joined)
+    }
+
+    /// Walk every component of `full` between `self.root` and the leaf,
+    /// rejecting any that is a symlink.
+    ///
+    /// Called asynchronously by the I/O methods that open existing paths so
+    /// the symlink check never blocks a tokio worker thread. New (not yet
+    /// existing) path tails are skipped — they cannot be symlinks.
+    async fn check_symlinks(&self, full: &Path) -> Result<(), StorageError> {
+        // Strip the root prefix to iterate only the virtual path components.
+        let rel = match full.strip_prefix(&self.root) {
+            Ok(r) => r,
+            Err(_) => return Ok(()), // shouldn't happen; treat as safe
+        };
+        let mut probe = self.root.clone();
+        for component in rel.components() {
+            probe.push(component);
+            match tokio::fs::symlink_metadata(&probe).await {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(StorageError::Unsupported(
+                        "path must not traverse a symlink",
+                    ))
+                }
+                Ok(_) => {}
+                // Not-yet-existing component: fine (new upload target).
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StorageError::Other(e)),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -99,6 +117,7 @@ fn file_meta_at(rel: &str, meta: &std::fs::Metadata) -> FileMeta {
 impl StorageBackend for FsStorage {
     async fn file_meta(&self, path: &str) -> Result<Option<FileMeta>, StorageError> {
         let full = self.resolve(path)?;
+        self.check_symlinks(&full).await?;
         let meta = match tokio::fs::metadata(&full).await {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -116,6 +135,7 @@ impl StorageBackend for FsStorage {
         range: RangeSpec,
     ) -> Result<Box<dyn Read + Send>, StorageError> {
         let full = self.resolve(path)?;
+        self.check_symlinks(&full).await?;
         let mut file = tokio::fs::File::open(&full)
             .await
             .map_err(|e| StorageError::Other(e))?;
@@ -138,6 +158,7 @@ impl StorageBackend for FsStorage {
         mode: WriteMode,
     ) -> Result<Box<dyn UploadSink>, StorageError> {
         let full = self.resolve(path)?;
+        self.check_symlinks(&full).await?;
         if let Some(parent) = full.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -209,32 +230,41 @@ impl StorageBackend for FsStorage {
         &self,
         path: &str,
         session: &str,
+        owner: &str,
         mode: WriteMode,
     ) -> Result<Box<dyn UploadSink>, StorageError> {
         let full = self.resolve(path)?;
+        self.check_symlinks(&full).await?;
         if let Some(parent) = full.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| StorageError::Other(e))?;
         }
-        // The session string is embedded in a temp filename, so it must never
-        // be able to inject path separators or `..` (a malicious client could
-        // otherwise write outside the mount root). Restrict to safe chars.
-        let safe: String = session
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        // Both the session id and owner tag are embedded in the temp filename,
+        // so neither must inject path separators or `..`. Restrict to safe
+        // chars (alphanumeric, `-`, `_`).
+        let sanitize = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let safe_session = sanitize(session);
+        // Embed the owner tag so that two authenticated users with the same
+        // file path and an identical (guessed/observed) session id cannot
+        // collide on the same temp file.  A short prefix of the owner hash
+        // is enough for discrimination without making filenames unwieldy.
+        let safe_owner = sanitize(&owner.chars().take(16).collect::<String>());
         let name = full
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "upload".to_string());
-        let tmp = full.with_file_name(format!(".libfw-sess-{safe}-{name}"));
+        let tmp = full.with_file_name(format!(".libfw-sess-{safe_owner}-{safe_session}-{name}"));
 
         let exists = tokio::fs::try_exists(&tmp)
             .await
@@ -313,6 +343,7 @@ impl StorageBackend for FsStorage {
         } else {
             self.resolve(path)?
         };
+        self.check_symlinks(&full).await?;
         let mut entries = Vec::new();
         let mut read_dir = tokio::fs::read_dir(&full)
             .await
@@ -357,6 +388,7 @@ impl StorageBackend for FsStorage {
 
     async fn mkdir_all(&self, path: &str) -> Result<(), StorageError> {
         let full = self.resolve(path)?;
+        self.check_symlinks(&full).await?;
         tokio::fs::create_dir_all(&full)
             .await
             .map_err(|e| StorageError::Other(e))?;
@@ -365,6 +397,7 @@ impl StorageBackend for FsStorage {
 
     async fn remove(&self, path: &str) -> Result<(), StorageError> {
         let full = self.resolve(path)?;
+        self.check_symlinks(&full).await?;
         // Use `symlink_metadata` (not `metadata`) so a symlink that appeared
         // since `resolve` checked is never followed — we refuse to remove
         // *through* it. (The check-then-use race cannot be fully closed on
@@ -413,13 +446,19 @@ impl StorageBackend for FsStorage {
                     Ok(ft) => ft,
                     Err(_) => continue,
                 };
-                if ft.is_dir() {
-                    if !ft.is_symlink() {
-                        stack.push(entry.path());
-                    }
+                // On Linux/macOS `FileType::is_dir()` and `is_symlink()` are
+                // mutually exclusive: a symlink to a directory reports
+                // `is_symlink()=true`, `is_dir()=false`. The old nested guard
+                // (`is_dir() && !is_symlink()`) was therefore always true when
+                // `is_dir()` was true, and symlink-to-directory entries were
+                // skipped by the outer `is_symlink()` check. Simplified below
+                // to make the intent unambiguous.
+                if ft.is_symlink() {
+                    // Never follow symlinks into directories.
                     continue;
                 }
-                if ft.is_symlink() {
+                if ft.is_dir() {
+                    stack.push(entry.path());
                     continue;
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
