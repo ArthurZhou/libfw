@@ -5,12 +5,15 @@
 //! as easily as into axum.
 //!
 //! Run: `cargo run -p libfw-actix-server -- <storage-dir> [port]`
+//! Then open http://127.0.0.1:8081/ for the transfer-status dashboard.
 //!
-//! Routes (all require `Authorization: Bearer <token>`):
-//!   GET  /file/{path}   download with Range/ETag/compression
-//!   HEAD /file/{path}   metadata only
-//!   POST /file/{path}   streaming upload
-//!   GET  /dir/{path}    directory listing (JSON)
+//! Routes:
+//!   GET  /                    demo dashboard (transfer status + config)
+//!   GET  /capabilities        capability advertisement (public, JSON)
+//!   GET  /file/{path}         download with Range/ETag/compression
+//!   HEAD /file/{path}         metadata only
+//!   POST /file/{path}         streaming upload
+//!   GET  /dir/{path}          directory listing (JSON)
 //!
 //! The bundled `TokenVerifier` accepts the literal token "dev-token".
 
@@ -568,17 +571,48 @@ async fn dir_list(
     state: web::Data<Arc<ServerState>>,
     path: web::Path<String>,
 ) -> HttpResponse {
-    let path = match validate_path(path.as_str()) {
+    dir_list_inner(&req, &state, path.as_str()).await
+}
+
+/// `GET /dir` — root listing (actix's `{path:.*}` does not match an empty
+/// tail, so the root needs its own route).
+async fn dir_list_root(req: HttpRequest, state: web::Data<Arc<ServerState>>) -> HttpResponse {
+    dir_list_inner(&req, &state, "").await
+}
+
+async fn dir_list_inner(
+    req: &HttpRequest,
+    state: &web::Data<Arc<ServerState>>,
+    path: &str,
+) -> HttpResponse {
+    let path = match validate_path(path) {
         Ok(p) => p,
         Err(resp) => return resp,
     };
-    if let Err(resp) = authorize(&req, &state, &path, libfw_core::auth::Action::Read) {
+    if let Err(resp) = authorize(req, state, &path, libfw_core::auth::Action::Read) {
         return resp;
     }
     match state.storage.list_dir(&path).await {
         Ok(entries) => HttpResponse::Ok().json(entries),
         Err(_) => HttpResponse::InternalServerError().finish(),
     }
+}
+
+/// `GET /capabilities` — the server's capability advertisement (public):
+/// tuning-parameter ranges, zrip level range, compression formats and the
+/// protocol version. The demo dashboard renders these as the transfer
+/// configuration panel.
+async fn capabilities(state: web::Data<Arc<ServerState>>) -> HttpResponse {
+    HttpResponse::Ok().json(state.capabilities())
+}
+
+/// `GET /` — the embedded transfer-status dashboard (vanilla JS, no build
+/// step): live upload/download progress, completion status and the
+/// `/capabilities` configuration table.
+async fn dashboard() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("text/html; charset=utf-8")
+        .body(include_str!("../index.html"))
 }
 
 // ---------------------------------------------------------------------------
@@ -629,13 +663,17 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
-            // Permissive CORS for the dev demo (HTML page is served on a
-            // different port than this API). Restrict in production.
+            // Permissive CORS for the dev demo (the dashboard is same-origin,
+            // but a page served elsewhere may also call this API). Restrict
+            // in production.
             .wrap(Cors::permissive())
             .app_data(web::Data::new(state.clone()))
+            .route("/", web::get().to(dashboard))
+            .route("/capabilities", web::get().to(capabilities))
             .route("/file/{path:.*}", web::get().to(file_download))
             .route("/file/{path:.*}", web::head().to(file_download))
             .route("/file/{path:.*}", web::post().to(file_upload))
+            .route("/dir", web::get().to(dir_list_root))
             .route("/dir/{path:.*}", web::get().to(dir_list))
     })
     .bind(addr)?

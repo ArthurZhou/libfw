@@ -13,7 +13,8 @@ crates/
   libfw-client/   WASM engine (wasm-bindgen) + JS SDK in sdk/
 examples/
   axum-server/    runnable axum file server (the libfw integration example)
-  actix-server/   runnable actix-web file server (same contracts, different framework)
+  actix-server/   runnable actix-web file server — serves a transfer-status
+                  dashboard at `/` (progress, completion, live config)
   web/            HTML demo page for the browser SDK
 sdk/              libfw-client npm package (ESM + TS types + wasm)
 ```
@@ -66,9 +67,14 @@ sdk/              libfw-client npm package (ESM + TS types + wasm)
 # axum example (storage root `data`, port 8080)
 cargo run -p axum-server -- data 8080
 
-# or actix-web (port 8081)
+# or actix-web (port 8081) — also serves a transfer-status dashboard at `/`
 cargo run -p libfw-actix-server -- data 8081
 ```
+
+The dev servers accept the token `dev-token`. Open
+<http://127.0.0.1:8081/> for the actix example's dashboard: it shows the
+`/capabilities` configuration (concurrency/window/chunk-size/zrip ranges),
+live upload & download progress (bytes, speed, ETA) and completion status.
 
 The dev servers accept the token `dev-token`:
 
@@ -239,7 +245,11 @@ the `Validator` trait yourself and pass it to `.validator(..)`.
 `FsStorage::new(root)` serves files under a directory. Uploads are streamed
 into a temp file and **atomically renamed** on commit, so an aborted upload
 never leaves a partial target behind. Paths are normalized and validated
-(`..`/absolute/NUL are rejected) to prevent traversal.
+(`..`/absolute/NUL are rejected) to prevent traversal, and every path
+component is checked asynchronously against symlinks so a planted symlink
+inside the root can never redirect a read/write outside it. Concurrent
+"session" upload temps are additionally namespaced per authenticated subject
+(see the [`x-libfw-session`](#http-protocol) isolation note).
 
 ### Custom backends
 
@@ -501,6 +511,10 @@ All routes require `Authorization: Bearer <token>`.
   out of order; `x-libfw-session-status` probes the already-received byte
   ranges, and `x-libfw-final: 1` commits (size-verified rename). Absent on a
   request → legacy sequential per-request upload.
+  **Isolation**: the server namespaces session temps per authenticated
+  subject (a SHA-256 prefix of the bearer-token `sub` is embedded in the
+  temp filename), so two users can never collide on — or read — each
+  other's in-progress upload even if they send the same session id.
 - `HEAD /file/{*path}` is the tus-style metadata probe: the client reads the
   authoritative `ETag` + `Content-Length` to plan parallel downloads and to
   validate the persisted resume offset.
