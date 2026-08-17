@@ -261,6 +261,13 @@ How it works:
 - **Outbound** — listings and metadata responses encode real paths back to
   shadows (`expose_path`), so a listed shadow can be used verbatim in a
   follow-up download/upload URL.
+- **Hierarchical composition** — a shadow also works with literal child
+  segments appended (`{dirShadow}/sub/file.txt`): `resolve_client_path`
+  decodes the longest decodable segment prefix and appends the rest, then
+  authorizes the combined real path. A directory shadow therefore covers its
+  whole subtree — uploads into not-yet-listed children, `{dirShadow}/{name}`
+  style URLs — with no per-file shadow minting. Tampered prefixes still fail
+  with `400`, and the combined path still has to pass `allowed_paths`.
 
 The root listing path (`/dir`) is the one exception: the canonical root `""`
 maps to itself. GCM shadows use a random nonce per encode (non-deterministic);

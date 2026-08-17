@@ -241,6 +241,82 @@ async fn tampered_shadow_is_400() {
     );
 }
 
+#[tokio::test]
+async fn dir_shadow_composes_with_literal_children() {
+    let state = restricted_state(); // token allows /public/
+    let app = router(state.clone());
+    let codec = EncryptedPathCodec::new(KEY);
+    let data = b"composed shadow upload".repeat(32);
+
+    // A directory shadow + literal child segments — no per-file shadow
+    // minting needed for uploads into not-yet-listed children. The whole
+    // string is not a valid shadow; `resolve_client_path` decodes the
+    // longest decodable prefix (`public/sub`) and appends the rest.
+    let dir_shadow = codec.encode("public/sub");
+    assert_ne!(dir_shadow, "public/sub");
+    let composed = format!("{dir_shadow}/deep/report.txt");
+    upload_through_shadow(&app, &composed, &data).await;
+
+    // Landed at the composed REAL path.
+    let meta = state
+        .storage
+        .file_meta("public/sub/deep/report.txt")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.size, data.len() as u64);
+
+    // Download through the same composed path.
+    let resp = app
+        .clone()
+        .oneshot(request("GET", &format!("/file/{composed}"), auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_string(resp).await.into_bytes(), data);
+
+    // A tampered shadow prefix must NOT fall through to composition:
+    // nothing decodes, so it stays a 400.
+    let mut tampered = dir_shadow.into_bytes();
+    let last = *tampered.last().unwrap();
+    *tampered.last_mut().unwrap() = if last == b'A' { b'B' } else { b'A' };
+    let tampered = String::from_utf8(tampered).unwrap();
+    let resp = app
+        .clone()
+        .oneshot(
+            request(
+                "GET",
+                &format!("/file/{tampered}/x.txt"),
+                auth_header("tok"),
+                Body::empty(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Composition cannot escape the token subtree: a valid `/etc` shadow
+    // composes fine, but the combined REAL path fails authorization.
+    let etc_shadow = codec.encode("etc");
+    let resp = app
+        .clone()
+        .oneshot(
+            request(
+                "GET",
+                &format!("/file/{etc_shadow}/passwd"),
+                auth_header("tok"),
+                Body::empty(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "composed real path outside allowed_paths must be rejected"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Dir listing helpers
 // ---------------------------------------------------------------------------

@@ -152,6 +152,19 @@ impl ServerState {
     /// authorize `action` **against the real path**, so
     /// `allowed_paths` keeps its exact pre-translation semantics.
     ///
+    /// **Hierarchical composition:** when the whole string is not a valid
+    /// shadow (e.g. a directory shadow with literal child segments
+    /// appended, `{dirShadow}/sub/file.txt`), the *longest* decodable
+    /// segment prefix is decoded and the remaining segments are appended
+    /// verbatim to the decoded real path before authorization. A directory
+    /// shadow therefore covers its whole subtree — uploads into
+    /// not-yet-listed children, downloads of freshly created files — with
+    /// no per-path shadow minting. The fallback only ever succeeds on a
+    /// prefix the codec itself accepts, so tampered or unknown shadows
+    /// still surface the original codec error (→ `400`); authorization
+    /// still runs on the combined **real** path, so `allowed_paths`
+    /// prefix semantics are unchanged.
+    ///
     /// The returned real path is safe to hand to the storage backend;
     /// it must never be echoed back to the client — responses go through
     /// [`ServerState::expose_path`].
@@ -168,7 +181,16 @@ impl ServerState {
         let real = if shadow.is_empty() {
             shadow
         } else {
-            self.path_codec.decode(&shadow)?
+            match self.path_codec.decode(&shadow) {
+                Ok(real) => real,
+                // Whole-string decode failed → try hierarchical
+                // composition (`{dirShadow}/{literal…}`); keep the
+                // original error when no prefix decodes.
+                Err(err) => match decode_compound(&*self.path_codec, &shadow) {
+                    Some(real) => real,
+                    None => return Err(PathResolveError::Codec(err)),
+                },
+            }
         };
         let real = validate_rel_path(&real).map_err(PathResolveError::Invalid)?;
         self.authorize(claims, &real, action)?;
@@ -179,6 +201,37 @@ impl ServerState {
     pub fn expose_path(&self, real: &str) -> String {
         self.path_codec.encode(real)
     }
+}
+
+/// Decode the **longest** decodable segment prefix of `shadow` and append
+/// the trailing literal segments to the decoded real path.
+///
+/// This is what gives shadow paths hierarchical composition: a shadow for
+/// `docs` used as `{shadow}/a.txt` resolves to `docs/a.txt`, so a single
+/// directory shadow covers its whole subtree. The search is
+/// longest-prefix-first (`a/b/c` tries `a/b`, then `a`), so a path mixing
+/// several shadow-like prefixes still picks the most specific one, and a
+/// full shadow — which the caller already tried as a whole — is never
+/// re-touched here. Returns `None` when no prefix decodes (tampered or
+/// unknown shadows; the caller keeps the original error).
+///
+/// The prefix must end on a segment boundary: composition splits at `/`
+/// only, so a decoded root can never swallow part of a literal segment.
+fn decode_compound(codec: &dyn PathCodec, shadow: &str) -> Option<String> {
+    let mut end = shadow.len();
+    while let Some(slash) = shadow[..end].rfind('/') {
+        end = slash;
+        let prefix = &shadow[..slash];
+        if let Ok(real) = codec.decode(prefix) {
+            let rest = &shadow[slash + 1..];
+            return Some(if real.is_empty() {
+                rest.to_string()
+            } else {
+                format!("{real}/{rest}")
+            });
+        }
+    }
+    None
 }
 
 /// Builder for [`ServerState`].
@@ -443,4 +496,94 @@ pub fn validate_rel_path(path: &str) -> Result<String, &'static str> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::decode_compound;
+    use libfw_core::pathmap::{PathCodec, PathCodecError};
+
+    /// A codec that only ever accepts the literal string `"docs"` — a
+    /// stand-in for a whole-string codec like `EncryptedPathCodec`, which
+    /// cannot decode compound paths as a whole.
+    struct DocsOnly;
+    impl PathCodec for DocsOnly {
+        fn encode(&self, real: &str) -> String {
+            real.to_string()
+        }
+        fn decode(&self, shadow: &str) -> Result<String, PathCodecError> {
+            if shadow == "docs" {
+                Ok("real/docs".to_string())
+            } else {
+                Err(PathCodecError::Unmapped(shadow.to_string()))
+            }
+        }
+    }
+
+    /// A codec that never decodes anything.
+    struct Never;
+    impl PathCodec for Never {
+        fn encode(&self, real: &str) -> String {
+            real.to_string()
+        }
+        fn decode(&self, _shadow: &str) -> Result<String, PathCodecError> {
+            Err(PathCodecError::InvalidShadow("nope".to_string()))
+        }
+    }
+
+    #[test]
+    fn compound_decodes_dir_shadow_plus_literal_suffix() {
+        let real = decode_compound(&DocsOnly, "docs/sub/deep/file.txt").unwrap();
+        assert_eq!(real, "real/docs/sub/deep/file.txt");
+    }
+
+    #[test]
+    fn compound_prefers_longest_decodable_prefix() {
+        // Shorter prefix "docs" also decodes, but the longer "docs/sub"
+        // must win when the codec accepts it.
+        struct TwoLevel;
+        impl PathCodec for TwoLevel {
+            fn encode(&self, real: &str) -> String {
+                real.to_string()
+            }
+            fn decode(&self, shadow: &str) -> Result<String, PathCodecError> {
+                match shadow {
+                    "docs" => Ok("real/docs".to_string()),
+                    "docs/sub" => Ok("real/docs/sub".to_string()),
+                    _ => Err(PathCodecError::Unmapped(shadow.to_string())),
+                }
+            }
+        }
+        let real = decode_compound(&TwoLevel, "docs/sub/deep/file.txt").unwrap();
+        assert_eq!(real, "real/docs/sub/deep/file.txt");
+    }
+
+    #[test]
+    fn compound_is_none_when_no_prefix_decodes() {
+        assert!(decode_compound(&Never, "abc").is_none());
+        assert!(decode_compound(&Never, "a/b/c").is_none());
+        // No '/' at all → nothing to split, even for a decodable prefix.
+        assert!(decode_compound(&DocsOnly, "docs").is_none());
+    }
+
+    #[test]
+    fn compound_decodes_identity_prefix_to_literal_rest() {
+        // A codec mapping a prefix to the root (""): the literal suffix
+        // becomes the whole result.
+        struct RootCodec;
+        impl PathCodec for RootCodec {
+            fn encode(&self, real: &str) -> String {
+                real.to_string()
+            }
+            fn decode(&self, shadow: &str) -> Result<String, PathCodecError> {
+                if shadow == "mnt" {
+                    Ok(String::new())
+                } else {
+                    Err(PathCodecError::Unmapped(shadow.to_string()))
+                }
+            }
+        }
+        let real = decode_compound(&RootCodec, "mnt/file.txt").unwrap();
+        assert_eq!(real, "file.txt");
+    }
 }

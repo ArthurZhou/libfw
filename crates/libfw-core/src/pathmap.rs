@@ -16,6 +16,15 @@
 //! *real* path against `allowed_paths` (see the `resolve_client_path`
 //! helper in `libfw-server`), so token semantics stay exactly as before.
 //!
+//! **Hierarchical composition:** `resolve_client_path` also accepts a
+//! shadow with literal child segments appended (`{dirShadow}/sub/file`):
+//! it decodes the longest decodable segment prefix and appends the
+//! remainder verbatim, then authorizes the combined real path — a
+//! directory shadow covers its whole subtree, with no per-path shadow
+//! minting. Whole-string codecs such as [`EncryptedPathCodec`] get this
+//! for free; prefix codecs like [`MountPathCodec`] already behave that
+//! way natively.
+//!
 //! # Codecs
 //!
 //! | Codec | Shadow looks like | Use when |
