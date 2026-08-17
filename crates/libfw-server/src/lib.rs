@@ -115,6 +115,16 @@ pub struct ServerState {
     /// the level header is ignored and downloads always use
     /// [`ZRIP_DEFAULT_LEVEL`](libfw_core::ZRIP_DEFAULT_LEVEL).
     pub zrip_levels: Option<ZripLevels>,
+    /// Sweep period of the stale session-temp cleaner (tus `Expiration`),
+    /// see [`ServerState::spawn_stale_session_cleanup`].
+    ///
+    /// Defaults to 1 hour; `Duration::ZERO` disables the sweeper.
+    pub cleanup_interval: std::time::Duration,
+    /// Max age of an abandoned session upload temp before it is removed.
+    ///
+    /// Defaults to [`DEFAULT_SESSION_TTL`](libfw_core::DEFAULT_SESSION_TTL)
+    /// (24 hours).
+    pub session_ttl: std::time::Duration,
 }
 
 impl ServerState {
@@ -181,6 +191,8 @@ pub struct ServerStateBuilder {
     max_upload_size: u64,
     limits: Option<Limits>,
     zrip_levels: Option<ZripLevels>,
+    cleanup_interval: std::time::Duration,
+    session_ttl: std::time::Duration,
 }
 
 impl Default for ServerStateBuilder {
@@ -194,6 +206,8 @@ impl Default for ServerStateBuilder {
             max_upload_size: DEFAULT_MAX_UPLOAD_SIZE,
             limits: None,
             zrip_levels: None,
+            cleanup_interval: std::time::Duration::from_secs(3600),
+            session_ttl: libfw_core::DEFAULT_SESSION_TTL,
         }
     }
 }
@@ -263,6 +277,20 @@ impl ServerStateBuilder {
         self
     }
 
+    /// Sweep period of the stale session-temp cleaner (default: 1 hour;
+    /// `Duration::ZERO` disables the sweeper).
+    pub fn cleanup_interval(mut self, interval: std::time::Duration) -> Self {
+        self.cleanup_interval = interval;
+        self
+    }
+
+    /// Max age of an abandoned session upload temp before removal
+    /// (default: 24 hours, [`DEFAULT_SESSION_TTL`](libfw_core::DEFAULT_SESSION_TTL)).
+    pub fn session_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.session_ttl = ttl;
+        self
+    }
+
     /// Build the state, panicking if required fields are missing.
     pub fn build(self) -> ServerState {
         ServerState {
@@ -274,6 +302,8 @@ impl ServerStateBuilder {
             max_upload_size: self.max_upload_size,
             limits: self.limits,
             zrip_levels: self.zrip_levels,
+            cleanup_interval: self.cleanup_interval,
+            session_ttl: self.session_ttl,
         }
     }
 }
@@ -299,6 +329,41 @@ impl ServerState {
             CompressionFormat::None => vec![CompressionFormat::None],
         };
         caps
+    }
+
+    /// Spawn the stale session-temp cleaner as a background task.
+    ///
+    /// Every [`cleanup_interval`](ServerState::cleanup_interval) it sweeps
+    /// the storage for abandoned session-upload temps and removes the ones
+    /// whose last write is older than [`session_ttl`](ServerState::session_ttl)
+    /// (tus `Expiration`; a client that vanished mid-upload never leaves its
+    /// `.libfw-sess-*` temp / `.blocks` sidecar behind forever).
+    ///
+    /// A zero `cleanup_interval` disables the sweeper: the returned handle
+    /// completes immediately. Backends that keep no long-lived session temps
+    /// (the [`StorageBackend`] trait default) simply report `0` removals.
+    pub fn spawn_stale_session_cleanup(
+        self: &Arc<Self>,
+    ) -> tokio::task::JoinHandle<()> {
+        let interval = self.cleanup_interval;
+        if interval.is_zero() {
+            return tokio::spawn(async {});
+        }
+        let storage = self.storage.clone();
+        let ttl = self.session_ttl;
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tokio::spawn(async move {
+            loop {
+                tick.tick().await;
+                match storage.cleanup_stale_sessions(ttl).await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!("cleaned {n} stale upload session temp(s)")
+                    }
+                    _ => {}
+                }
+            }
+        })
     }
 }
 

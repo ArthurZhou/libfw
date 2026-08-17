@@ -80,6 +80,24 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../index.html"))
 }
 
+/// Parse a duration from plain seconds (`300`) or a suffixed form
+/// (`30s`, `15m`, `2h`, `1d`). Returns `None` on garbage input.
+fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    let (digits, mult) = match s.chars().last()? {
+        's' => (&s[..s.len() - 1], 1u64),
+        'm' => (&s[..s.len() - 1], 60),
+        'h' => (&s[..s.len() - 1], 3600),
+        'd' => (&s[..s.len() - 1], 86_400),
+        '0'..='9' => (s, 1),
+        _ => return None,
+    };
+    digits
+        .parse::<u64>()
+        .ok()
+        .map(|n| std::time::Duration::from_secs(n.saturating_mul(mult)))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -104,11 +122,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&root)?;
     let root = root.canonicalize().unwrap_or(root);
 
+    // tus-style expiry tuning (env-overridable).
+    //   LIBFW_CLEANUP_INTERVAL — how often the sweeper runs (default 3600s)
+    //   LIBFW_SESSION_TTL     — max age of an abandoned `.libfw-sess-*` temp
+    //                           before it is removed (default 24h)
+    // Both accept plain seconds ("300") or a suffix ("5m", "2h", "1d").
+    let cleanup_interval = std::env::var("LIBFW_CLEANUP_INTERVAL")
+        .ok()
+        .and_then(|v| parse_duration(&v))
+        .unwrap_or(std::time::Duration::from_secs(3600));
+    let session_ttl = std::env::var("LIBFW_SESSION_TTL")
+        .ok()
+        .and_then(|v| parse_duration(&v))
+        .unwrap_or(libfw_core::DEFAULT_SESSION_TTL);
+
     let state = Arc::new({
         let mut builder = ServerState::builder()
             .storage(FsStorage::new(&root))
             .verifier(DevTokenVerifier)
-            .validator(PathValidator::new());
+            .validator(PathValidator::new())
+            .cleanup_interval(cleanup_interval)
+            .session_ttl(session_ttl);
         if let Ok(key_hex) = std::env::var("LIBFW_PATH_KEY") {
             match EncryptedPathCodec::from_hex(&key_hex) {
                 Ok(codec) => {
@@ -126,27 +160,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage_root: root.clone(),
     });
 
-    // tus-style expiry: sweep abandoned session-upload temps hourly so a
+    // tus-style expiry: sweep abandoned session-upload temps so a
     // client that vanished mid-upload never leaves its `.libfw-sess-*` temp
-    // (or `.blocks` sidecar) behind forever.
-    {
-        let storage = state.storage.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
-            loop {
-                tick.tick().await;
-                match storage
-                    .cleanup_stale_sessions(libfw_core::DEFAULT_SESSION_TTL)
-                    .await
-                {
-                    Ok(n) if n > 0 => {
-                        tracing::info!("cleaned {n} stale upload session temp(s)")
-                    }
-                    _ => {}
-                }
-            }
-        });
-    }
+    // (or `.blocks` sidecar) behind forever. Interval and max age were set
+    // on the instance above (env-overridable).
+    tracing::info!(
+        "session-temp cleanup: interval={cleanup_interval:?} ttl={session_ttl:?}"
+    );
+    state.spawn_stale_session_cleanup();
 
     // `GET /health` — service info (no auth required). Captures `health` by
     // value so it works on a state-less router.
@@ -202,4 +223,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::parse_duration;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_plain_seconds() {
+        assert_eq!(parse_duration("300"), Some(Duration::from_secs(300)));
+        assert_eq!(parse_duration("0"), Some(Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn parses_suffixed_durations() {
+        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration("15m"), Some(Duration::from_secs(900)));
+        assert_eq!(parse_duration("2h"), Some(Duration::from_secs(7200)));
+        assert_eq!(parse_duration("1d"), Some(Duration::from_secs(86_400)));
+        assert_eq!(parse_duration(" 5m "), Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("abc"), None);
+        assert_eq!(parse_duration("5x"), None);
+        assert_eq!(parse_duration("-1"), None);
+        assert_eq!(parse_duration("1.5h"), None);
+    }
 }
