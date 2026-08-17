@@ -7,7 +7,7 @@ description = "libfw integration example: an axum-based file server"
 
 [dependencies]
 libfw-core = { path = "../../crates/libfw-core" }
-libfw-server = { path = "../../crates/libfw-server" }
+libfw-server = { path = "../../crates/libfw-server", features = ["path-encrypt"] }
 axum = { version = "0.8", features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }

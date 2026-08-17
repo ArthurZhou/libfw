@@ -53,6 +53,7 @@ sdk/              libfw-client npm package (ESM + TS types + wasm)
 - [Browser demo](#browser-demo)
 - [Embedding in a Rust app](#embedding-in-a-rust-app)
 - [Authorization](#authorization)
+- [Path translation (shadow paths)](#path-translation-shadow-paths)
 - [Storage backends](#storage-backends)
 - [Browser SDK guide](#browser-sdk-guide)
 - [HTTP transport](#http-transport)
@@ -237,6 +238,44 @@ the `Validator` trait yourself and pass it to `.validator(..)`.
 | --------- | ------ |
 | `MissingToken`, `Invalid`, `Expired` | `401 Unauthorized` |
 | `Forbidden` | `403 Forbidden` |
+
+## Path translation (shadow paths)
+
+By default the API exposes **real storage paths** in URLs and listings. Deployments
+that must hide the on-disk layout (directory names, hierarchy, naming habits) can
+install a `PathCodec` on the server; the client then only ever sees **shadow
+paths**, and the server translates them back to real paths internally.
+
+```rust
+// IdentityPathCodec (default): shadow == real, zero overhead.
+// MountPathCodec: readable aliases, e.g. shadow `home/alice/**` → real `data/vol-3/**`.
+// EncryptedPathCodec (feature "path-encrypt"): opaque `v1.<base64url>` blobs,
+// AES-256-GCM; tampered shadows are rejected with `400`.
+ServerState::builder()
+    .path_codec(EncryptedPathCodec::from_hex(&key_hex)?) // 64 hex chars (32 bytes)
+    ...
+```
+
+How it works:
+
+- **Inbound** — every handler resolves the client-supplied shadow through
+  `resolve_client_path`, which shape-validates it, decodes it to the real path,
+  and authorizes the **real** path against `allowed_paths`. Token semantics are
+  unchanged: `allowed_paths` still refers to real storage paths.
+- **Outbound** — listings and metadata responses encode real paths back to
+  shadows (`expose_path`), so a listed shadow can be used verbatim in a
+  follow-up download/upload URL.
+
+The root listing path (`/dir`) is the one exception: the canonical root `""`
+maps to itself. GCM shadows use a random nonce per encode (non-deterministic);
+use `MountPathCodec` when you need stable, readable shadow names.
+
+Both example servers enable encrypted shadows automatically when the
+`LIBFW_PATH_KEY` environment variable is set (a 64-char hex key):
+
+```sh
+LIBFW_PATH_KEY=$(openssl rand -hex 32) cargo run -p axum-server
+```
 
 ## Storage backends
 

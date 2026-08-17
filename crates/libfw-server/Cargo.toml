@@ -8,6 +8,11 @@ description = "Embeddable libfw server handlers/middleware (axum integration)"
 keywords = ["server", "axum", "http", "streaming", "transfer"]
 categories = ["network-programming", "web-programming"]
 
+[features]
+default = []
+# Forward the encrypted-shadow-path codec from libfw-core.
+path-encrypt = ["libfw-core/path-encrypt"]
+
 [dependencies]
 libfw-core.workspace = true
 axum.workspace = true

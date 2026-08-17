@@ -25,7 +25,7 @@ use axum::routing::get;
 use axum::Json;
 use libfw_core::auth::{AuthError, PathValidator, TokenVerifier};
 use libfw_core::claims::{Permission, TokenClaims};
-use libfw_server::{router, FsStorage, ServerState};
+use libfw_server::{router, EncryptedPathCodec, FsStorage, ServerState};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
@@ -101,13 +101,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&root)?;
     let root = root.canonicalize().unwrap_or(root);
 
-    let state = Arc::new(
-        ServerState::builder()
+    let state = Arc::new({
+        let mut builder = ServerState::builder()
             .storage(FsStorage::new(&root))
             .verifier(DevTokenVerifier)
-            .validator(PathValidator::new())
-            .build(),
-    );
+            .validator(PathValidator::new());
+        if let Ok(key_hex) = std::env::var("LIBFW_PATH_KEY") {
+            match EncryptedPathCodec::from_hex(&key_hex) {
+                Ok(codec) => {
+                    builder = builder.path_codec(codec);
+                    tracing::info!("shadow paths: encrypted (LIBFW_PATH_KEY set)");
+                }
+                Err(err) => tracing::warn!(
+                    "LIBFW_PATH_KEY ignored ({err}); falling back to identity paths"
+                ),
+            }
+        }
+        builder.build()
+    });
     let health = Arc::new(Health {
         storage_root: root.clone(),
         static_dir: static_dir.clone(),

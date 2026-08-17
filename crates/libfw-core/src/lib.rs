@@ -40,6 +40,7 @@ pub mod compress;
 pub mod constants;
 pub mod error;
 pub mod metadata;
+pub mod pathmap;
 pub mod range;
 pub mod storage;
 pub mod ws;
@@ -54,6 +55,9 @@ pub use compress::{
 pub use constants::*;
 pub use error::{CompressError, DecompressError, StorageError};
 pub use metadata::{ChunkMeta, FileMeta, TransferPlan};
+pub use pathmap::{IdentityPathCodec, MountPathCodec, PathCodec, PathCodecError};
+#[cfg(feature = "path-encrypt")]
+pub use pathmap::EncryptedPathCodec;
 pub use range::RangeSpec;
 pub use storage::{DirEntry, StorageBackend, UploadSink, WriteMode};
 pub use ws::{

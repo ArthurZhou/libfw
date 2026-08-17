@@ -60,13 +60,39 @@ use axum::response::{IntoResponse, Response};
 use axum::Router;
 use libfw_core::auth::{AuthError, TokenVerifier, Validator};
 use libfw_core::capabilities::{Capabilities, Limits, ZripLevels};
+use libfw_core::claims::TokenClaims;
 use libfw_core::compress::CompressionFormat;
+use libfw_core::pathmap::{IdentityPathCodec, PathCodec, PathCodecError};
 use libfw_core::storage::StorageBackend;
+pub use libfw_core::pathmap::MountPathCodec;
+#[cfg(feature = "path-encrypt")]
+pub use libfw_core::pathmap::EncryptedPathCodec;
 use libfw_core::{protocol_compatible, protocol_header_value, DEFAULT_MAX_UPLOAD_SIZE, HEADER_PROTOCOL};
 pub use libfw_core::{
     HEADER_COMPRESS, HEADER_COMPRESS_LEVEL, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET,
     HEADER_SESSION, HEADER_SESSION_STATUS,
 };
+
+/// Error resolving a client-supplied (shadow) path to a real storage path.
+///
+/// Returned by [`ServerState::resolve_client_path`]; map it to HTTP as:
+/// - [`Invalid`](PathResolveError::Invalid) / [`Codec`](PathResolveError::Codec)
+///   → `400 Bad Request` (malformed or tampered shadow path),
+/// - [`Auth`](PathResolveError::Auth) → `401` / `403` as usual.
+#[derive(Debug, thiserror::Error)]
+pub enum PathResolveError {
+    /// The shadow path failed basic shape validation (absolute, `..`,
+    /// NUL byte, empty segments).
+    #[error("invalid path: {0}")]
+    Invalid(&'static str),
+    /// The codec could not decode the shadow (unknown version, bad
+    /// base64, tampered ciphertext, unmapped namespace).
+    #[error("cannot decode path: {0}")]
+    Codec(#[from] PathCodecError),
+    /// The decoded real path is not authorized for this token.
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+}
 
 /// Immutable server configuration shared by all handlers.
 pub struct ServerState {
@@ -76,6 +102,10 @@ pub struct ServerState {
     pub verifier: Arc<dyn TokenVerifier>,
     /// Decides whether claims may access a path.
     pub validator: Arc<dyn Validator>,
+    /// Real storage paths ↔ client-visible shadow paths.
+    ///
+    /// Defaults to [`IdentityPathCodec`] (no translation).
+    pub path_codec: Arc<dyn PathCodec>,
     /// Compression applied to downloads when the client asks for it.
     pub compression: CompressionFormat,
     /// Upper bound for a single upload body.
@@ -106,11 +136,49 @@ impl ServerState {
     }
 }
 
+impl ServerState {
+    /// Resolve a client-supplied (shadow) path to the canonical real path.
+    ///
+    /// Pipeline: shape-validate the shadow → [`PathCodec::decode`] →
+    /// shape-validate the decoded real path (defense in depth) →
+    /// authorize `action` **against the real path**, so
+    /// `allowed_paths` keeps its exact pre-translation semantics.
+    ///
+    /// The returned real path is safe to hand to the storage backend;
+    /// it must never be echoed back to the client — responses go through
+    /// [`ServerState::expose_path`].
+    pub fn resolve_client_path(
+        &self,
+        claims: &TokenClaims,
+        shadow: &str,
+        action: libfw_core::auth::Action,
+    ) -> Result<String, PathResolveError> {
+        let shadow = validate_rel_path(shadow).map_err(PathResolveError::Invalid)?;
+        // The canonical root (``) is not a shadow: it maps to itself
+        // (the root handler `GET /dir` passes it directly). Everything
+        // else must round-trip through the codec.
+        let real = if shadow.is_empty() {
+            shadow
+        } else {
+            self.path_codec.decode(&shadow)?
+        };
+        let real = validate_rel_path(&real).map_err(PathResolveError::Invalid)?;
+        self.authorize(claims, &real, action)?;
+        Ok(real)
+    }
+
+    /// Translate a real storage path for client consumption (shadow).
+    pub fn expose_path(&self, real: &str) -> String {
+        self.path_codec.encode(real)
+    }
+}
+
 /// Builder for [`ServerState`].
 pub struct ServerStateBuilder {
     storage: Option<Arc<dyn StorageBackend>>,
     verifier: Option<Arc<dyn TokenVerifier>>,
     validator: Option<Arc<dyn Validator>>,
+    path_codec: Option<Arc<dyn PathCodec>>,
     compression: CompressionFormat,
     max_upload_size: u64,
     limits: Option<Limits>,
@@ -123,6 +191,7 @@ impl Default for ServerStateBuilder {
             storage: None,
             verifier: None,
             validator: None,
+            path_codec: None,
             compression: CompressionFormat::Zrip,
             max_upload_size: DEFAULT_MAX_UPLOAD_SIZE,
             limits: None,
@@ -147,6 +216,20 @@ impl ServerStateBuilder {
     /// Required: the path/permission validator.
     pub fn validator(mut self, validator: impl Validator) -> Self {
         self.validator = Some(Arc::new(validator));
+        self
+    }
+
+    /// Path translator between real storage paths and client-visible
+    /// shadow paths (default: identity — no translation).
+    ///
+    /// Handlers resolve inbound shadow paths through
+    /// [`ServerState::resolve_client_path`] (which also authorizes the
+    /// real path) and encode outbound paths via
+    /// [`ServerState::expose_path`]. See [`MountPathCodec`] for readable
+    /// aliases and [`EncryptedPathCodec`] for opaque encrypted paths
+    /// (`libfw-core/path-encrypt` feature).
+    pub fn path_codec(mut self, codec: impl PathCodec) -> Self {
+        self.path_codec = Some(Arc::new(codec));
         self
     }
 
@@ -188,6 +271,7 @@ impl ServerStateBuilder {
             storage: self.storage.expect("storage is required"),
             verifier: self.verifier.expect("verifier is required"),
             validator: self.validator.expect("validator is required"),
+            path_codec: self.path_codec.unwrap_or_else(|| Arc::new(IdentityPathCodec)),
             compression: self.compression,
             max_upload_size: self.max_upload_size,
             limits: self.limits,

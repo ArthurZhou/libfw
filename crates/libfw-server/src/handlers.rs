@@ -32,7 +32,7 @@ use crate::http::{
 };
 use crate::{
     HEADER_COMPRESS, HEADER_COMPRESS_LEVEL, HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET,
-    HEADER_SESSION, HEADER_SESSION_STATUS, ServerState, validate_rel_path,
+    HEADER_SESSION, HEADER_SESSION_STATUS, PathResolveError, ServerState, validate_rel_path,
 };
 
 /// Errors surfaced by handlers, mapped to HTTP responses.
@@ -154,21 +154,24 @@ pub(crate) async fn capabilities(
     Json(state.capabilities())
 }
 
-fn authorize_request(
-    state: &ServerState,
-    claims: &TokenClaims,
-    path: &str,
-    action: Action,
-) -> Result<(), ApiError> {
-    state
-        .authorize(claims, path, action)
-        .map_err(|err| match err {
-            AuthError::Forbidden { path, action } => ApiError::Auth(AuthRejection::Forbidden {
-                path,
-                action: action.to_string(),
-            }),
-            other => ApiError::Auth(AuthRejection::Unauthorized(other.to_string())),
-        })
+/// Map a [`PathResolveError`] to HTTP: malformed/tampered shadows are
+/// `400`, authorization failures keep their usual `401`/`403` shape.
+fn resolve_error(err: PathResolveError) -> ApiError {
+    match err {
+        PathResolveError::Invalid(msg) => ApiError::BadRequest(msg.to_string()),
+        PathResolveError::Codec(e) => ApiError::BadRequest(e.to_string()),
+        PathResolveError::Auth(auth) => authorize_request_error(auth),
+    }
+}
+
+fn authorize_request_error(err: AuthError) -> ApiError {
+    match err {
+        AuthError::Forbidden { path, action } => ApiError::Auth(AuthRejection::Forbidden {
+            path,
+            action: action.to_string(),
+        }),
+        other => ApiError::Auth(AuthRejection::Unauthorized(other.to_string())),
+    }
 }
 
 async fn plan_download(
@@ -319,7 +322,9 @@ pub(crate) async fn download(
     BearerClaims(claims): BearerClaims,
     req_headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    authorize_request(&state, &claims, &path, Action::Read)?;
+    let path = state
+        .resolve_client_path(&claims, &path, Action::Read)
+        .map_err(resolve_error)?;
     let plan = plan_download(&state, &path, &req_headers, true).await?;
 
     let reader = plan.reader.expect("reader requested");
@@ -339,7 +344,9 @@ pub(crate) async fn head_file(
     BearerClaims(claims): BearerClaims,
     req_headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    authorize_request(&state, &claims, &path, Action::Read)?;
+    let path = state
+        .resolve_client_path(&claims, &path, Action::Read)
+        .map_err(resolve_error)?;
     let plan = plan_download(&state, &path, &req_headers, false).await?;
     let mut builder = Response::builder().status(plan.status);
     for (name, value) in plan.headers {
@@ -571,7 +578,9 @@ async fn upload_session(
                 )));
             }
         }
-        let committed = sink.commit().await?;
+        let mut committed = sink.commit().await?;
+        // Outbound: never leak the real path in the committed meta.
+        committed.path = state.expose_path(&committed.path);
         return Ok((StatusCode::CREATED, Json(UploadOk { file: committed })).into_response());
     }
 
@@ -586,8 +595,10 @@ pub(crate) async fn upload(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    authorize_request(&state, &claims, &path, Action::Write)?;
-    let path = validate_rel_path(path.as_str()).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // Shadow → real, with authorization against the real path.
+    let path = state
+        .resolve_client_path(&claims, &path, Action::Write)
+        .map_err(resolve_error)?;
 
     let meta_header = headers
         .get(HEADER_FILE_META)
@@ -727,7 +738,9 @@ pub(crate) async fn upload(
         )));
     }
 
-    let committed = sink.commit().await?;
+    let mut committed = sink.commit().await?;
+    // Outbound: never leak the real path in the committed meta.
+    committed.path = state.expose_path(&committed.path);
     Ok((StatusCode::CREATED, Json(UploadOk { file: committed })).into_response())
 }
 
@@ -757,9 +770,16 @@ async fn list_dir_impl(
     claims: &TokenClaims,
     path: &str,
 ) -> Result<Response, ApiError> {
-    authorize_request(state, claims, path, Action::Read)?;
-    let path = validate_rel_path(path).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let entries = state.storage.list_dir(&path).await?;
+    // Shadow → real, with authorization against the real path.
+    let path = state
+        .resolve_client_path(claims, path, Action::Read)
+        .map_err(resolve_error)?;
+    let mut entries = state.storage.list_dir(&path).await?;
+    // Outbound: every entry path must be a shadow path the client can use
+    // directly in a follow-up download/upload URL.
+    for entry in &mut entries {
+        entry.path = state.expose_path(&entry.path);
+    }
     Ok(Json(entries).into_response())
 }
 

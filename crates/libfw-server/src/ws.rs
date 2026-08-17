@@ -36,7 +36,7 @@ use libfw_core::storage::WriteMode;
 use libfw_core::ws::*;
 use libfw_core::{RangeSpec, protocol_compatible};
 
-use crate::{ServerState, validate_rel_path};
+use crate::{PathResolveError, ServerState};
 
 /// Default block size for a WebSocket download stream (256 KiB), kept small
 /// so the browser's out-of-order reorder buffer stays modest.
@@ -196,18 +196,30 @@ fn error_frame(code: &str, message: &str) -> Vec<u8> {
     )
 }
 
-fn authorize(
-    state: &ServerState,
-    claims: &TokenClaims,
-    path: &str,
-    action: Action,
-) -> Result<(), String> {
-    state.authorize(claims, path, action).map_err(|err| match err {
+/// Turn an [`AuthError`] into a human-readable frame payload.
+fn auth_err_string(err: AuthError) -> String {
+    match err {
         AuthError::Forbidden { path, action } => {
             format!("permission denied: {action} on `{path}`")
         }
         other => format!("unauthorized: {other}"),
-    })
+    }
+}
+
+/// Resolve a client-supplied (shadow) path and authorize `action` on the
+/// real path; maps failures to `(code, message)` for an error frame.
+fn resolve_or_error(
+    state: &ServerState,
+    claims: &TokenClaims,
+    shadow: &str,
+    action: Action,
+) -> Result<String, (&'static str, String)> {
+    state
+        .resolve_client_path(claims, shadow, action)
+        .map_err(|err| match err {
+            PathResolveError::Auth(auth) => ("auth", auth_err_string(auth)),
+            other => ("path", other.to_string()),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -224,18 +236,23 @@ async fn list_reply(state: &ServerState, claims: &TokenClaims, frame: &[u8]) -> 
         Ok(r) => r,
         Err(_) => return error_frame("protocol", "malformed LIST_REQ"),
     };
-    let path = match validate_rel_path(&req.path) {
+    // Shadow → real, with authorization against the real path.
+    let path = match resolve_or_error(state, claims, &req.path, Action::Read) {
         Ok(p) => p,
-        Err(e) => return error_frame("path", e),
+        Err((code, msg)) => return error_frame(code, &msg),
     };
-    if let Err(e) = authorize(state, claims, &path, Action::Read) {
-        return error_frame("auth", &e);
-    }
     match state.storage.list_dir(&path).await {
-        Ok(entries) => control_frame(
-            FRAME_LIST_REPLY,
-            &serde_json::json!({ "path": req.path, "entries": entries }),
-        ),
+        Ok(mut entries) => {
+            // Outbound: every entry path must be a shadow path the client
+            // can use directly in a follow-up transfer.
+            for entry in &mut entries {
+                entry.path = state.expose_path(&entry.path);
+            }
+            control_frame(
+                FRAME_LIST_REPLY,
+                &serde_json::json!({ "path": req.path, "entries": entries }),
+            )
+        }
         Err(e) => error_frame("storage", &e.to_string()),
     }
 }
@@ -250,18 +267,16 @@ async fn meta_reply(state: &ServerState, claims: &TokenClaims, frame: &[u8]) -> 
         Ok(r) => r,
         Err(_) => return error_frame("protocol", "malformed META_REQ"),
     };
-    let path = match validate_rel_path(&req.path) {
+    // Shadow → real, with authorization against the real path.
+    let path = match resolve_or_error(state, claims, &req.path, Action::Read) {
         Ok(p) => p,
-        Err(e) => return error_frame("path", e),
+        Err((code, msg)) => return error_frame(code, &msg),
     };
-    if let Err(e) = authorize(state, claims, &path, Action::Read) {
-        return error_frame("auth", &e);
-    }
     match state.storage.file_meta(&path).await {
         Ok(Some(meta)) => control_frame(
             FRAME_META_REPLY,
             &serde_json::json!({
-                "path": meta.path,
+                "path": state.expose_path(&meta.path),
                 "size": meta.size,
                 "mtime": meta.mtime,
                 "etag": meta.etag,
@@ -284,17 +299,14 @@ async fn run_download(
     claims: &TokenClaims,
     start: StartRequest,
 ) {
-    let path = match validate_rel_path(&start.path) {
+    // Shadow → real, with authorization against the real path.
+    let path = match resolve_or_error(state, claims, &start.path, Action::Read) {
         Ok(p) => p,
-        Err(e) => {
-            let _ = send_frame(socket, error_frame("path", e)).await;
+        Err((code, msg)) => {
+            let _ = send_frame(socket, error_frame(code, &msg)).await;
             return;
         }
     };
-    if let Err(e) = authorize(state, claims, &path, Action::Read) {
-        let _ = send_frame(socket, error_frame("auth", &e)).await;
-        return;
-    }
     let meta = match state.storage.file_meta(&path).await {
         Ok(Some(m)) => m,
         Ok(None) => {
@@ -467,17 +479,14 @@ async fn run_upload(
     claims: &TokenClaims,
     start: StartRequest,
 ) {
-    let path = match validate_rel_path(&start.path) {
+    // Shadow → real, with authorization against the real path.
+    let path = match resolve_or_error(state, claims, &start.path, Action::Write) {
         Ok(p) => p,
-        Err(e) => {
-            let _ = send_frame(socket, error_frame("path", e)).await;
+        Err((code, msg)) => {
+            let _ = send_frame(socket, error_frame(code, &msg)).await;
             return;
         }
     };
-    if let Err(e) = authorize(state, claims, &path, Action::Write) {
-        let _ = send_frame(socket, error_frame("auth", &e)).await;
-        return;
-    }
     if start.size > state.max_upload_size {
         let _ = send_frame(
             socket,

@@ -16,6 +16,14 @@ zrip.workspace = true
 sha2.workspace = true
 async-trait.workspace = true
 crc32fast.workspace = true
+# `path-encrypt` feature: EncryptedPathCodec (AES-256-GCM shadow paths).
+aes-gcm = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
+getrandom = { workspace = true, features = ["js"], optional = true }
+
+[features]
+default = []
+path-encrypt = ["dep:aes-gcm", "dep:base64", "dep:getrandom"]
 
 [dev-dependencies]
 zstd = "0.13"

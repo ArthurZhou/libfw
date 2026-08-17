@@ -33,8 +33,8 @@ use libfw_core::storage::WriteMode;
 use libfw_core::{RangeSpec, StorageError, STREAM_BUF_SIZE};
 use libfw_server::{
     content_range_none_value, content_range_value, etag_matches_if_none_match, if_range_matches,
-    parse_range_header, FsStorage, ParsedRange, ServerState, HEADER_COMPRESS, HEADER_FILE_META,
-    HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION,
+    parse_range_header, EncryptedPathCodec, FsStorage, ParsedRange, ServerState, HEADER_COMPRESS,
+    HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -629,13 +629,24 @@ async fn main() -> std::io::Result<()> {
     let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8081);
     std::fs::create_dir_all(&root)?;
 
-    let state = Arc::new(
-        ServerState::builder()
+    let state = Arc::new({
+        let mut builder = ServerState::builder()
             .storage(FsStorage::new(&root))
             .verifier(DevTokenVerifier)
-            .validator(PathValidator::new())
-            .build(),
-    );
+            .validator(PathValidator::new());
+        if let Ok(key_hex) = std::env::var("LIBFW_PATH_KEY") {
+            match EncryptedPathCodec::from_hex(&key_hex) {
+                Ok(codec) => {
+                    builder = builder.path_codec(codec);
+                    tracing::info!("shadow paths: encrypted (LIBFW_PATH_KEY set)");
+                }
+                Err(err) => tracing::warn!(
+                    "LIBFW_PATH_KEY ignored ({err}); falling back to identity paths"
+                ),
+            }
+        }
+        builder.build()
+    });
 
     // tus-style expiry: sweep abandoned session-upload temps hourly so a
     // client that vanished mid-upload never leaves its `.libfw-sess-*` temp
