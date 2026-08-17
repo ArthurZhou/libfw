@@ -424,8 +424,14 @@
   // ---------------------------------------------------------------- boot
   $('base').value = location.origin;
 
+  // The page works out of the box (base URL + dev token are pre-filled), so
+  // boot with the SAME full-featured client the Apply button creates —
+  // a bare `new LibfwClient({ baseUrl })` would silently skip progress
+  // rendering and adaptive tuning for any transfer started before Apply.
+  newClient();
+
   // Detect the WASM engine availability; the REST API works without it.
-  client = new LibfwClient({ baseUrl: location.origin });
+  client._ready?.().then(
   client._ready?.().then(
     () => { $('status-pill').textContent = 'engine: ready'; $('status-pill').classList.add('active'); },
     (err) => {
