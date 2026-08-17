@@ -438,7 +438,7 @@
       $('status-pill').textContent = 'engine: missing (wasm-pack)';
       log(`engine init failed: ${err?.message ?? err}`, 'err');
     }
-  );
+  ));
 
   window.addEventListener('error', (ev) => {
     console.error('window error', ev.error ?? ev.message);
