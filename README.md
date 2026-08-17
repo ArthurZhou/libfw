@@ -53,6 +53,7 @@ sdk/              libfw-client npm package (ESM + TS types + wasm)
 - [Browser SDK guide](#browser-sdk-guide)
 - [HTTP transport](#http-transport)
 - [HTTP protocol](#http-protocol)
+- [Adaptive tuning](#adaptive-tuning)
 - [Building from source](#building-from-source)
 - [Testing](#testing)
 - [License](#license)
@@ -350,7 +351,10 @@ const client = new LibfwClient({
   baseRetryDelayMs: 500,      // initial exponential backoff (default 500)
   maxRetryDelayMs: 30000,     // backoff ceiling (default 30 s)
   timeoutMs: 60000,           // per-request timeout (default 60 s)
-  onEvent: (e) => {},         // progress / lifecycle listener
+  autoTune: false,            // adaptive tuning engine (default false; see
+                              // "Adaptive tuning" — ramps windows/chunk/level)
+  tuneTtlMs: 3600000,         // reuse a settled tuning for this long (default 1 h)
+  onEvent: (e) => {},         // progress / lifecycle / tuning listener
 });
 ```
 
@@ -432,13 +436,16 @@ client.totalBytes();  // total bytes to transfer
 - `fileStart` — `{ type, path, done: 0, total: size }`
 - `fileCompleted` — `{ type, path }`
 - `progress` — `{ type, done, total }`
+- `tuning` — `{ type, phase, params, stats }` (only when `autoTune` is
+  enabled; see [Adaptive tuning](#adaptive-tuning)).
 
 ### Errors
 
 Every rejection is a `LibfwError` with a stable `code`:
 
 `unknown` · `wasm` · `abort` · `unsupported` · `path` · `storage` · `idb` ·
-`http` · `network` · `decompress` · `compress` · `protocol` · `cancelled`
+`http` · `network` · `decompress` · `compress` · `protocol` · `cancelled` ·
+`too-large`
 
 ```js
 try {
@@ -518,8 +525,13 @@ The HTTP routes below are the transport the browser SDK uses (see
 | HEAD   | `/file/{*path}` | metadata only |
 | POST   | `/file/{*path}` | streaming upload (headers below) |
 | GET    | `/dir/{*path}`  | directory listing (JSON) |
+| GET    | `/capabilities` | capability advertisement (JSON, **public** — no auth; a non-sensitive contract for adaptive clients, see [Adaptive tuning](#adaptive-tuning)) |
 
-All routes require `Authorization: Bearer <token>`.
+All routes require `Authorization: Bearer <token>` except `/capabilities`.
+Every request may carry `x-libfw-protocol: libfw/1` (the SDK always sends
+it): the server replies `426 Upgrade Required` when the value is present but
+incompatible with the server build, so mismatched client/server versions fail
+fast with a clear error instead of corrupting transfers.
 
 ### Downloads
 
@@ -575,6 +587,34 @@ All routes require `Authorization: Bearer <token>`.
 | `409` | upload with create semantics but target exists |
 | `412` | resume offset mismatch (client resets and re-uploads) |
 | `416` | unsatisfiable range |
+| `426` | `x-libfw-protocol` handshake present but incompatible |
+
+## Adaptive tuning
+
+With `autoTune: true` (SDK option) the client fetches the server's
+`/capabilities` advertisement (protocol version, compression support, tuning
+limits, zrip levels), picks the advertised minimums as a starting point, and
+then **TCP-style ramps** real transfer parameters as measurements come in:
+concurrency → upload/download windows → chunk sizes (and the zrip level),
+using 1-second EWMA RTT / throughput samples. Errors halve the parameters
+(`degraded`), which then hold for two stable windows before settling;
+settled results are cached per origin for `tuneTtlMs` (default 1 h) and
+re-ramp automatically on RTT drift or capability changes.
+
+The live state is readable via `client.tuneStatus()` and pushed to
+`options.onEvent` as `{ type: 'tuning', phase, params, stats }` events:
+
+```js
+client.tuneStatus();
+// { phase: 'settled', capsHash: 'a1b2…',
+//   params: { concurrency: 4, uploadWindow: 8, downloadWindow: 4,
+//             chunkSize: 4194304, downloadChunkSize: 262144, compressLevel: -8 },
+//   stats:  { rttMs: 12.4, mbps: 87.3 } }
+```
+
+`phase` is `uninitialized | ramping | settled | degraded`. A server without
+the `/capabilities` route (pre-0.3.3 builds) simply disables tuning — the
+client falls back to the configured static values.
 
 ## Building from source
 

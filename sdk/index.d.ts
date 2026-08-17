@@ -36,6 +36,40 @@ export interface UploadEntry {
   mtime: number;
 }
 
+/** Adaptive-tuning parameters the engine is currently tuned to. */
+export interface TuningParams {
+  /** Cross-file transfer concurrency. */
+  concurrency: number;
+  /** In-flight chunks per single-file upload. */
+  uploadWindow: number;
+  /** In-flight byte-range GETs per single-file download. */
+  downloadWindow: number;
+  /** Upload chunk size in bytes. */
+  chunkSize: number;
+  /** Download byte-range size in bytes. */
+  downloadChunkSize: number;
+  /** zrip compression level (negative = faster, positive = smaller). */
+  compressLevel: number;
+}
+
+/** Last-window transfer statistics reported by the tuning engine. */
+export interface TuningStats {
+  /** EWMA request round-trip time in milliseconds. */
+  rttMs: number;
+  /** Last-window throughput in megabits per second. */
+  mbps: number;
+}
+
+/** Live adaptive-tuning status (see {@link LibfwClient.tuneStatus}). */
+export interface TuneStatus {
+  /** `uninitialized` until the first measurement window completes. */
+  phase: 'uninitialized' | 'ramping' | 'settled' | 'degraded';
+  params: TuningParams;
+  stats: TuningStats;
+  /** Hash of the server `/capabilities` payload the tuning is based on. */
+  capsHash: string;
+}
+
 /** Progress / lifecycle event delivered via `options.onEvent`. */
 export interface LibfwEvent {
   /** `fileStart`, `fileCompleted`, `progress`. */
@@ -46,6 +80,14 @@ export interface LibfwEvent {
   done?: number;
   /** Total bytes (progress events). */
   total?: number;
+}
+
+/** Tuning event delivered via `options.onEvent` when `autoTune` is enabled. */
+export interface LibfwTuningEvent {
+  type: 'tuning';
+  phase: TuneStatus['phase'];
+  params: TuningParams;
+  stats: TuningStats;
 }
 
 /** Options accepted by the {@link LibfwClient} constructor. */
@@ -114,8 +156,21 @@ export interface LibfwClientOptions {
    * limit. Default `536870912` (512 MiB).
    */
   maxFallbackBytes?: number;
-  /** Optional progress/state listener. */
-  onEvent?: (event: LibfwEvent) => void;
+  /**
+   * Enable the adaptive tuning engine: the engine probes the server's
+   * `/capabilities` limits and TCP-style ramps concurrency / windows /
+   * chunk sizes (and the zrip level) from the advertised minimums using
+   * real transfer stats. When disabled the configured static values are
+   * used as-is. Default `false`.
+   */
+  autoTune?: boolean;
+  /**
+   * How long (ms) a settled tuning result is reused for the same server
+   * origin before re-ramping. Default `3600000` (1 hour).
+   */
+  tuneTtlMs?: number;
+  /** Optional progress/state listener. Tuning updates arrive as `{ type: 'tuning', phase, params, stats }`. */
+  onEvent?: (event: LibfwEvent | LibfwTuningEvent) => void;
 }
 
 /**
@@ -191,6 +246,19 @@ export declare class LibfwClient {
 
   /** Total bytes to transfer. */
   totalBytes(): number;
+
+  /**
+   * Live adaptive-tuning status.
+   *
+   * @returns `{ phase, params, stats, capsHash }` — `phase` is
+   *   `uninitialized | ramping | settled | degraded`; `params` holds the
+   *   tuned `concurrency` / `uploadWindow` / `downloadWindow` / `chunkSize`
+   *   / `downloadChunkSize` / `compressLevel`; `stats` is
+   *   `{ rttMs, mbps }` (EWMA request RTT, last-window throughput).
+   *   `null` until the WASM engine is initialised (or when `autoTune` is
+   *   disabled, `phase` stays `uninitialized`).
+   */
+  tuneStatus(): TuneStatus | null;
 
   /**
    * Delete persisted resume state (IndexedDB).

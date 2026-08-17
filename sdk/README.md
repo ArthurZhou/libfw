@@ -108,12 +108,28 @@ dist/libfw-client.umd.js   UMD bundle (after build:umd)
     for the in-memory `'browser'` fallback. File sizes are pre-checked
     against it before buffering; a download that would exceed it rejects
     with a `too-large` `LibfwError` instead of risking an OOM. `0` disables.
+  - `autoTune: boolean` (default `false`) — enable the adaptive tuning
+    engine. The engine probes the server's `/capabilities` limits and
+    TCP-style ramps concurrency / windows / chunk sizes (and the zrip
+    level) from the advertised minimums using real transfer stats. When
+    disabled, the configured static values are used as-is.
+  - `tuneTtlMs: number` (default `3600000`, 1 h) — how long a settled
+    tuning result is reused for the same server origin before re-ramping.
 - `downloadFolder(token, dirPath?) → Promise<number>`
 - `downloadFile(token, filePath) → Promise<number>`
 - `upload(token, files?) → Promise<number>`
 - `clearResumeStore(direction?) → Promise<number>`
 - `pause()`, `resume()`, `cancel()`
 - `state()`, `progress()`, `doneBytes()`, `totalBytes()`
+- `tuneStatus() → { phase, params, stats, capsHash } | null` — live
+  adaptive-tuning status. `phase` is `uninitialized | ramping | settled |
+  degraded`; `params` is `{ concurrency, uploadWindow, downloadWindow,
+  chunkSize, downloadChunkSize, compressLevel }`; `stats` is
+  `{ rttMs, mbps }` (EWMA request RTT, last-window throughput). `null`
+  until the WASM engine is initialised.
+- Events: with `autoTune` enabled, `onEvent` additionally receives
+  `{ type: 'tuning', phase, params, stats }` on every phase transition /
+  window evaluation.
 - Errors: every rejection is a `LibfwError` with a stable `code`.
 
 See `index.d.ts` for the full type surface.
