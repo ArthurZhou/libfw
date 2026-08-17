@@ -336,14 +336,17 @@
   });
 
   $('files').addEventListener('change', (ev) => {
-    const files = ev.target.files;
+    // Copy immediately: `input.files` is a live FileList and the `value = ''`
+    // below empties it — a captured reference would see zero entries by the
+    // time the (async) upload reads it.
+    const files = Array.from(ev.target.files);
     if (!files.length) return;
     runTransfer((t) => client.upload(t, files), `upload ${files.length} file(s)`);
     ev.target.value = '';
   });
 
   $('folder').addEventListener('change', (ev) => {
-    const files = ev.target.files;
+    const files = Array.from(ev.target.files);
     if (!files.length) return;
     runTransfer((t) => client.upload(t, files), `upload folder (${files.length} file(s))`);
     ev.target.value = '';

@@ -938,6 +938,20 @@ export class LibfwClient {
    * @throws {LibfwError}
    */
   async upload(token, files) {
+    // Snapshot the FileList SYNCHRONOUSLY, before any await: `input.files`
+    // is a LIVE list that the page typically clears (`input.value = ''`)
+    // right after the change event — while we await WASM init below, that
+    // clear would empty a captured FileList to zero entries and the upload
+    // would silently transfer 0 bytes. Copying the File objects now keeps
+    // them valid regardless of what the page does to the input afterwards.
+    if (
+      files !== undefined &&
+      files !== null &&
+      !Array.isArray(files) &&
+      typeof files[Symbol.iterator] === 'function'
+    ) {
+      files = Array.from(files);
+    }
     const engine = await this._ready();
     this._uploadFiles.clear();
     this._uploadPlan = [];
