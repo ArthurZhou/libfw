@@ -16,7 +16,13 @@ const client = new LibfwClient({
   downloadWindow: 4,    // parallel byte-range GETs per single file download
                         // (raise to reduce download stutter on high-latency links)
   compress: true,       // zrip per-block compression
-  onEvent: (e) => console.log(e), // { type: 'progress', done, total }
+  autoTune: true,       // adaptive tuning: probes /capabilities and ramps
+                        // concurrency/windows/chunk sizes from real stats
+  onEvent: (e) => {
+    if (e.type === 'progress') updateProgressBar(e.done, e.total);
+    else if (e.type === 'tuning') renderTuning(e.phase, e.params, e.stats);
+    // other types: fileStart, fileCompleted, ...
+  },
 });
 
 // Download a whole folder. Uses showDirectoryPicker when the File System
