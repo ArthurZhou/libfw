@@ -235,8 +235,16 @@ export class LibfwClient {
    *        before any bytes are buffered; a download that would exceed it is
    *        rejected with a `too-large` error instead of risking an OOM.
    *        `0` disables the limit.
+   * @param {boolean} [options.autoTune=false] enable the adaptive tuning
+   *        engine: the engine probes the server's `/capabilities` limits and
+   *        TCP-style ramps concurrency / windows / chunk sizes (and the zrip
+   *        level) from the advertised minimums using real transfer stats.
+   *        When disabled the configured static values are used as-is.
+   * @param {number} [options.tuneTtlMs=3600000] how long a settled tuning
+   *        result is reused for the same server origin before re-ramping
    * @param {(event: {type: string, done: number, total: number, path?: string, error?: string}) => void} [options.onEvent]
-   *        optional progress/state listener
+   *        optional progress/state listener. Tuning updates arrive as
+   *        `{ type: 'tuning', phase, params, stats }` events.
    */
   constructor(options = {}) {
     this._options = {
@@ -254,6 +262,8 @@ export class LibfwClient {
       wasmUrl: null,
       downloadMode: 'auto',
       maxFallbackBytes: 512 * 1024 * 1024,
+      autoTune: false,
+      tuneTtlMs: 3600000,
       onEvent: null,
       ...options,
     };
@@ -310,8 +320,15 @@ export class LibfwClient {
       baseRetryDelayMs: this._options.baseRetryDelayMs,
       maxRetryDelayMs: this._options.maxRetryDelayMs,
       timeoutMs: this._options.timeoutMs,
+      autoTune: this._options.autoTune,
+      tuneTtlMs: this._options.tuneTtlMs,
     });
     engine.set_callbacks(this._makeCallbacks());
+    // Forward tuning state changes (phase transitions, window evaluations)
+    // to the SDK consumer as `{ type: 'tuning', phase, params, stats }`.
+    engine.set_tune_callback((phase, params, stats) => {
+      this._emit({ type: 'tuning', phase, params, stats });
+    });
     this._engine = engine;
     return engine;
   }
@@ -1099,6 +1116,23 @@ export class LibfwClient {
    */
   totalBytes() {
     return this._engine ? this._engine.total_bytes() : 0;
+  }
+
+  /**
+   * Live adaptive-tuning status: `{ phase, params, stats, capsHash }`.
+   *
+   * - `phase`: `uninitialized | ramping | settled | degraded`
+   * - `params`: `{ concurrency, uploadWindow, downloadWindow, chunkSize,
+   *   downloadChunkSize, compressLevel }` — the parameters the engine is
+   *   currently tuned to
+   * - `stats`: `{ rttMs, mbps }` — EWMA request RTT and last-window
+   *   throughput of the most recent transfer
+   *
+   * `null` until the WASM engine is initialised.
+   * @returns {object|null}
+   */
+  tuneStatus() {
+    return this._engine ? this._engine.tune_state() : null;
   }
 
   // ------------------------------------------------------------- resume store

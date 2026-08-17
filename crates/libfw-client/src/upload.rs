@@ -504,7 +504,17 @@ async fn upload_session_resumable(
             match commit_upload(base_url, token, file, callbacks, control, config, &session)
                 .await
             {
-                Ok(()) => break file.size.saturating_sub(initial_covered),
+                Ok(()) => {
+                    // Feed the tuning engine BEFORE breaking: the success
+                    // `break`s below skip the end-of-loop tick, so without
+                    // an explicit tick here uploads would never contribute a
+                    // measurement and the engine would stay at the caps
+                    // minimums forever (no ramp, no events).
+                    if tune.borrow().enabled() {
+                        tune_tick(tune, control, control.done_bytes(), None, false);
+                    }
+                    break file.size.saturating_sub(initial_covered);
+                }
                 Err(e) => {
                     if rounds >= config.max_retries {
                         return Err(e);
@@ -560,7 +570,14 @@ async fn upload_session_resumable(
         //    acks missed (rare) is caught here as a rejection and triggers a
         //    re-probe + refill on the next round.
         match commit_upload(base_url, token, file, callbacks, control, config, &session).await {
-            Ok(()) => break file.size.saturating_sub(initial_covered),
+            Ok(()) => {
+                // Tune with this round's outcome (see the sibling tick above:
+                // the success break skips the end-of-loop tick).
+                if tune.borrow().enabled() {
+                    tune_tick(tune, control, control.done_bytes(), None, round_errors > 0);
+                }
+                break file.size.saturating_sub(initial_covered);
+            }
             Err(e) => {
                 rounds += 1;
                 if rounds > config.max_retries {

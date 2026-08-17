@@ -75,6 +75,21 @@
   }
   .status-pill { font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
   .status-pill.active { color: var(--accent); border-color: var(--accent); }
+  .tune-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+  .tune-grid .chip {
+    display: inline-flex; align-items: baseline; gap: 6px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 10px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  .tune-grid .chip b { font-weight: 600; color: var(--fg); }
+  .tune-grid .chip i { font-style: normal; color: var(--fg); font-family: var(--mono); }
+  .chip.phase-ramping { border-color: var(--warn); color: var(--warn); }
+  .chip.phase-ramping i { color: var(--warn); }
+  .chip.phase-settled { border-color: var(--ok); color: var(--ok); }
+  .chip.phase-settled i { color: var(--ok); }
+  .chip.phase-degraded { border-color: var(--err); color: var(--err); }
+  .chip.phase-degraded i { color: var(--err); }
+  .tune-foot { margin-top: 8px; font-size: 12px; color: var(--muted); }
   details.help { margin-top: 10px; }
   details.help summary { cursor: pointer; color: var(--muted); font-size: 12px; }
   details.help pre { font: 12px var(--mono); background: var(--bg); padding: 10px; border-radius: 6px; overflow: auto; }
@@ -138,6 +153,22 @@
     <div id="files"></div>
     <div id="log"></div>
   </section>
+
+  <section class="card">
+    <h2>Adaptive tuning <span class="badge" id="tune-on">—</span></h2>
+    <div class="tune-grid" id="tune-grid">
+      <span class="chip" id="tune-phase-chip"><b>phase</b><i id="t-phase">—</i></span>
+      <span class="chip"><b>concurrency</b><i id="t-conc">—</i></span>
+      <span class="chip"><b>upload win</b><i id="t-uw">—</i></span>
+      <span class="chip"><b>download win</b><i id="t-dw">—</i></span>
+      <span class="chip"><b>chunk</b><i id="t-chunk">—</i></span>
+      <span class="chip"><b>dl chunk</b><i id="t-dchunk">—</i></span>
+      <span class="chip"><b>zrip level</b><i id="t-level">—</i></span>
+      <span class="chip"><b>rtt</b><i id="t-rtt">—</i></span>
+      <span class="chip"><b>throughput</b><i id="t-mbps">—</i></span>
+    </div>
+    <div class="tune-foot" id="tune-foot">the engine TCP-style ramps concurrency / windows / chunk sizes against the server caps — status updates live during transfers</div>
+  </section>
 </main>
 
 <script type="module">
@@ -175,12 +206,40 @@
       downloadWindow: 4,
       compress: true,
       chunkSize: 2 * 1024 * 1024,
+      autoTune: true,
       onEvent: (e) => {
         if (e.type === 'progress') onProgress(e.done, e.total);
         else if (e.type === 'fileStart') addFileRow(e.path, e.total, '▶');
         else if (e.type === 'fileCompleted') markFileDone(e.path);
+        else if (e.type === 'tuning') renderTune({ phase: e.phase, params: e.params, stats: e.stats });
       },
     });
+    $('tune-on').textContent = 'enabled (autoTune)';
+  }
+
+  const PHASE_LABEL = {
+    uninitialized: 'uninitialized',
+    ramping: 'ramping ↑',
+    settled: 'settled ✓',
+    degraded: 'degraded ⚠',
+  };
+  function renderTune(t) {
+    if (!t) return;
+    const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+    const p = t.params || {};
+    const s = t.stats || {};
+    const phase = t.phase || 'uninitialized';
+    set('t-phase', PHASE_LABEL[phase] ?? phase);
+    const chip = $('tune-phase-chip');
+    if (chip) chip.className = `chip phase-${phase}`;
+    set('t-conc', p.concurrency ?? '—');
+    set('t-uw', p.uploadWindow ?? '—');
+    set('t-dw', p.downloadWindow ?? '—');
+    set('t-chunk', p.chunkSize ? fmt(p.chunkSize) : '—');
+    set('t-dchunk', p.downloadChunkSize ? fmt(p.downloadChunkSize) : '—');
+    set('t-level', p.compressLevel ?? '—');
+    set('t-rtt', s.rttMs ? `${Math.round(s.rttMs)} ms` : '—');
+    set('t-mbps', s.mbps ? `${s.mbps.toFixed(1)} Mb/s` : '—');
   }
 
   function setBusy(active) {
@@ -245,6 +304,7 @@
       speed.rate = 0;
       $('st-speed').textContent = '—';
       $('st-eta').textContent = '—';
+      if (client) renderTune(client.tuneStatus());
       setBusy(false);
       if (busy === false) $('st-state').textContent = 'idle';
     }
@@ -334,6 +394,11 @@
     refresh();
     log(`connected to ${$('base').value}`);
   });
+
+  // Live refresh of the tuning panel while a transfer is active.
+  setInterval(() => {
+    if (busy && client) renderTune(client.tuneStatus());
+  }, 1000);
 
   $('files').addEventListener('change', (ev) => {
     // Copy immediately: `input.files` is a live FileList and the `value = ''`

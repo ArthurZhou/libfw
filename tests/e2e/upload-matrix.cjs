@@ -96,6 +96,7 @@ function check(name, ok, detail = '') {
   // ---------------------------------------------------------------- fixtures
   const fix = (name, bytes) => {
     const p = `/tmp/libfw-e2e/${name}`;
+    fs.mkdirSync('/tmp/libfw-e2e', { recursive: true });
     fs.writeFileSync(p, bytes);
     return { p, bytes, sha: sha(bytes) };
   };

@@ -28,13 +28,19 @@ function check(name, ok, detail = '') {
     downloadThroughput: 8 * 1024 * 1024, uploadThroughput: 32 * 1024 * 1024,
   });
 
-  // Capture probe responses (session-status) and chunk POST offsets.
+  // Capture probe responses (session-status), chunk POST offsets, and the
+  // first chunk ack (used to time the cancel AFTER bytes land server-side).
   const probes = [];
   const chunkOffsets = [];
+  let firstChunkAcked = false;
   page.on('response', async (r) => {
     const req = r.request();
-    if (req.method() === 'POST' && req.headers()['x-libfw-session-status']) {
+    if (req.method() !== 'POST' || !req.url().includes('/file/')) return;
+    const h = req.headers();
+    if (h['x-libfw-session-status']) {
       probes.push({ status: r.status(), body: await r.text().catch(() => '?') });
+    } else if (h['x-libfw-offset'] && h['x-libfw-offset'] !== '' && r.status() === 201) {
+      firstChunkAcked = true;
     }
   });
   page.on('request', (r) => {
@@ -58,6 +64,7 @@ function check(name, ok, detail = '') {
     }
   };
 
+  fs.mkdirSync('/tmp/libfw-e2e', { recursive: true });
   const filePath = '/tmp/libfw-e2e/resume.bin';
   const bytes = crypto.randomBytes(30 * 1024 * 1024 + 777); // 15 chunks @ 2MiB (window 8 -> real gaps on cancel)
   const FULL = bytes.length;
@@ -67,21 +74,26 @@ function check(name, ok, detail = '') {
   // ---- run 1: cancel mid-transfer ----------------------------------------
   await clearLog();
   await page.setInputFiles('#files', filePath);
-  // Wait until progress is clearly non-zero but not finished, then cancel.
+  // Cancel only after REAL progress (engine doneBytes > 0, a chunk acked).
+  // NOTE: the UI % element starts at the static placeholder "0%" and the
+  // engine may take ~0.5s (capabilities probe + level benchmark) before the
+  // first chunk even starts, so DOM text is not a reliable progress signal.
   let cancelled = false;
-  for (let i = 0; i < 400; i++) {
+  for (let i = 0; i < 1200; i++) {
     const log = await logText();
     if (log.includes('✔ done') || log.includes('✖')) break;
-    const pct = await page.textContent('#st-pct').catch('0.0%');
-    if (pct !== '0.0%' && pct !== '100.0%') {
+    const progressed = await page.evaluate(() => {
+      const c = window.libfw?.client;
+      return c ? c.doneBytes() > 0 : false;
+    }).catch(() => false);
+    if (progressed && firstChunkAcked) {
       await page.evaluate(() => window.libfw.client.cancel());
       cancelled = true;
       break;
     }
-    await page.waitForTimeout(20);
     await page.waitForTimeout(50);
   }
-  check('run1: cancel issued mid-transfer', cancelled, `chunkOffsets run1=${chunkOffsets.join(',')}`);
+  check('run1: cancel issued mid-transfer', cancelled, `chunkOffsets run1=${chunkOffsets.slice(0, 5).join(',')}… (${chunkOffsets.length} total)`);
   await waitIdle();
   await page.waitForTimeout(500);
   const partials = fs.readdirSync('/tmp/libfw-storage').filter((f) => f.includes('.libfw-sess-'));
