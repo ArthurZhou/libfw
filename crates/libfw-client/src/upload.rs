@@ -2,6 +2,9 @@
 //! fixed-size chunks, compresses each chunk into one zstd frame and POSTs
 //! them with `x-libfw-offset` so the server can resume/validate offsets.
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use wasm_bindgen::JsValue;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -62,6 +65,13 @@ pub(crate) async fn sleep_ms(ms: u32) {
 /// `semaphore` is the engine-wide in-flight HTTP pool (sized by
 /// `concurrency`): every data request takes a permit so `concurrency` bounds
 /// the TOTAL number of parallel transfers, not just concurrent files.
+///
+/// `on_progress` (when set) is invoked on every XHR upload-progress tick with
+/// `(loaded, total)` bytes of the body being sent, enabling wire-level
+/// real-time progress reporting.
+// clippy: this is the single choke point for every upload request; grouping
+// the progress plumbing would churn every caller for no gain.
+#[allow(clippy::too_many_arguments)]
 async fn post_chunk(
     base_url: &str,
     token: &str,
@@ -73,6 +83,7 @@ async fn post_chunk(
     final_chunk: bool,
     session: &str,
     semaphore: &Semaphore,
+    on_progress: Option<Rc<dyn Fn(u64, u64)>>,
 ) -> Result<(), LibfwError> {
     // Header pairs for the XHR upload path (XHR cannot consume a `Headers`).
     let mut headers: Vec<(String, String)> = vec![
@@ -104,8 +115,9 @@ async fn post_chunk(
     // XHR-based upload with a NO-PROGRESS timeout: `fetch` cannot observe
     // upload progress, so a slow-but-active upload on a low-bandwidth link
     // (e.g. through a CF tunnel) would be killed by a wall clock. The XHR
-    // path only aborts when nothing has moved for `timeout_ms`.
-    let promise = xhr_post(&url, &headers, body, timeout_ms)?;
+    // path only aborts when nothing has moved for `timeout_ms`; the optional
+    // `on_progress` callback turns the wire ticks into real-time progress.
+    let promise = xhr_post(&url, &headers, body, timeout_ms, on_progress)?;
     let status = JsFuture::from(promise)
         .await
         .map_err(|e| LibfwError::Network(format!("upload request failed: {e:?}")))?
@@ -284,6 +296,30 @@ async fn upload_one_chunk(
     };
 
     let mut attempts = 0u32;
+    // Wire-level progress accounting for this chunk. `last_loaded` tracks how
+    // many bytes of THIS payload have already been counted, and the closure
+    // only counts the delta on every XHR progress tick, so:
+    //  - a large chunk shows smooth, real-time progress instead of a jump,
+    //  - a retried attempt never double-counts bytes it already reported
+    //    (the counter only moves forward across attempts), and
+    //  - the success path below reconciles any uncounted tail.
+    let last_loaded = Rc::new(Cell::new(0u64));
+    let on_progress = {
+        let control = control.clone();
+        let callbacks = callbacks.clone();
+        let last_loaded = last_loaded.clone();
+        Some(Rc::new(move |loaded: u64, _total: u64| {
+            let prev = last_loaded.get();
+            if loaded > prev {
+                last_loaded.set(loaded);
+                control.add_progress(loaded - prev);
+                // Best-effort: a throwing JS progress handler must not abort
+                // the transfer (the synchronous post-chunk report below is
+                // still authoritative).
+                let _ = control.report_progress_if(&callbacks);
+            }
+        }) as Rc<dyn Fn(u64, u64)>)
+    };
     loop {
         control.wait_ready().await?;
         control.check()?;
@@ -298,6 +334,7 @@ async fn upload_one_chunk(
             false,
             session,
             control.semaphore(),
+            on_progress.clone(),
         )
         .await
         {
@@ -316,7 +353,13 @@ async fn upload_one_chunk(
         }
     }
 
-    control.add_progress(len);
+    // Reconcile: XHR fires its last progress event slightly before the
+    // request settles, so count the (usually tiny) uncounted tail — unless
+    // the wire already counted the whole payload.
+    let counted = last_loaded.get().min(len);
+    if counted < len {
+        control.add_progress(len - counted);
+    }
     // Report smooth intermediate progress during a long single-file upload
     // (throttled to whole-percent boundaries so a 200 MB file doesn't sit at
     // 0% until it jumps to 100%).
@@ -349,6 +392,7 @@ async fn commit_upload(
             true,
             session,
             control.semaphore(),
+            None, // the commit request carries no body, so no wire progress
         )
         .await
         {

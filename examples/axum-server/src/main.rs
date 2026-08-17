@@ -1,6 +1,23 @@
-//! libfw integration example — axum file server.
+//! libfw integration example — axum file server with a built-in web UI.
 //!
-//! Run: `cargo run -p axum-server -- <storage-dir> [port] [--static <dir>]`
+//! Serves the full libfw HTTP API (via `libfw_server::router`) plus an
+//! embedded, dependency-free file-manager frontend at `/` — upload/download
+//! files & folders, browse and navigate the storage tree, live progress with
+//! pause/resume/cancel — all driven by the libfw browser SDK.
+//!
+//! Run: `cargo run -p axum-server -- <storage-dir> [port]`
+//! Then open http://127.0.0.1:8080/ (token: `dev-token`).
+//!
+//! The frontend imports the SDK from `/sdk/index.js`, which the server
+//! serves straight from the repository's `sdk/` directory, so the WASM
+//! engine must be built first (once):
+//!
+//! ```bash
+//! wasm-pack build crates/libfw-client --target web --out-dir ../../sdk/pkg --release
+//! ```
+//!
+//! Without `sdk/pkg` the page still renders and explains what to run; the
+//! REST API itself works regardless.
 //!
 //! API routes (all require `Authorization: Bearer <token>`, and validate the
 //! `x-libfw-protocol` handshake shared with the WASM client):
@@ -8,19 +25,17 @@
 //!   HEAD /file/{*path}   metadata only
 //!   POST /file/{*path}   streaming upload
 //!   GET  /dir/{*path}    directory listing (JSON)
+//!   GET  /capabilities   capability advertisement (public)
 //!
 //! Extra routes:
-//!   GET  /health         JSON service info (no auth)
-//!   GET  /               same as /health
-//!
-//! Optional `--static <dir>` serves a static directory as a fallback, so the
-//! web demo can be served from the same origin (e.g. `--static .` then open
-//! `/examples/web/index.html`). The bundled `TokenVerifier` accepts the
-//! literal token "dev-token".
+//!   GET  /           embedded web UI (no auth)
+//!   GET  /health     JSON service info (no auth)
+//!   GET  /sdk/*      the browser SDK + pkg (no auth, dev convenience)
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::response::Html;
 use axum::routing::get;
 use axum::Json;
 use libfw_core::auth::{AuthError, PathValidator, TokenVerifier};
@@ -55,7 +70,11 @@ impl TokenVerifier for DevTokenVerifier {
 #[derive(Clone)]
 struct Health {
     storage_root: PathBuf,
-    static_dir: Option<PathBuf>,
+}
+
+/// The embedded web UI (see `index.html`).
+async fn index() -> Html<&'static str> {
+    Html(include_str!("../index.html"))
 }
 
 #[tokio::main]
@@ -67,35 +86,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // Parse: <root> [port] [--static <dir>]  (all optional, in any order).
+    // Parse: <root> [port]  (both optional).
     let args: Vec<String> = std::env::args().collect();
     let mut root = PathBuf::from("./data");
     let mut port: u16 = 8080;
-    let mut static_dir: Option<PathBuf> = None;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--static" => {
-                i += 1;
-                static_dir = args.get(i).map(PathBuf::from);
-            }
-            "--port" => {
-                i += 1;
-                if let Some(p) = args.get(i).and_then(|s| s.parse().ok()) {
-                    port = p;
-                }
-            }
-            _ if args[i].parse::<u16>().is_ok() => {
-                port = args[i].parse().unwrap_or(port);
-            }
-            _ if root == PathBuf::from("./data") => {
-                root = PathBuf::from(&args[i]);
-            }
-            _ => {
-                tracing::warn!("ignoring unknown argument: {}", args[i]);
-            }
+    for arg in args.iter().skip(1) {
+        if let Ok(p) = arg.parse::<u16>() {
+            port = p;
+        } else {
+            root = PathBuf::from(arg);
         }
-        i += 1;
     }
 
     std::fs::create_dir_all(&root)?;
@@ -121,7 +121,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let health = Arc::new(Health {
         storage_root: root.clone(),
-        static_dir: static_dir.clone(),
     });
 
     // tus-style expiry: sweep abandoned session-upload temps hourly so a
@@ -159,39 +158,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "version": env!("CARGO_PKG_VERSION"),
                     "protocol": libfw_core::protocol_header_value(),
                     "storage_root": health.storage_root.to_string_lossy(),
-                    "static_dir": health.static_dir.as_ref().map(|d| d.to_string_lossy()),
                 }))
             }
         }
     };
 
-    // Permissive CORS for the dev demo: the HTML page may be served on a
-    // different origin (e.g. :5173) than this API. Production deployments
-    // should restrict this.
-    let mut app = router(state)
+    // Permissive CORS for the dev demo: the page can point its "server URL"
+    // at a different origin (e.g. a remote libfw deployment). Production
+    // deployments should restrict this.
+    let app = router(state)
+        .route("/", get(index))
         .route("/health", get(health_route))
+        .nest_service(
+            "/sdk",
+            ServeDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../sdk")),
+        )
         .layer(CorsLayer::permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http());
-
-    // Optionally serve a static directory (e.g. the repo root) as a
-    // fallback so the web demo works from the same origin. API routes take
-    // precedence over the fallback service.
-    if let Some(dir) = &static_dir {
-        let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-        tracing::info!("serving static files from {}", canonical.display());
-        app = app.fallback_service(ServeDir::new(canonical));
-    }
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     tracing::info!("libfw axum server listening on {addr}");
     tracing::info!("  storage root : {}", root.display());
     tracing::info!("  dev token    : `dev-token`");
     tracing::info!("  protocol     : {}", libfw_core::protocol_header_value());
+    tracing::info!("  web UI       : http://{addr}/");
     tracing::info!("  health       : http://{addr}/health");
     tracing::info!("  transport    : HTTP (SDK/engine; parallel Range + chunked uploads)");
     tracing::info!("  download     : GET/HEAD http://{addr}/file/{{*path}}");
     tracing::info!("  upload       : POST http://{addr}/file/{{*path}}");
     tracing::info!("  listing      : GET http://{addr}/dir/{{*path}}");
+    if !std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../sdk/pkg/libfw_client.js")).exists() {
+        tracing::warn!("sdk/pkg missing — build the WASM engine with:");
+        tracing::warn!("  wasm-pack build crates/libfw-client --target web --out-dir ../../sdk/pkg --release");
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

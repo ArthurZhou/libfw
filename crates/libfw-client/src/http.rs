@@ -134,13 +134,17 @@ where
 /// moving) is aborted.
 ///
 /// `header_pairs` is copied onto the XHR (XHR cannot consume a `Headers`
-/// object). The promise resolves with the HTTP status (u16 as f64) and
-/// rejects on network error or no-progress timeout.
+/// object). When `on_progress` is set it is invoked on every upload progress
+/// tick with `(loaded, total)` bytes, so the engine can report **wire-level**
+/// progress in real time instead of jumping per completed chunk. The promise
+/// resolves with the HTTP status (u16 as f64) and rejects on network error
+/// or no-progress timeout.
 pub fn xhr_post(
     url: &str,
     header_pairs: &[(String, String)],
     body: &[u8],
     timeout_ms: u32,
+    on_progress: Option<Rc<dyn Fn(u64, u64)>>,
 ) -> Result<js_sys::Promise, LibfwError> {
     let xhr = XmlHttpRequest::new()
         .map_err(|e| LibfwError::Js(format!("XmlHttpRequest::new failed: {e:?}")))?;
@@ -165,6 +169,10 @@ pub fn xhr_post(
     // All event closures must stay alive until the request settles; the
     // settle path clears this to release them (no per-chunk leaks).
     let holders: Rc<RefCell<Vec<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(Vec::new()));
+    // The upload-progress handler has a different closure signature, so it
+    // gets its own holder (cleared on the same settle paths as `holders`).
+    let progress_holder: Rc<RefCell<Option<Closure<dyn FnMut(web_sys::ProgressEvent)>>>> =
+        Rc::new(RefCell::new(None));
 
     let promise = js_sys::Promise::new(&mut |resolve, reject| {
         let xhr = xhr.clone();
@@ -173,6 +181,8 @@ pub fn xhr_post(
         let finished = finished.clone();
         let watchdog_id = watchdog_id.clone();
         let holders = holders.clone();
+        let progress_holder = progress_holder.clone();
+        let on_progress = on_progress.clone();
         let resolve = resolve.clone();
         let reject = reject.clone();
         let timeout_ms = timeout_ms;
@@ -187,6 +197,7 @@ pub fn xhr_post(
             let watchdog_id = watchdog_id.clone();
             let reject = reject.clone();
             let holders = holders.clone();
+            let progress_holder = progress_holder.clone();
             Closure::wrap(Box::new(move || {
                 if finished.get() {
                     return;
@@ -202,6 +213,7 @@ pub fn xhr_post(
                         )),
                     );
                     holders.borrow_mut().clear();
+                    progress_holder.borrow_mut().take();
                 }
             }) as Box<dyn FnMut()>)
         };
@@ -221,16 +233,22 @@ pub fn xhr_post(
         watchdog_id.set(id);
         holders.borrow_mut().push(watchdog);
 
-        // Upload body progress: any movement refreshes the deadline.
+        // Upload body progress: refresh the no-progress deadline and, when a
+        // callback was supplied, report wire-level progress (`loaded` bytes
+        // of `total` have been handed to the network stack).
         let on_upload_progress = {
             let deadline = deadline.clone();
-            Closure::wrap(Box::new(move || {
+            let on_progress = on_progress.clone();
+            Closure::wrap(Box::new(move |ev: web_sys::ProgressEvent| {
                 deadline.set(js_sys::Date::now());
-            }) as Box<dyn FnMut()>)
+                if let Some(cb) = &on_progress {
+                    cb(ev.loaded() as u64, ev.total() as u64);
+                }
+            }) as Box<dyn FnMut(web_sys::ProgressEvent)>)
         };
         let upload_target: &XmlHttpRequestEventTarget = upload.unchecked_ref();
         upload_target.set_onprogress(Some(on_upload_progress.as_ref().unchecked_ref()));
-        holders.borrow_mut().push(on_upload_progress);
+        *progress_holder.borrow_mut() = Some(on_upload_progress);
 
         // Response phase: refresh the deadline once headers/body start
         // arriving, and settle when the request is DONE.
@@ -243,6 +261,7 @@ pub fn xhr_post(
             let resolve = resolve.clone();
             let reject = reject.clone();
             let holders = holders.clone();
+            let progress_holder = progress_holder.clone();
             Closure::wrap(Box::new(move || {
                 if finished.get() {
                     return;
@@ -264,6 +283,7 @@ pub fn xhr_post(
                         );
                     }
                     holders.borrow_mut().clear();
+                    progress_holder.borrow_mut().take();
                 }
             }) as Box<dyn FnMut()>)
         };
@@ -277,6 +297,7 @@ pub fn xhr_post(
             let watchdog_id = watchdog_id.clone();
             let reject = reject.clone();
             let holders = holders.clone();
+            let progress_holder = progress_holder.clone();
             Closure::wrap(Box::new(move || {
                 if finished.get() {
                     return;
@@ -285,6 +306,7 @@ pub fn xhr_post(
                 window.clear_interval_with_handle(watchdog_id.get());
                 let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("libfw upload network error"));
                 holders.borrow_mut().clear();
+                progress_holder.borrow_mut().take();
             }) as Box<dyn FnMut()>)
         };
         let xhr_target: &XmlHttpRequestEventTarget = xhr.unchecked_ref();
@@ -299,6 +321,7 @@ pub fn xhr_post(
             let watchdog_id = watchdog_id.clone();
             let reject = reject.clone();
             let holders = holders.clone();
+            let progress_holder = progress_holder.clone();
             Closure::wrap(Box::new(move || {
                 if finished.get() {
                     return;
@@ -307,6 +330,7 @@ pub fn xhr_post(
                 window.clear_interval_with_handle(watchdog_id.get());
                 let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("libfw upload aborted"));
                 holders.borrow_mut().clear();
+                progress_holder.borrow_mut().take();
             }) as Box<dyn FnMut()>)
         };
         xhr_target.set_onabort(Some(on_abort.as_ref().unchecked_ref()));
@@ -319,6 +343,7 @@ pub fn xhr_post(
                 &JsValue::from_str(&format!("libfw xhr.send failed: {e:?}")),
             );
             holders.borrow_mut().clear();
+            progress_holder.borrow_mut().take();
         }
     });
 

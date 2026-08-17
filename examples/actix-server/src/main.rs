@@ -1,26 +1,25 @@
-//! libfw integration example — actix-web file server.
+//! libfw integration example — actix-web file server (minimal).
 //!
-//! Demonstrates that libfw's framework-agnostic core contracts (storage
-//! backend, token validation, streaming compression) plug into actix-web
-//! as easily as into axum.
+//! Shows how to call libfw's framework-agnostic contracts from actix-web:
+//! `ServerState` (storage + auth), `FsStorage`, the `TokenVerifier` /
+//! `Validator` traits and the HTTP transfer routes. No frontend, no extra
+//! routes — just the API surface, so it stays a focused "how to integrate"
+//! reference. The axum example (`examples/axum-server`) is the full-featured
+//! server with an embedded web UI.
 //!
 //! Run: `cargo run -p libfw-actix-server -- <storage-dir> [port]`
-//! Then open http://127.0.0.1:8081/ for the transfer-status dashboard.
+//! The dev verifier accepts the literal token "dev-token".
 //!
 //! Routes:
-//!   GET  /                    demo dashboard (transfer status + config)
-//!   GET  /capabilities        capability advertisement (public, JSON)
-//!   GET  /file/{path}         download with Range/ETag/compression
-//!   HEAD /file/{path}         metadata only
-//!   POST /file/{path}         streaming upload
-//!   GET  /dir/{path}          directory listing (JSON)
-//!
-//! The bundled `TokenVerifier` accepts the literal token "dev-token".
+//!   GET  /file/{path}   download with Range/ETag/compression
+//!   HEAD /file/{path}   metadata only
+//!   POST /file/{path}   streaming upload (sequential or session-chunked)
+//!   GET  /dir           root listing (JSON)
+//!   GET  /dir/{path}    directory listing (JSON)
 
 use std::io::Read;
 use std::sync::Arc;
 
-use actix_cors::Cors;
 use actix_web::http::header::{self, HeaderMap};
 use actix_web::web::{self, Bytes};
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer};
@@ -33,8 +32,8 @@ use libfw_core::storage::WriteMode;
 use libfw_core::{RangeSpec, StorageError, STREAM_BUF_SIZE};
 use libfw_server::{
     content_range_none_value, content_range_value, etag_matches_if_none_match, if_range_matches,
-    parse_range_header, EncryptedPathCodec, FsStorage, ParsedRange, ServerState, HEADER_COMPRESS,
-    HEADER_FILE_META, HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION,
+    parse_range_header, FsStorage, ParsedRange, ServerState, HEADER_COMPRESS, HEADER_FILE_META,
+    HEADER_FINAL, HEADER_OFFSET, HEADER_SESSION,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -74,11 +73,15 @@ fn authorize(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing bearer token"})))?;
+        .ok_or_else(|| {
+            HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing bearer token"}))
+        })?;
     let claims = state
         .verifier
         .verify(token.trim())
-        .map_err(|e| HttpResponse::Unauthorized().json(serde_json::json!({"error": e.to_string()})))?;
+        .map_err(|e| {
+            HttpResponse::Unauthorized().json(serde_json::json!({"error": e.to_string()}))
+        })?;
     state
         .validator
         .validate(&claims, path, action)
@@ -86,12 +89,15 @@ fn authorize(
             AuthError::Forbidden { path, action } => HttpResponse::Forbidden().json(
                 serde_json::json!({"error": format!("permission denied: {action} on `{path}`")}),
             ),
-            other => HttpResponse::Unauthorized().json(serde_json::json!({"error": other.to_string()})),
+            other => {
+                HttpResponse::Unauthorized().json(serde_json::json!({"error": other.to_string()}))
+            }
         })?;
     Ok(claims)
 }
 
-/// Path validation shared by all handlers.
+/// Path validation shared by all handlers (rejects absolute paths, `..`,
+/// NUL bytes and empty segments).
 fn validate_path(raw: &str) -> Result<String, HttpResponse> {
     if raw.contains('\0') {
         return Err(HttpResponse::BadRequest().json(serde_json::json!({"error": "path contains NUL"})));
@@ -104,7 +110,9 @@ fn validate_path(raw: &str) -> Result<String, HttpResponse> {
         match seg {
             "" | "." => {}
             ".." => {
-                return Err(HttpResponse::BadRequest().json(serde_json::json!({"error": "path escapes root"})))
+                return Err(
+                    HttpResponse::BadRequest().json(serde_json::json!({"error": "path escapes root"}))
+                )
             }
             s => {
                 if !out.is_empty() {
@@ -146,12 +154,12 @@ fn reader_stream(reader: Box<dyn Read + Send>) -> BoxStream<'static, Result<Byte
     ReceiverStream::new(rx).boxed()
 }
 
-/// Optionally wrap a byte stream through the zrip compressor.
-///
-/// The compressor is shared behind an `Arc<Mutex<_>>` because the map
-/// closure (sync) and the finish step (async) both need it, and actix
-/// requires `Send` response streams.
-fn maybe_compress<S>(raw: S, format: CompressionFormat) -> BoxStream<'static, Result<Bytes, std::io::Error>>
+/// Optionally wrap a byte stream through the zrip compressor (shared behind
+/// an `Arc<Mutex<_>>` so the map closure and the finish step can both use it).
+fn maybe_compress<S>(
+    raw: S,
+    format: CompressionFormat,
+) -> BoxStream<'static, Result<Bytes, std::io::Error>>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
@@ -219,13 +227,21 @@ async fn file_download(
 
     // Range negotiation.
     let mut range = None;
-    if let Some(raw) = req.headers().get(header::RANGE).and_then(|v| v.to_str().ok()) {
+    if let Some(raw) = req
+        .headers()
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+    {
         match parse_range_header(raw) {
             Ok(r) => range = r,
             Err(_) => return HttpResponse::BadRequest().body("malformed range header"),
         }
     }
-    if let Some(if_range) = req.headers().get(header::IF_RANGE).and_then(|v| v.to_str().ok()) {
+    if let Some(if_range) = req
+        .headers()
+        .get(header::IF_RANGE)
+        .and_then(|v| v.to_str().ok())
+    {
         if !if_range_matches(if_range, &meta.etag) {
             range = None;
         }
@@ -239,9 +255,7 @@ async fn file_download(
                 let mut resp = HttpResponse::RangeNotSatisfiable().finish();
                 resp.headers_mut().insert(
                     header::CONTENT_RANGE,
-                    content_range_none_value(meta.size)
-                        .parse()
-                        .expect("header"),
+                    content_range_none_value(meta.size).parse().expect("header"),
                 );
                 return resp;
             }
@@ -251,9 +265,7 @@ async fn file_download(
                 let mut resp = HttpResponse::RangeNotSatisfiable().finish();
                 resp.headers_mut().insert(
                     header::CONTENT_RANGE,
-                    content_range_none_value(meta.size)
-                        .parse()
-                        .expect("header"),
+                    content_range_none_value(meta.size).parse().expect("header"),
                 );
                 return resp;
             }
@@ -293,10 +305,7 @@ async fn file_download(
         .insert_header((header::ETAG, meta.etag.clone()))
         .insert_header((HEADER_COMPRESS, format.as_str()));
     if is_partial {
-        builder.insert_header((
-            header::CONTENT_RANGE,
-            content_range_value(&spec, meta.size),
-        ));
+        builder.insert_header((header::CONTENT_RANGE, content_range_value(&spec, meta.size)));
     }
     if format == CompressionFormat::None {
         builder.insert_header((header::CONTENT_LENGTH, spec.len().to_string()));
@@ -457,10 +466,9 @@ async fn file_upload(
     }
 }
 
-/// Handle one request of the concurrent "session" upload protocol (mirrors
-/// the axum handler). Data chunks write at their ABSOLUTE offset into a
-/// shared per-session temp; the `x-libfw-final` request verifies the size
-/// and commits.
+/// Handle one request of the concurrent "session" upload protocol. Data
+/// chunks write at their ABSOLUTE offset into a shared per-session temp; the
+/// `x-libfw-final` request verifies the size and commits.
 async fn upload_session_actix(
     state: &ServerState,
     path: &str,
@@ -486,7 +494,11 @@ async fn upload_session_actix(
         WriteMode::Overwrite
     };
 
-    let mut sink = match state.storage.write_stream_session(path, session, owner, create_mode).await {
+    let mut sink = match state
+        .storage
+        .write_stream_session(path, session, owner, create_mode)
+        .await
+    {
         Ok(s) => s,
         Err(StorageError::AlreadyExists(_)) => return HttpResponse::Conflict().body("exists"),
         Err(_) => return HttpResponse::InternalServerError().finish(),
@@ -565,21 +577,6 @@ async fn upload_session_actix(
 // Directory listing
 // ---------------------------------------------------------------------------
 
-/// `GET /dir/{path}` — JSON listing of immediate children.
-async fn dir_list(
-    req: HttpRequest,
-    state: web::Data<Arc<ServerState>>,
-    path: web::Path<String>,
-) -> HttpResponse {
-    dir_list_inner(&req, &state, path.as_str()).await
-}
-
-/// `GET /dir` — root listing (actix's `{path:.*}` does not match an empty
-/// tail, so the root needs its own route).
-async fn dir_list_root(req: HttpRequest, state: web::Data<Arc<ServerState>>) -> HttpResponse {
-    dir_list_inner(&req, &state, "").await
-}
-
 async fn dir_list_inner(
     req: &HttpRequest,
     state: &web::Data<Arc<ServerState>>,
@@ -598,21 +595,19 @@ async fn dir_list_inner(
     }
 }
 
-/// `GET /capabilities` — the server's capability advertisement (public):
-/// tuning-parameter ranges, zrip level range, compression formats and the
-/// protocol version. The demo dashboard renders these as the transfer
-/// configuration panel.
-async fn capabilities(state: web::Data<Arc<ServerState>>) -> HttpResponse {
-    HttpResponse::Ok().json(state.capabilities())
+/// `GET /dir/{path}` — JSON listing of immediate children.
+async fn dir_list(
+    req: HttpRequest,
+    state: web::Data<Arc<ServerState>>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    dir_list_inner(&req, &state, path.as_str()).await
 }
 
-/// `GET /` — the embedded transfer-status dashboard (vanilla JS, no build
-/// step): live upload/download progress, completion status and the
-/// `/capabilities` configuration table.
-async fn dashboard() -> HttpResponse {
-    HttpResponse::Ok()
-        .content_type("text/html; charset=utf-8")
-        .body(include_str!("../index.html"))
+/// `GET /dir` — root listing (actix's `{path:.*}` does not match an empty
+/// tail, so the root needs its own route).
+async fn dir_list_root(req: HttpRequest, state: web::Data<Arc<ServerState>>) -> HttpResponse {
+    dir_list_inner(&req, &state, "").await
 }
 
 // ---------------------------------------------------------------------------
@@ -622,51 +617,17 @@ async fn dashboard() -> HttpResponse {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let root = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "./data".to_string());
+    let root = args.get(1).cloned().unwrap_or_else(|| "./data".to_string());
     let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8081);
     std::fs::create_dir_all(&root)?;
 
-    let state = Arc::new({
-        let mut builder = ServerState::builder()
+    let state = Arc::new(
+        ServerState::builder()
             .storage(FsStorage::new(&root))
             .verifier(DevTokenVerifier)
-            .validator(PathValidator::new());
-        if let Ok(key_hex) = std::env::var("LIBFW_PATH_KEY") {
-            match EncryptedPathCodec::from_hex(&key_hex) {
-                Ok(codec) => {
-                    builder = builder.path_codec(codec);
-                    tracing::info!("shadow paths: encrypted (LIBFW_PATH_KEY set)");
-                }
-                Err(err) => tracing::warn!(
-                    "LIBFW_PATH_KEY ignored ({err}); falling back to identity paths"
-                ),
-            }
-        }
-        builder.build()
-    });
-
-    // tus-style expiry: sweep abandoned session-upload temps hourly so a
-    // client that vanished mid-upload never leaves its `.libfw-sess-*` temp
-    // (or `.blocks` sidecar) behind forever.
-    {
-        let storage = state.storage.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
-            loop {
-                tick.tick().await;
-                match storage
-                    .cleanup_stale_sessions(libfw_core::DEFAULT_SESSION_TTL)
-                    .await
-                {
-                    Ok(n) if n > 0 => println!("cleaned {n} stale upload session temp(s)"),
-                    _ => {}
-                }
-            }
-        });
-    }
+            .validator(PathValidator::new())
+            .build(),
+    );
 
     let addr = format!("127.0.0.1:{port}");
     println!("libfw actix-web server listening on {addr}, storage root: {root}");
@@ -674,13 +635,7 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
-            // Permissive CORS for the dev demo (the dashboard is same-origin,
-            // but a page served elsewhere may also call this API). Restrict
-            // in production.
-            .wrap(Cors::permissive())
             .app_data(web::Data::new(state.clone()))
-            .route("/", web::get().to(dashboard))
-            .route("/capabilities", web::get().to(capabilities))
             .route("/file/{path:.*}", web::get().to(file_download))
             .route("/file/{path:.*}", web::head().to(file_download))
             .route("/file/{path:.*}", web::post().to(file_upload))

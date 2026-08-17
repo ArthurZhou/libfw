@@ -7,7 +7,6 @@
 //! - `allowed_paths` still authorizes the **real** path (token semantics
 //!   unchanged), so a shadow of an unauthorized subtree stays forbidden
 //! - tampered shadow → 400
-//! - WebSocket upload accepts shadow paths and lands on the real path
 //!
 //! These tests only build when libfw-server's `path-encrypt` feature is on
 //! (the encrypted codec is feature-gated in libfw-core).
@@ -19,17 +18,11 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
-use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use libfw_core::auth::{AuthError, PathValidator, TokenVerifier};
 use libfw_core::claims::{Permission, TokenClaims};
 use libfw_core::metadata::{FileMeta, encode_file_meta_header};
 use libfw_core::pathmap::{EncryptedPathCodec, PathCodec};
-use libfw_core::ws::{
-    FRAME_COMPLETE, FRAME_HELLO, FRAME_HELLO_OK, FRAME_READY, FRAME_START, Hello, StartRequest,
-    TransferKind, block_bounds, block_count, block_frame, control_frame, crc32, frame_payload,
-    frame_type, parse_control, wave_done_frame,
-};
 use libfw_server::{FsStorage, ServerState, router, HEADER_FILE_META};
 use serde::Deserialize;
 use tower::ServiceExt;
@@ -249,7 +242,7 @@ async fn tampered_shadow_is_400() {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket upload through a shadow
+// Dir listing helpers
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -258,105 +251,4 @@ struct DirList(Vec<DirEntry>);
 #[derive(Deserialize)]
 struct DirEntry {
     path: String,
-}
-
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
-
-async fn connect_ws(state: Arc<ServerState>) -> Ws {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, router(state)).await.unwrap();
-    });
-    let (ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-        .await
-        .expect("ws connect");
-    ws
-}
-
-async fn send(ws: &mut Ws, frame: Vec<u8>) {
-    ws.send(tokio_tungstenite::tungstenite::Message::Binary(frame))
-        .await
-        .unwrap();
-}
-
-async fn recv(ws: &mut Ws) -> Vec<u8> {
-    loop {
-        match ws.next().await {
-            Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(b))) => return b.to_vec(),
-            Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(p))) => {
-                ws.send(tokio_tungstenite::tungstenite::Message::Pong(p))
-                    .await
-                    .unwrap();
-            }
-            Some(Ok(_)) => continue,
-            other => panic!("ws closed unexpectedly: {other:?}"),
-        }
-    }
-}
-
-#[tokio::test]
-async fn ws_upload_accepts_shadow_path() {
-    let state = state();
-    let codec = EncryptedPathCodec::new(KEY);
-    let shadow = codec.encode("media/clip.mp4");
-    let mut ws = connect_ws(state.clone()).await;
-
-    // Hello handshake.
-    send(&mut ws, control_frame(FRAME_HELLO, &Hello::new("tok"))).await;
-    let f = recv(&mut ws).await;
-    assert_eq!(frame_type(&f), Some(FRAME_HELLO_OK));
-
-    // Start an upload to the shadow path.
-    let data: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
-    let start = StartRequest {
-        kind: TransferKind::Upload,
-        path: shadow.clone(),
-        size: data.len() as u64,
-        mtime: 0,
-        etag: String::new(),
-        compress: false,
-        mode: "overwrite".into(),
-        offset: 0,
-        block_size: 1024,
-        window: 0,
-    };
-    send(&mut ws, control_frame(FRAME_START, &start)).await;
-    let ready = recv(&mut ws).await;
-    let _ready: libfw_core::ws::ReadyReply = parse_control(&ready, FRAME_READY).unwrap();
-
-    // Send all blocks (in order is fine here), then wave-done.
-    let total = block_count(data.len() as u64, 1024);
-    for idx in 0..total {
-        let (s, e) = block_bounds(idx, 1024, data.len() as u64);
-        let payload = &data[s as usize..e as usize];
-        send(
-            &mut ws,
-            block_frame(idx, crc32(payload), payload.len() as u32, payload),
-        )
-        .await;
-    }
-    send(&mut ws, wave_done_frame()).await;
-    let complete = recv(&mut ws).await;
-    assert_eq!(
-        frame_type(&complete),
-        Some(FRAME_COMPLETE),
-        "payload: {}",
-        String::from_utf8_lossy(frame_payload(&complete))
-    );
-
-    // The file landed on the REAL path, and only there.
-    let meta = state
-        .storage
-        .file_meta("media/clip.mp4")
-        .await
-        .unwrap()
-        .expect("real path must exist after WS upload through shadow");
-    assert_eq!(meta.size, data.len() as u64);
-    assert!(
-        state.storage.file_meta(&shadow).await.unwrap().is_none(),
-        "shadow must not be used as a storage path"
-    );
 }

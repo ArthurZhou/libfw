@@ -377,7 +377,13 @@ mod encrypt_tests {
         let shadow = codec.encode("secret/plan.txt");
         let mut bytes = shadow.into_bytes();
         let n = bytes.len();
-        bytes[n - 1] = if bytes[n - 1] == b'A' { b'B' } else { b'A' };
+        // Flip a byte well before the end: base64 trailing chars can contain
+        // unused low bits (when byte count ≢ 0 mod 3), so flipping the very
+        // last char may be a no-op in the decoded byte stream. Using a
+        // position near the middle of the base64 payload guarantees we hit
+        // a fully-significant byte.
+        let mid = n / 2;
+        bytes[mid] = if bytes[mid] == b'A' { b'B' } else { b'A' };
         let bad = String::from_utf8(bytes).unwrap();
         assert_eq!(
             codec.decode(&bad),

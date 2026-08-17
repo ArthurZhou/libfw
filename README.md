@@ -12,14 +12,10 @@ crates/
   libfw-server/   embeddable axum handlers: routing, auth, Range/ETag, streaming I/O
   libfw-client/   WASM engine (wasm-bindgen) + JS SDK in sdk/
 examples/
-  axum-server/    runnable axum file server (the libfw integration example)
-  actix-server/   runnable actix-web file server — serves a transfer-status
-                  dashboard at `/` (progress, completion, live config)
-  web/            HTML demo page for the browser SDK
+  axum-server/    runnable axum file server with an embedded web UI at `/`
+  actix-server/   minimal actix-web integration example (API only, no frontend)
 sdk/              libfw-client npm package (ESM + TS types + wasm)
 ```
-
-
 
 ## Highlights
 
@@ -30,9 +26,8 @@ sdk/              libfw-client npm package (ESM + TS types + wasm)
   chunked POSTs** into a shared per-session temp with a final size-verified
   commit. Independent parallel streams mean a lost packet stalls only that
   one stream (which retries just its own bytes) instead of blocking a whole
-  multiplexed WebSocket connection — this is what keeps transfers moving on
-  lossy/unstable links. A WebSocket endpoint (`/ws`) remains on the server
-  for raw clients and older builds.
+  multiplexed connection — this is what keeps transfers moving on
+  lossy/unstable links.
 - **Resumable**: the client persists `{ etag, offset, size }` in IndexedDB and
   re-validates against the server (source of truth) on every retry; uploads
   resume from a shared per-session temp (BitTorrent-style, only the missing
@@ -65,17 +60,17 @@ sdk/              libfw-client npm package (ESM + TS types + wasm)
 ## Quick start: run a server
 
 ```bash
-# axum example (storage root `data`, port 8080)
+# axum example (storage root `data`, port 8080) — serves the web UI at `/`
 cargo run -p axum-server -- data 8080
 
-# or actix-web (port 8081) — also serves a transfer-status dashboard at `/`
+# actix-web example (port 8081) — API only (integration reference)
 cargo run -p libfw-actix-server -- data 8081
 ```
 
 The dev servers accept the token `dev-token`. Open
-<http://127.0.0.1:8081/> for the actix example's dashboard: it shows the
-`/capabilities` configuration (concurrency/window/chunk-size/zrip ranges),
-live upload & download progress (bytes, speed, ETA) and completion status.
+<http://127.0.0.1:8080/> for the axum example's web UI: browse/upload/
+download files and folders with live progress (bytes, speed, ETA),
+pause/resume/cancel, and a transfer log.
 
 The dev servers accept the token `dev-token`:
 
@@ -97,8 +92,8 @@ curl -H "Authorization: Bearer dev-token" http://127.0.0.1:8080/dir/dir
 
 ## Browser demo
 
-A one-click dev script starts the axum server, serves the demo page, and opens
-the browser:
+A one-click dev script starts the axum server (which embeds the web UI at
+`/`) and opens the browser:
 
 ```bash
 # Windows
@@ -108,14 +103,14 @@ dev-test.bat
 ./dev-test.sh
 ```
 
-It runs `cargo test --workspace`, boots the API on `:8080` and a static server
-for `examples/web/` on `:5173`. Override with `PORT_API`, `PORT_WEB` and
-`TOKEN` env vars. The demo page (`examples/web/index.html`) can also be opened
-manually from any static server once the SDK is built (see
+It runs `cargo test --workspace`, boots the API on `:8080` and opens
+<http://127.0.0.1:8080/>. Override with `PORT_API` and `TOKEN` env vars.
+For the UI to work the WASM engine must be built once (see
 [Building the SDK](#building-the-sdk)).
 
-> The demo relies on the **File System Access API** (`showDirectoryPicker`,
-> `createWritable`) and therefore needs a Chromium-based browser.
+> The UI relies on the **File System Access API** (`showDirectoryPicker`,
+> `createWritable`) for folder operations and therefore needs a
+> Chromium-based browser.
 
 ## Embedding in a Rust app
 
@@ -465,7 +460,7 @@ The browser SDK/WASM engine performs **all** communication (control commands
 and data) over plain HTTP at the routes below — no WebSocket. The design
 follows the tus/download-manager model: **independent parallel streams** per
 range/chunk, so a lost packet stalls only that one stream (which retries just
-its own bytes) instead of blocking a whole multiplexed WebSocket connection.
+its own bytes) instead of blocking a whole multiplexed connection.
 
 ### Downloads (tus-style parallel `Range` GETs)
 
@@ -512,15 +507,13 @@ balancer; `libfw` itself stays transport-agnostic.
 
 ## HTTP protocol
 
-The HTTP routes are the transport the browser SDK uses (see
-[HTTP transport](#http-transport) above). A WebSocket endpoint remains for
-raw clients and older builds.
+The HTTP routes below are the transport the browser SDK uses (see
+[HTTP transport](#http-transport) above).
 
 ### Routes
 
 | Method | Route          | Purpose |
 | ------ | -------------- | ------- |
-| GET    | `/ws`           | optional WebSocket control (kept for back-compat) |
 | GET    | `/file/{*path}` | download (Range, ETag, If-Range, compression) |
 | HEAD   | `/file/{*path}` | metadata only |
 | POST   | `/file/{*path}` | streaming upload (headers below) |

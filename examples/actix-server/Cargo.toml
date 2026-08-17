@@ -9,7 +9,6 @@ description = "libfw integration example: an actix-web based file server"
 libfw-core = { path = "../../crates/libfw-core" }
 libfw-server = { path = "../../crates/libfw-server", features = ["path-encrypt"] }
 actix-web = "4"
-actix-cors = "0.7"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"

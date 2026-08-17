@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>libfw · file server</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f8fa; --card: #fff; --fg: #1f2328; --muted: #656d76;
+    --border: #d0d7de; --accent: #2f81f7; --accent-fg: #fff;
+    --ok: #1a7f37; --err: #cf222e; --warn: #9a6700;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --card: #161b22; --fg: #e6edf3; --muted: #8b949e;
+      --border: #30363d; --accent: #4493f8; --ok: #3fb950; --err: #f85149; --warn: #d29922;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px; background: var(--card); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0; }
+  header .badge { font-size: 12px; color: var(--muted); }
+  main { max-width: 1080px; margin: 0 auto; padding: 16px; }
+  section.card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  label.fld { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+  input[type="text"], input[type="password"] {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; font: inherit; min-width: 200px;
+  }
+  button {
+    background: var(--accent); color: var(--accent-fg); border: none; border-radius: 6px;
+    padding: 7px 14px; font: inherit; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--fg); border: 1px solid var(--border); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.danger { background: var(--err); }
+  button.small { padding: 2px 8px; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  tr.dir-row { cursor: pointer; }
+  tr.dir-row:hover td { background: var(--bg); }
+  .entry-name .icon { margin-right: 6px; }
+  .crumb { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; font-size: 13px; }
+  .crumb a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .crumb .sep { color: var(--muted); }
+  .empty { color: var(--muted); text-align: center; padding: 18px 0; }
+  #bar-wrap { height: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  #bar { height: 100%; width: 0%; background: linear-gradient(90deg, #2f81f7, #56d364); transition: width .12s; }
+  #stats { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 8px; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #files { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; font: 12px var(--mono); color: var(--muted); max-height: 140px; overflow: auto; }
+  #log { margin-top: 10px; font: 12px/1.55 var(--mono); white-space: pre-wrap; word-break: break-all;
+         max-height: 180px; overflow: auto; color: var(--muted); }
+  #log .err { color: var(--err); } #log .ok { color: var(--ok); } #log .warn { color: var(--warn); }
+  .file-inputs { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  input[type="file"] { font: inherit; color: var(--muted); max-width: 100%; }
+  input[type="file"]::file-selector-button {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px; margin-right: 8px; cursor: pointer; font: inherit;
+  }
+  .status-pill { font-size: 12px; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+  .status-pill.active { color: var(--accent); border-color: var(--accent); }
+  details.help { margin-top: 10px; }
+  details.help summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  details.help pre { font: 12px var(--mono); background: var(--bg); padding: 10px; border-radius: 6px; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>libfw</h1>
+  <span class="badge">file server demo · axum + browser SDK</span>
+  <span id="status-pill" class="status-pill">engine: loading…</span>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Connection</h2>
+    <div class="row">
+      <label class="fld">Server URL
+        <input id="base" type="text" value="" spellcheck="false" />
+      </label>
+      <label class="fld">Token
+        <input id="token" type="password" value="dev-token" spellcheck="false" />
+      </label>
+      <button id="connect" class="ghost">Apply</button>
+      <span class="badge" id="conn-status"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Files</h2>
+    <div class="crumb" id="crumbs"><a data-cd="">root</a></div>
+    <table>
+      <thead><tr><th>Name</th><th class="num">Size</th><th class="num">Modified</th><th style="width:190px">Actions</th></tr></thead>
+      <tbody id="listing"><tr><td colspan="4" class="empty">Loading…</td></tr></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Upload</h2>
+    <div class="file-inputs">
+      <input id="files" type="file" multiple />
+      <input id="folder" type="file" webkitdirectory multiple />
+      <span class="badge">choose files, or a whole folder (Chromium)</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Transfer</h2>
+    <div id="bar-wrap"><div id="bar"></div></div>
+    <div id="stats">
+      <span id="st-progress">0 B / 0 B</span>
+      <span id="st-pct">0%</span>
+      <span id="st-speed">—</span>
+      <span id="st-eta">—</span>
+      <span id="st-state">idle</span>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button id="pause" disabled>Pause</button>
+      <button id="resume" disabled>Resume</button>
+      <button id="cancel" class="danger" disabled>Cancel</button>
+    </div>
+    <div id="files"></div>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script type="module">
+  import { LibfwClient } from '/sdk/index.js';
+
+  const $ = (id) => document.getElementById(id);
+  const fmt = (n) => {
+    if (n == null || isNaN(n)) return '—';
+    if (n < 1024) return `${n} B`;
+    const u = ['KiB', 'MiB', 'GiB', 'TiB'];
+    let i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+    return `${n.toFixed(n >= 100 ? 0 : 1)} ${u[i]}`;
+  };
+  const fmtTime = (t) => (t ? new Date(t * 1000).toLocaleString() : '—');
+  const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  const log = (msg, cls = '') => {
+    const line = document.createElement('div');
+    line.className = cls;
+    line.textContent = `${new Date().toLocaleTimeString()} ${msg}`;
+    $('log').prepend(line);
+  };
+
+  let client = null;
+  let busy = false;
+  let curPath = '';
+  let speed = { done: 0, t: 0, rate: 0, last: 0 };
+
+  function newClient() {
+    client = new LibfwClient({
+      baseUrl: $('base').value.replace(/\/+$/, ''),
+      concurrency: 4,
+      uploadWindow: 8,
+      downloadWindow: 4,
+      compress: true,
+      chunkSize: 2 * 1024 * 1024,
+      onEvent: (e) => {
+        if (e.type === 'progress') onProgress(e.done, e.total);
+        else if (e.type === 'fileStart') addFileRow(e.path, e.total, '▶');
+        else if (e.type === 'fileCompleted') markFileDone(e.path);
+      },
+    });
+  }
+
+  function setBusy(active) {
+    busy = active;
+    $('pause').disabled = !active;
+    $('resume').disabled = !active;
+    $('cancel').disabled = !active;
+    $('connect').disabled = active;
+  }
+
+  let startedAt = 0;
+  function onProgress(done, total) {
+    const now = performance.now();
+    if (!startedAt) { startedAt = now; speed.done = done; speed.t = now; speed.rate = 0; }
+    const dt = (now - speed.t) / 1000;
+    if (dt >= 0.5) {
+      speed.rate = (done - speed.done) / dt;
+      speed.done = done; speed.t = now;
+    }
+    const pct = total > 0 ? (done / total) * 100 : 0;
+    $('bar').style.width = `${Math.min(100, pct)}%`;
+    $('st-progress').textContent = `${fmt(done)} / ${fmt(total)}`;
+    $('st-pct').textContent = `${pct.toFixed(1)}%`;
+    $('st-speed').textContent = speed.rate > 0 ? `${fmt(speed.rate)}/s` : '—';
+    $('st-eta').textContent = speed.rate > 0 && total > done ? `${Math.round((total - done) / speed.rate)}s` : '—';
+  }
+
+  function addFileRow(path, total, icon) {
+    const row = document.createElement('div');
+    row.id = `f-${path.replace(/[^\w.-]/g, '_')}`;
+    row.textContent = `${icon} ${path} (${fmt(total)})`;
+    $('files').prepend(row);
+  }
+  function markFileDone(path) {
+    const row = document.getElementById(`f-${path.replace(/[^\w.-]/g, '_')}`);
+    if (row) row.textContent = `✔ ${path}`;
+  }
+
+  async function runTransfer(fn, what) {
+    if (busy) { log('transfer already active', 'warn'); return; }
+    const token = $('token').value.trim();
+    if (!token) { log('enter a token first', 'warn'); return; }
+    setBusy(true);
+    startedAt = 0;
+    $('st-state').textContent = 'running';
+    $('files').textContent = '';
+    log(`▶ ${what}`);
+    try {
+      const bytes = await fn(token);
+      log(`✔ done: ${fmt(bytes)} transferred`, 'ok');
+      $('st-state').textContent = 'completed';
+      refresh();
+    } catch (err) {
+      log(`✖ ${what} failed: ${err?.message ?? err}`, 'err');
+      $('st-state').textContent = 'failed';
+    } finally {
+      startedAt = 0;
+      speed.rate = 0;
+      $('st-speed').textContent = '—';
+      $('st-eta').textContent = '—';
+      setBusy(false);
+      if (busy === false) $('st-state').textContent = 'idle';
+    }
+  }
+
+  // ---------------------------------------------------------------- listing
+  async function listDir(path) {
+    const base = $('base').value.replace(/\/+$/, '');
+    const token = $('token').value.trim();
+    const url = `${base}/dir${path ? '/' + path.split('/').map(encodeURIComponent).join('/') : ''}`;
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!resp.ok) throw new Error(`list ${path || '/'}: HTTP ${resp.status}`);
+    return await resp.json();
+  }
+
+  async function refresh() {
+    try {
+      const entries = await listDir(curPath);
+      renderCrumbs();
+      const tbody = $('listing');
+      tbody.textContent = '';
+      if (curPath) {
+        const up = curPath.split('/').slice(0, -1).join('/');
+        const row = document.createElement('tr');
+        row.className = 'dir-row';
+        row.innerHTML = `<td class="entry-name"><span class="icon">⬆</span>..</td><td class="num"></td><td class="num"></td><td></td>`;
+        row.onclick = () => { curPath = up; refresh(); };
+        tbody.appendChild(row);
+      }
+      if (!entries.length) {
+        const row = document.createElement('tr');
+        row.innerHTML = `<td colspan="4" class="empty">empty directory</td>`;
+        tbody.appendChild(row);
+        return;
+      }
+      for (const e of entries) {
+        const row = document.createElement('tr');
+        const name = e.path.split('/').pop();
+        row.className = e.is_dir ? 'dir-row' : '';
+        const actions = e.is_dir
+          ? `<button class="small" data-act="dl">folder ↓</button>`
+          : `<button class="small" data-act="dl">download</button>`;
+        row.innerHTML =
+          `<td class="entry-name"><span class="icon">${e.is_dir ? '📁' : '📄'}</span>${esc(name)}</td>` +
+          `<td class="num">${e.is_dir ? '—' : fmt(e.size)}</td>` +
+          `<td class="num">${fmtTime(e.mtime)}</td>` +
+          `<td>${actions}</td>`;
+        if (e.is_dir) {
+          row.onclick = () => { curPath = e.path; refresh(); };
+        }
+        row.querySelector('[data-act="dl"]').addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (e.is_dir) runTransfer((t) => client.downloadFolder(t, e.path), `download folder ${e.path}`);
+          else runTransfer((t) => client.downloadFile(t, e.path), `download ${e.path}`);
+        });
+        tbody.appendChild(row);
+      }
+    } catch (err) {
+      $('listing').innerHTML = `<tr><td colspan="4" class="empty">${esc(err.message)}</td></tr>`;
+    }
+  }
+
+  function renderCrumbs() {
+    const c = $('crumbs');
+    c.textContent = '';
+    const add = (label, path) => {
+      const a = document.createElement('a');
+      a.textContent = label;
+      a.onclick = () => { curPath = path; refresh(); };
+      c.appendChild(a);
+    };
+    add('root', '');
+    if (curPath) {
+      const parts = curPath.split('/');
+      let acc = '';
+      for (const p of parts) {
+        acc = acc ? `${acc}/${p}` : p;
+        c.appendChild(document.createTextNode(' / '));
+        add(p, acc);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- wiring
+  $('connect').addEventListener('click', () => {
+    newClient();
+    refresh();
+    log(`connected to ${$('base').value}`);
+  });
+
+  $('files').addEventListener('change', (ev) => {
+    const files = ev.target.files;
+    if (!files.length) return;
+    runTransfer((t) => client.upload(t, files), `upload ${files.length} file(s)`);
+    ev.target.value = '';
+  });
+
+  $('folder').addEventListener('change', (ev) => {
+    const files = ev.target.files;
+    if (!files.length) return;
+    runTransfer((t) => client.upload(t, files), `upload folder (${files.length} file(s))`);
+    ev.target.value = '';
+  });
+
+  $('pause').addEventListener('click', () => { client.pause(); $('st-state').textContent = 'paused'; log('paused'); });
+  $('resume').addEventListener('click', () => { client.resume(); $('st-state').textContent = 'running'; log('resumed'); });
+  $('cancel').addEventListener('click', () => { client.cancel(); log('cancelled', 'warn'); });
+
+  // ---------------------------------------------------------------- boot
+  $('base').value = location.origin;
+
+  // Detect the WASM engine availability; the REST API works without it.
+  client = new LibfwClient({ baseUrl: location.origin });
+  client._ready?.().then(
+    () => { $('status-pill').textContent = 'engine: ready'; $('status-pill').classList.add('active'); },
+    () => { $('status-pill').textContent = 'engine: missing (wasm-pack)'; }
+  );
+
+  refresh();
+
+  // Expose for the console tinkerers.
+  window.libfw = { get client() { return client; } };
+</script>
+</body>
+</html>

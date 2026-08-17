@@ -34,5 +34,3 @@ tokio-stream = "0.1"
 tempfile = "3"
 tower.workspace = true
 http-body-util = "0.1"
-tokio-tungstenite.workspace = true
-futures-util = "0.3"
