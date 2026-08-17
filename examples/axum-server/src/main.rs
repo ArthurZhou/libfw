@@ -35,6 +35,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::http::header::CACHE_CONTROL;
+use axum::http::HeaderValue;
 use axum::response::Html;
 use axum::routing::get;
 use axum::Json;
@@ -42,6 +44,7 @@ use libfw_core::auth::{AuthError, PathValidator, TokenVerifier};
 use libfw_core::claims::{Permission, TokenClaims};
 use libfw_server::{router, EncryptedPathCodec, FsStorage, ServerState};
 use tower_http::cors::CorsLayer;
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::services::ServeDir;
 
 /// A permissive token verifier for local development / demos.
@@ -174,6 +177,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ServeDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../sdk")),
         )
         .layer(CorsLayer::permissive())
+        .layer(SetResponseHeaderLayer::if_not_present(
+            CACHE_CONTROL,
+            HeaderValue::from_static("no-store, max-age=0"),
+        ))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));

@@ -51,6 +51,11 @@ use js_sys::Reflect;
 use wasm_bindgen::prelude::*;
 
 use crate::js::Callbacks;
+
+#[wasm_bindgen(start)]
+pub fn start() {
+    console_error_panic_hook::set_once();
+}
 use crate::state::{TaskControl, TaskState};
 use crate::tune::{TuningEngine, now_ms};
 

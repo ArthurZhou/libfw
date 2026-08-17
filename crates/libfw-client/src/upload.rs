@@ -468,6 +468,12 @@ async fn upload_session_resumable(
         control.add_progress(initial_covered);
         control.report_progress_if(callbacks)?;
     }
+    if initial_covered >= file.size {
+        callbacks.log(&format!(
+            "upload `{}` already fully present on the server; skipping re-send ({} bytes already covered)",
+            file.path, initial_covered
+        ));
+    }
 
     let mut rounds = 0u32;
     let mut first_error: Option<LibfwError> = None;
@@ -703,9 +709,16 @@ pub async fn upload(
 
     // Resolve the compression level once per session: `Auto` micro-benchmarks
     // a 256 KiB sample of the first file against the advertised candidates.
-    let caps = tune.borrow().caps().unwrap_or_default();
+    let caps = {
+        let t = tune.borrow();
+        t.caps().unwrap_or_default()
+    };
     let (compress, level) = if config.compress {
-        let sample = if tune.borrow().enabled() {
+        let enabled = {
+            let t = tune.borrow();
+            t.enabled()
+        };
+        let sample = if enabled {
             match files.first() {
                 Some(f) if f.size > 0 => {
                     let len = (f.size as usize).min(LEVEL_SAMPLE_SIZE);
@@ -720,9 +733,14 @@ pub async fn upload(
         } else {
             None
         };
-        let level = tune
-            .borrow_mut()
-            .upload_compress_level(&caps, sample.as_deref(), tune.borrow().stats().mbps);
+        let stats_mbps = {
+            let t = tune.borrow();
+            t.stats().mbps
+        };
+        let level = {
+            let mut t = tune.borrow_mut();
+            t.upload_compress_level(&caps, sample.as_deref(), stats_mbps)
+        };
         (true, level)
     } else {
         (false, caps.compression.zrip_levels.default)

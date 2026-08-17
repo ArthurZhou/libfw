@@ -11,6 +11,7 @@ node_modules/
 
 # Dev-mode launcher data
 /dev-data/
+/data/
 
 # Editor / OS
 .idea/

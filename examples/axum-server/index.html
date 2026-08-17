@@ -230,7 +230,11 @@
     log(`▶ ${what}`);
     try {
       const bytes = await fn(token);
-      log(`✔ done: ${fmt(bytes)} transferred`, 'ok');
+      if (bytes > 0) {
+        log(`✔ done: ${fmt(bytes)} transferred`, 'ok');
+      } else {
+        log('✔ done: no bytes needed (already present / resumed no-op)', 'ok');
+      }
       $('st-state').textContent = 'completed';
       refresh();
     } catch (err) {
@@ -356,8 +360,21 @@
   client = new LibfwClient({ baseUrl: location.origin });
   client._ready?.().then(
     () => { $('status-pill').textContent = 'engine: ready'; $('status-pill').classList.add('active'); },
-    () => { $('status-pill').textContent = 'engine: missing (wasm-pack)'; }
+    (err) => {
+      console.error('libfw wasm init failed', err);
+      $('status-pill').textContent = 'engine: missing (wasm-pack)';
+      log(`engine init failed: ${err?.message ?? err}`, 'err');
+    }
   );
+
+  window.addEventListener('error', (ev) => {
+    console.error('window error', ev.error ?? ev.message);
+    log(`browser error: ${ev.error?.message ?? ev.message}`, 'err');
+  });
+  window.addEventListener('unhandledrejection', (ev) => {
+    console.error('unhandled rejection', ev.reason);
+    log(`unhandled rejection: ${ev.reason?.message ?? ev.reason}`, 'err');
+  });
 
   refresh();
 

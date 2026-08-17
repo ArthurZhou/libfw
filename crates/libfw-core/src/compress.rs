@@ -479,20 +479,21 @@ fn zstd_frame_boundary(buf: &[u8]) -> FrameBoundary {
     if !single_segment {
         hdr_len += 1; // window descriptor
     }
-    hdr_len += match dict_id_flag {
+    let dict_id_size = match dict_id_flag {
         0 => 0,
         1 => 1,
         2 => 2,
         3 => 4,
-        _ => unreachable!(),
+        _ => return FrameBoundary::Invalid,
     };
+    hdr_len += dict_id_size;
     let fcs_size: usize = match fcs_flag {
         0 if single_segment => 1,
         0 => 0,
         1 => 2,
         2 => 4,
         3 => 8,
-        _ => unreachable!(),
+        _ => return FrameBoundary::Invalid,
     };
     hdr_len += fcs_size;
 
@@ -619,6 +620,18 @@ mod tests {
         d.decompress(&compressed, &mut plain).unwrap();
         d.finish(&mut plain).unwrap();
         assert!(plain.is_empty());
+    }
+
+    #[test]
+    fn malformed_zstd_headers_are_rejected_without_panicking() {
+        // Keep the parser defensive: malformed / hostile frame headers must
+        // surface as Invalid instead of crashing the WASM guest with an
+        // internal `unreachable!`.
+        let bad = [0xFD, 0x2F, 0xB5, 0x28, 0xFF];
+        assert!(matches!(frame_boundary(&bad), FrameBoundary::Invalid));
+
+        let bad2 = [0xFD, 0x2F, 0xB5, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert!(matches!(frame_boundary(&bad2), FrameBoundary::Invalid));
     }
 
     #[test]
