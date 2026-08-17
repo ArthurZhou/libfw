@@ -432,7 +432,6 @@
 
   // Detect the WASM engine availability; the REST API works without it.
   client._ready?.().then(
-  client._ready?.().then(
     () => { $('status-pill').textContent = 'engine: ready'; $('status-pill').classList.add('active'); },
     (err) => {
       console.error('libfw wasm init failed', err);
