@@ -57,11 +57,12 @@ pub async fn fetch(
     Ok(value.unchecked_into())
 }
 
-/// Race a promise against a timer that rejects after `ms` (0 disables).
+/// Wrap a JS promise with a deadline.
 ///
-/// When `abort` is given, the timer also aborts the request's
-/// `AbortController` first, so a hung fetch/`ReadableStream` read is really
-/// cancelled — not just raced — and releases its connection immediately.
+/// The timeout is enforced by aborting the request's `AbortController` only
+/// when the deadline actually fires. If the underlying promise resolves or
+/// rejects before that time, the timer is cleared so it cannot abort a
+/// finished request and generate a spurious `AbortError` later.
 fn with_timeout(
     promise: js_sys::Promise,
     ms: u32,
@@ -70,22 +71,83 @@ fn with_timeout(
     if ms == 0 {
         return promise;
     }
-    let timer = js_sys::Promise::new(&mut |_resolve, reject| {
-        // No window (non-browser host): degrade to an un-timed race instead
-        // of panicking.
-        let Some(window) = web_sys::window() else { return };
-        if let Some(ctrl) = abort {
-            ctrl.abort();
-        }
-        let f: &js_sys::Function = reject.unchecked_ref();
-        let err = js_sys::Error::new(&format!("libfw request timed out after {ms}ms"));
-        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_1(
-            f,
-            ms as i32,
-            &err.into(),
-        );
-    });
-    js_sys::Promise::race(&js_sys::Array::of2(&promise, &timer))
+
+    let holders: Rc<RefCell<Vec<Closure<dyn FnMut(JsValue)>>>> = Rc::new(RefCell::new(Vec::new()));
+    let timeout_holder: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+    let scheduled = Rc::new(Cell::new(None::<i32>));
+
+    js_sys::Promise::new(&mut |resolve, reject| {
+        let Some(window) = web_sys::window() else {
+            // No browser window at all: just pass through the underlying
+            // promise without imposing a timeout.
+            let resolve_fn = js_sys::Function::from(resolve.clone());
+            let reject_fn = js_sys::Function::from(reject.clone());
+            let on_ok = Closure::wrap(Box::new(move |v: JsValue| {
+                let _ = resolve_fn.call1(&JsValue::UNDEFINED, &v);
+            }) as Box<dyn FnMut(JsValue)>);
+            let on_err = Closure::wrap(Box::new(move |e: JsValue| {
+                let _ = reject_fn.call1(&JsValue::UNDEFINED, &e);
+            }) as Box<dyn FnMut(JsValue)>);
+            let _ = promise.then(&on_ok);
+            let _ = promise.catch(&on_err);
+            holders.borrow_mut().push(on_ok);
+            holders.borrow_mut().push(on_err);
+            return;
+        };
+
+        let resolve_fn = js_sys::Function::from(resolve.clone());
+        let reject_fn = js_sys::Function::from(reject.clone());
+        let window_for_success = window.clone();
+        let scheduled_for_success = scheduled.clone();
+        let holders_for_success = holders.clone();
+        let timeout_holder_for_success = timeout_holder.clone();
+        let on_ok = Closure::wrap(Box::new(move |value: JsValue| {
+            if let Some(id) = scheduled_for_success.take() {
+                window_for_success.clear_timeout_with_handle(id);
+            }
+            timeout_holder_for_success.borrow_mut().take();
+            holders_for_success.borrow_mut().clear();
+            let _ = resolve_fn.call1(&JsValue::UNDEFINED, &value);
+        }) as Box<dyn FnMut(JsValue)>);
+
+        let window_for_fail = window.clone();
+        let scheduled_for_fail = scheduled.clone();
+        let holders_for_fail = holders.clone();
+        let timeout_holder_for_fail = timeout_holder.clone();
+        let on_err = Closure::wrap(Box::new(move |err: JsValue| {
+            if let Some(id) = scheduled_for_fail.take() {
+                window_for_fail.clear_timeout_with_handle(id);
+            }
+            timeout_holder_for_fail.borrow_mut().take();
+            holders_for_fail.borrow_mut().clear();
+            let _ = reject_fn.call1(&JsValue::UNDEFINED, &err);
+        }) as Box<dyn FnMut(JsValue)>);
+
+        let _ = promise.then(&on_ok);
+        let _ = promise.catch(&on_err);
+        holders.borrow_mut().push(on_ok);
+        holders.borrow_mut().push(on_err);
+
+        let timeout_abort = abort.cloned();
+        let timeout_reject = reject.clone();
+        let timeout_holder_for_timeout = timeout_holder.clone();
+        let timeout_cb = Closure::wrap(Box::new(move || {
+            if let Some(ctrl) = timeout_abort.as_ref() {
+                ctrl.abort();
+            }
+            let err = js_sys::Error::new(&format!("libfw request timed out after {ms}ms"));
+            timeout_holder_for_timeout.borrow_mut().take();
+            let _ = timeout_reject.call1(&JsValue::UNDEFINED, &err.into());
+        }) as Box<dyn FnMut()>);
+        let timer_id = window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                timeout_cb.as_ref().unchecked_ref(),
+                ms as i32,
+            )
+            .expect("setTimeout callback should be registered");
+        scheduled.set(Some(timer_id));
+        timeout_holder.borrow_mut().replace(timeout_cb);
+    })
 }
 
 /// Read the entire response body into memory (used for small JSON payloads

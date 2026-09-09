@@ -4,6 +4,7 @@
 //! thin `wasm` bridge. This allows the client logic to be consumed by Rust
 //! code directly, while the JS/browser-facing API remains in the dedicated
 //! WASM module.
+#![allow(dead_code)]
 #![recursion_limit = "512"]
 
 mod config;

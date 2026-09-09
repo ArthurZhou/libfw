@@ -12,7 +12,7 @@ use crate::config::ClientConfig;
 use crate::error::LibfwError;
 use crate::js::Callbacks;
 use crate::state::{TaskControl, TaskState};
-use crate::tune::{LocalStore, TuningEngine, TuneHandle, TuneParams, TunePhase, TransferKind, now_ms};
+use crate::tune::{LocalStore, TuningEngine, TuneHandle, TuneParams, TransferKind, now_ms};
 
 #[wasm_bindgen(start)]
 pub fn start() {
