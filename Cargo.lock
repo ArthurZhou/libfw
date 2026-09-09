@@ -1128,12 +1128,10 @@ dependencies = [
  "futures",
  "libfw-core",
  "libfw-server",
- "serde",
  "serde_json",
  "sha2",
  "tokio",
  "tokio-stream",
- "tracing",
 ]
 
 [[package]]
@@ -1187,11 +1185,9 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
- "time",
  "tokio",
  "tokio-stream",
  "tower",
- "tower-http",
  "tracing",
 ]
 

@@ -6,6 +6,11 @@ Rust, built as a Cargo workspace. It features resumable transfers
 [`zrip`](https://crates.io/crates/zrip)), fine-grained bearer-token
 authorization, and a browser SDK backed by a WASM engine.
 
+## Documentation
+
+- [中文文档](README.zh-CN.md)
+- [SDK documentation](sdk/README.md)
+
 ```
 crates/
   libfw-core/     shared contracts: claims, validator, storage, compression, ranges
@@ -16,6 +21,10 @@ examples/
   actix-server/   minimal actix-web integration example (API only, no frontend)
 sdk/              libfw-client npm package (ESM + TS types + wasm)
 ```
+
+> Current examples default to `dev-token` and a storage root of `./data` on port
+> `8080` for the axum demo. When `LIBFW_PATH_KEY` is set to a 64-character hex
+> string, the example server enables encrypted shadow paths for the UI/API.
 
 ## Highlights
 

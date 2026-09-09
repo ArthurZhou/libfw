@@ -169,8 +169,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     state.spawn_stale_session_cleanup();
 
-    // `GET /health` — service info (no auth required). Captures `health` by
-    // value so it works on a state-less router.
+    // `GET /health` — service info (no auth required). The captured health
+    // state is cloned into the request handler so the router remains stateless.
     let health_route = {
         let health = health.clone();
         move || {
