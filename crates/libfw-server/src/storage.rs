@@ -353,7 +353,7 @@ impl StorageBackend for FsStorage {
             let _ = tokio::fs::remove_file(&blocks_path).await;
         }
         let ranges = if exists {
-            read_ranges(&blocks_path).await
+            read_ranges(&blocks_path).await?
         } else {
             Vec::new()
         };
@@ -629,7 +629,7 @@ impl UploadSink for FsSink {
         // keeps every writer's merge based on the latest on-disk state.
         if let Some(blocks) = self.blocks_path.clone() {
             let _guard = self.target_guard.as_ref().expect("session sink holds a guard");
-            let mut current = read_ranges(&blocks).await;
+            let mut current = read_ranges(&blocks).await?;
             merge_range(&mut current, ChunkRange {
                 start: offset,
                 end: offset.saturating_add(buf.len() as u64),
@@ -719,11 +719,21 @@ fn blocks_path_for(tmp: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Read the persisted received byte ranges for a session temp sidecar.
-async fn read_ranges(blocks: &Path) -> Vec<ChunkRange> {
+/// Read the persisted received ranges for a session temp sidecar.
+///
+/// An invalid or tampered sidecar is a protocol error: the server must refuse
+/// to continue instead of silently treating the upload as if it had no
+/// received data and accidentally re-sending/overwriting valid chunks.
+async fn read_ranges(blocks: &Path) -> Result<Vec<ChunkRange>, StorageError> {
     match tokio::fs::read_to_string(blocks).await {
-        Ok(text) => serde_json::from_str::<Vec<ChunkRange>>(&text).unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(text) => serde_json::from_str::<Vec<ChunkRange>>(&text).map_err(|e| {
+            StorageError::Other(std::io::Error::other(format!(
+                "corrupt sidecar {}: {e}",
+                blocks.display()
+            )))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(StorageError::Other(e)),
     }
 }
 
@@ -869,6 +879,20 @@ mod tests {
         let storage = FsStorage::new(dir.path());
         assert!(storage.file_meta("../etc/passwd").await.is_err());
         assert!(storage.file_meta("/etc/passwd").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn corrupt_session_sidecar_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path());
+        let tmp = dir.path().join(".libfw-sess-owner-session-f.txt");
+        std::fs::write(&tmp, b"partial").unwrap();
+        std::fs::write(tmp.with_extension("txt.blocks"), b"{not-json}").unwrap();
+
+        let res = storage
+            .write_stream_session("f.txt", "session", "owner", WriteMode::Create)
+            .await;
+        assert!(res.is_err(), "malformed sidecar should not be accepted");
     }
 
     #[tokio::test]

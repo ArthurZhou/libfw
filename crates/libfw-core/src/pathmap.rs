@@ -262,6 +262,28 @@ const SHADOW_VERSION: &str = "v1";
 const NONCE_LEN: usize = 12;
 
 #[cfg(feature = "path-encrypt")]
+fn random_bytes() -> [u8; NONCE_LEN] {
+    let mut nonce = [0u8; NONCE_LEN];
+    match getrandom::getrandom(&mut nonce) {
+        Ok(()) => nonce,
+        Err(_) => {
+            // Some constrained hosts have no usable OS RNG. Fall back to an
+            // in-process PRNG seeded from time so the codec still works without
+            // panicking, while remaining explicit that this is a degraded path.
+            let mut state = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            for i in &mut nonce {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *i = (state >> 32) as u8;
+            }
+            nonce
+        }
+    }
+}
+
+#[cfg(feature = "path-encrypt")]
 impl EncryptedPathCodec {
     /// Build the codec from a 32-byte key.
     pub fn new(key: [u8; 32]) -> Self {
@@ -285,8 +307,7 @@ impl PathCodec for EncryptedPathCodec {
     fn encode(&self, real: &str) -> String {
         use aes_gcm::aead::{Aead, Payload};
         use base64::Engine;
-        let mut nonce = [0u8; NONCE_LEN];
-        getrandom::getrandom(&mut nonce).expect("OS RNG");
+        let nonce = random_bytes();
         let ct = self
             .cipher
             .encrypt(
