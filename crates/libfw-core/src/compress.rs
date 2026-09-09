@@ -323,8 +323,12 @@ impl ZripDecompressor {
     /// `max_add` bytes to `out` across the whole call.
     fn drain_frames(&mut self, out: &mut Vec<u8>, max_add: usize) -> Result<(), DecompressError> {
         let mut added = 0usize;
+        // Consume via a cursor and compact `pending` once at the end: a
+        // per-frame `drain(..len)` would memmove the whole remaining buffer
+        // for every frame (O(n²) across a many-frame stream).
+        let mut consumed = 0usize;
         loop {
-            let boundary = frame_boundary(&self.pending);
+            let boundary = frame_boundary(&self.pending[consumed..]);
             match boundary {
                 FrameBoundary::Complete { len, content_size } => {
                     if content_size.is_some_and(|cs| cs > MAX_FRAME_OUTPUT as u64) {
@@ -333,7 +337,7 @@ impl ZripDecompressor {
                         });
                     }
                     let decoded = {
-                        let frame = &self.pending[..len];
+                        let frame = &self.pending[consumed..consumed + len];
                         zrip::decompress_with_limit(frame, MAX_FRAME_OUTPUT).map_err(|e| {
                             DecompressError::Io(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -348,9 +352,16 @@ impl ZripDecompressor {
                     }
                     out.extend_from_slice(&decoded);
                     added = added.saturating_add(decoded.len());
-                    self.pending.drain(..len);
+                    consumed += len;
                 }
-                FrameBoundary::Incomplete => return Ok(()),
+                FrameBoundary::Incomplete => {
+                    // Keep the one compaction cheap: only memmove when the
+                    // consumed prefix is non-trivially large.
+                    if consumed > 0 {
+                        self.pending.drain(..consumed);
+                    }
+                    return Ok(());
+                }
                 FrameBoundary::Invalid => {
                     return Err(DecompressError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,

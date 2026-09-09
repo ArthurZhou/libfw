@@ -5,6 +5,7 @@ use js_sys::{Array, Reflect};
 use wasm_bindgen::JsValue;
 
 use crate::error::LibfwError;
+use crate::js::safe_u64;
 use libfw_core::metadata::{etag_from_size_mtime, FileMeta, TransferPlan};
 
 /// A file to transfer, identified by its virtual path.
@@ -44,14 +45,14 @@ pub fn parse_file_entries(value: &JsValue) -> Result<Vec<FileEntry>, LibfwError>
             .map_err(|e| LibfwError::Js(format!("missing `path`: {e:?}")))?
             .as_string()
             .ok_or_else(|| LibfwError::Js("`path` must be a string".into()))?;
-        let size = Reflect::get(&item, &JsValue::from_str("size"))
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as u64;
-        let mtime = Reflect::get(&item, &JsValue::from_str("mtime"))
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as u64;
+        let size = safe_u64(
+            &Reflect::get(&item, &JsValue::from_str("size")).unwrap_or(JsValue::UNDEFINED),
+            "size",
+        )?;
+        let mtime = safe_u64(
+            &Reflect::get(&item, &JsValue::from_str("mtime")).unwrap_or(JsValue::UNDEFINED),
+            "mtime",
+        )?;
         out.push(FileEntry { path, size, mtime });
     }
     Ok(out)

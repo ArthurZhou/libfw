@@ -807,15 +807,16 @@ fn reader_stream(reader: Box<dyn Read + Send>) -> BoxStream<'static, Result<Byte
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
     tokio::task::spawn_blocking(move || {
         let mut reader = reader;
-        let mut buf = vec![0u8; STREAM_BUF_SIZE];
         loop {
+            // Allocate per chunk and hand ownership to `Bytes::from` — no
+            // extra copy per read (the reused-buffer variant would need a
+            // `copy_from_slice` per chunk instead).
+            let mut buf = vec![0u8; STREAM_BUF_SIZE];
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if tx
-                        .blocking_send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                        .is_err()
-                    {
+                    buf.truncate(n);
+                    if tx.blocking_send(Ok(Bytes::from(buf))).is_err() {
                         break; // consumer dropped
                     }
                 }

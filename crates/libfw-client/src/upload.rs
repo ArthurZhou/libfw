@@ -46,7 +46,9 @@ pub(crate) async fn sleep_ms(ms: u32) {
         return;
     }
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        let window = web_sys::window().expect("window");
+        // No window (non-browser host): degrade to returning immediately
+        // instead of panicking — the backoff is merely less patient.
+        let Some(window) = web_sys::window() else { return };
         let f: &js_sys::Function = resolve.unchecked_ref();
         let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(f, ms as i32);
     });
@@ -172,13 +174,13 @@ async fn probe_session(
         .map_err(|e| LibfwError::Js(format!("set session-status header failed: {e:?}")))?;
 
     let url = file_url(base_url, &file.path);
-    let req = request(&url, "POST", &headers, None)?;
-    let resp = fetch(&req, timeout_ms).await?;
+    let (req, ctrl) = request(&url, "POST", &headers, None)?;
+    let resp = fetch(&req, timeout_ms, &ctrl).await?;
     let status = resp.status();
     if status != 200 && status != 201 {
         return Err(LibfwError::Http { status, url });
     }
-    let body = read_all(&resp, timeout_ms).await?;
+    let body = read_all(&resp, timeout_ms, &ctrl).await?;
     #[derive(serde::Deserialize)]
     struct Ranges {
         #[serde(default)]

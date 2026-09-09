@@ -12,33 +12,46 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Headers, Request, RequestInit, Response, XmlHttpRequest, XmlHttpRequestEventTarget};
+use web_sys::{AbortController, Headers, Request, RequestInit, Response, XmlHttpRequest, XmlHttpRequestEventTarget};
 
 use crate::error::{js_value_string, LibfwError};
 
 /// Build a `Request` for `url` with the given method, headers and body.
+///
+/// Returns the request together with its `AbortController`: pass it back to
+/// [`fetch`]/[`read_all`]/[`stream_body`] so a timeout aborts the underlying
+/// transfer instead of leaving the request (and its connection buffers)
+/// running in the background.
 pub fn request(
     url: &str,
     method: &str,
     headers: &Headers,
     body: Option<&JsValue>,
-) -> Result<Request, LibfwError> {
+) -> Result<(Request, AbortController), LibfwError> {
     let init = RequestInit::new();
     init.set_method(method);
     if let Some(body) = body {
         init.set_body(body);
     }
     init.set_headers(headers);
-    Request::new_with_str_and_init(url, &init)
-        .map_err(|e| LibfwError::Network(format!("failed to build request for `{url}`: {e:?}")))
+    let ctrl = AbortController::new()
+        .map_err(|e| LibfwError::Js(format!("AbortController unavailable: {e:?}")))?;
+    init.set_signal(Some(&ctrl.signal()));
+    let req = Request::new_with_str_and_init(url, &init)
+        .map_err(|e| LibfwError::Network(format!("failed to build request for `{url}`: {e:?}")));
+    req.map(|r| (r, ctrl))
 }
 
 /// Perform a `fetch` and return the `Response`, aborting after `timeout_ms`.
-pub async fn fetch(request: &Request, timeout_ms: u32) -> Result<Response, LibfwError> {
+pub async fn fetch(
+    request: &Request,
+    timeout_ms: u32,
+    ctrl: &AbortController,
+) -> Result<Response, LibfwError> {
     let window = web_sys::window()
         .ok_or_else(|| LibfwError::Js("no window available".into()))?;
     let promise = window.fetch_with_request(request);
-    let value = JsFuture::from(with_timeout(promise, timeout_ms))
+    let value = JsFuture::from(with_timeout(promise, timeout_ms, Some(ctrl)))
         .await
         .map_err(|e| LibfwError::Network(format!("fetch failed: {}", js_value_string(&e))))?;
     Ok(value.unchecked_into())
@@ -46,15 +59,24 @@ pub async fn fetch(request: &Request, timeout_ms: u32) -> Result<Response, Libfw
 
 /// Race a promise against a timer that rejects after `ms` (0 disables).
 ///
-/// Enforces the client's per-request / per-read timeout so a hung peer
-/// cannot stall a transfer forever (an `AbortController`-style guard without
-/// an explicit signal object).
-fn with_timeout(promise: js_sys::Promise, ms: u32) -> js_sys::Promise {
+/// When `abort` is given, the timer also aborts the request's
+/// `AbortController` first, so a hung fetch/`ReadableStream` read is really
+/// cancelled — not just raced — and releases its connection immediately.
+fn with_timeout(
+    promise: js_sys::Promise,
+    ms: u32,
+    abort: Option<&AbortController>,
+) -> js_sys::Promise {
     if ms == 0 {
         return promise;
     }
     let timer = js_sys::Promise::new(&mut |_resolve, reject| {
-        let window = web_sys::window().expect("window");
+        // No window (non-browser host): degrade to an un-timed race instead
+        // of panicking.
+        let Some(window) = web_sys::window() else { return };
+        if let Some(ctrl) = abort {
+            ctrl.abort();
+        }
         let f: &js_sys::Function = reject.unchecked_ref();
         let err = js_sys::Error::new(&format!("libfw request timed out after {ms}ms"));
         let _ = window.set_timeout_with_callback_and_timeout_and_arguments_1(
@@ -68,11 +90,15 @@ fn with_timeout(promise: js_sys::Promise, ms: u32) -> js_sys::Promise {
 
 /// Read the entire response body into memory (used for small JSON payloads
 /// like directory listings).
-pub async fn read_all(resp: &Response, timeout_ms: u32) -> Result<Vec<u8>, LibfwError> {
+pub async fn read_all(
+    resp: &Response,
+    timeout_ms: u32,
+    ctrl: &AbortController,
+) -> Result<Vec<u8>, LibfwError> {
     let promise = resp.array_buffer().map_err(|e| {
         LibfwError::Network(format!("arrayBuffer() failed: {}", js_value_string(&e)))
     })?;
-    let value = JsFuture::from(with_timeout(promise, timeout_ms))
+    let value = JsFuture::from(with_timeout(promise, timeout_ms, Some(ctrl)))
         .await
         .map_err(|e| LibfwError::Network(format!("body read failed: {}", js_value_string(&e))))?;
     let buf: js_sys::ArrayBuffer = value.unchecked_into();
@@ -88,6 +114,7 @@ pub async fn read_all(resp: &Response, timeout_ms: u32) -> Result<Vec<u8>, Libfw
 pub async fn stream_body<F, Fut>(
     resp: &Response,
     timeout_ms: u32,
+    ctrl: &AbortController,
     mut on_chunk: F,
 ) -> Result<(), LibfwError>
 where
@@ -100,8 +127,9 @@ where
     let reader: web_sys::ReadableStreamDefaultReader = body.get_reader().unchecked_into();
     loop {
         // A stalled body (peer stops sending) must also time out, not just
-        // the initial connection.
-        let value = JsFuture::from(with_timeout(reader.read(), timeout_ms))
+        // the initial connection. The controller abort cancels the whole
+        // response body, which is exactly what we want here.
+        let value = JsFuture::from(with_timeout(reader.read(), timeout_ms, Some(ctrl)))
             .await
             .map_err(|e| {
                 LibfwError::Network(format!("body read failed: {}", js_value_string(&e)))
@@ -394,13 +422,13 @@ pub async fn fetch_capabilities(
     let url = format!("{}/capabilities", base_url.trim_end_matches('/'));
     let headers = Headers::new()
         .map_err(|e| LibfwError::Js(format!("Headers::new failed: {e:?}")))?;
-    let req = request(&url, "GET", &headers, None)?;
-    let resp = fetch(&req, timeout_ms).await?;
+    let (req, ctrl) = request(&url, "GET", &headers, None)?;
+    let resp = fetch(&req, timeout_ms, &ctrl).await?;
     let status = resp.status();
     if status != 200 {
         return Err(LibfwError::Http { status, url });
     }
-    let body = read_all(&resp, timeout_ms).await?;
+    let body = read_all(&resp, timeout_ms, &ctrl).await?;
     serde_json::from_slice(&body)
         .map_err(|e| LibfwError::Protocol(format!("bad /capabilities JSON: {e}")))
 }

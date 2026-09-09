@@ -188,3 +188,24 @@ pub fn u8_vec_from_js(value: &JsValue) -> Result<Vec<u8>, LibfwError> {
         ))
     }
 }
+
+/// Exact-integer ceiling of IEEE-754 doubles (2^53 − 1). JS `Number`s beyond
+/// this cannot represent every integer, so trusting them as byte
+/// sizes/offsets would silently desynchronise resumes and chunk plans.
+pub const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// Convert a JS number to a `u64`, rejecting non-finite, negative or
+/// > 2^53−1 values instead of rounding them into a wrong offset. A missing /
+/// non-numeric field falls back to `0` (matching the previous lenient
+/// behaviour for optional fields).
+pub fn safe_u64(value: &JsValue, field: &str) -> Result<u64, LibfwError> {
+    let Some(n) = value.as_f64() else {
+        return Ok(0);
+    };
+    if !n.is_finite() || n < 0.0 || n > MAX_SAFE_INTEGER {
+        return Err(LibfwError::Protocol(format!(
+            "`{field}` is not an exact integer in the JS number range: {n}"
+        )));
+    }
+    Ok(n as u64)
+}

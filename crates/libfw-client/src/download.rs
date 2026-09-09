@@ -45,13 +45,13 @@ async fn list_dir(
 ) -> Result<Vec<DirEntry>, LibfwError> {
     let headers = auth_headers(token, false, None)?;
     let url = dir_url(base_url, path);
-    let req = request(&url, "GET", &headers, None)?;
-    let resp = fetch(&req, timeout_ms).await?;
+    let (req, ctrl) = request(&url, "GET", &headers, None)?;
+    let resp = fetch(&req, timeout_ms, &ctrl).await?;
     let status = resp.status();
     if status != 200 {
         return Err(LibfwError::Http { status, url });
     }
-    let body = read_all(&resp, timeout_ms).await?;
+    let body = read_all(&resp, timeout_ms, &ctrl).await?;
     serde_json::from_slice::<Vec<DirEntry>>(&body)
         .map_err(|e| LibfwError::Protocol(format!("bad listing JSON: {e}")))
 }
@@ -91,7 +91,9 @@ async fn sleep_ms(ms: u32) {
         return;
     }
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        let window = web_sys::window().expect("window");
+        // No window (non-browser host): degrade to returning immediately
+        // instead of panicking — the backoff is merely less patient.
+        let Some(window) = web_sys::window() else { return };
         let f: &js_sys::Function = resolve.unchecked_ref();
         let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(f, ms as i32);
     });
@@ -129,10 +131,10 @@ async fn download_file(
             .ok()
             .and_then(|v| v.as_string())
             .unwrap_or_default();
-        let offset = Reflect::get(&state, &JsValue::from_str("offset"))
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as u64;
+        let offset = crate::js::safe_u64(
+            &Reflect::get(&state, &JsValue::from_str("offset")).unwrap_or(JsValue::UNDEFINED),
+            "offset",
+        )?;
         if !etag.is_empty() && offset > 0 {
             resume = Some((etag, offset));
         }
@@ -222,18 +224,19 @@ async fn download_file(
                 .map_err(|e| LibfwError::Js(format!("set If-Range failed: {e:?}")))?;
         }
         let url = file_url(base_url, &file.path);
-        let req = request(&url, "GET", &headers, None)?;
+        let (req, ctrl) = request(&url, "GET", &headers, None)?;
 
         let t0 = now_ms();
-        match fetch(&req, config.timeout_ms).await {
+        match fetch(&req, config.timeout_ms, &ctrl).await {
             Ok(resp) => {
                 let rtt = now_ms() - t0;
                 match resp.status() {
                     200 => {
                         // Full content: the file changed (or first attempt).
                         etag = response_etag(&resp).unwrap_or(etag);
-                        let outcome = stream_download(&resp, file, callbacks, control, 0, &etag, config.timeout_ms)
-                            .await?;
+                        let outcome =
+                            stream_download(&resp, file, callbacks, control, 0, &etag, config.timeout_ms, &ctrl)
+                                .await?;
                         if tune.borrow().enabled() {
                             tune_tick(tune, control, control.done_bytes(), Some(rtt), false);
                         }
@@ -252,6 +255,7 @@ async fn download_file(
                             start,
                             &etag,
                             config.timeout_ms,
+                            &ctrl,
                         )
                         .await?;
                         if tune.borrow().enabled() {
@@ -342,8 +346,8 @@ async fn fetch_meta(
 ) -> Result<(String, u64), LibfwError> {
     let headers = auth_headers(token, false, None)?;
     let url = file_url(base_url, path);
-    let req = request(&url, "HEAD", &headers, None)?;
-    let resp = fetch(&req, timeout_ms).await?;
+    let (req, ctrl) = request(&url, "HEAD", &headers, None)?;
+    let resp = fetch(&req, timeout_ms, &ctrl).await?;
     let status = resp.status();
     if status != 200 {
         return Err(LibfwError::Http { status, url });
@@ -446,14 +450,14 @@ async fn download_chunk_once(
             .map_err(|e| LibfwError::Js(format!("set If-Range failed: {e:?}")))?;
     }
     let url = file_url(base_url, path);
-    let req = request(&url, "GET", &headers, None)?;
+    let (req, ctrl) = request(&url, "GET", &headers, None)?;
     // Hold the permit for the whole request so the global cap is respected.
     let _permit = semaphore.acquire().await;
     let t0 = now_ms();
-    let resp = fetch(&req, timeout_ms).await?;
+    let resp = fetch(&req, timeout_ms, &ctrl).await?;
     let rtt = now_ms() - t0;
     match resp.status() {
-        206 => Ok((collect_chunk(&resp, timeout_ms).await?, rtt)),
+        206 => Ok((collect_chunk(&resp, timeout_ms, &ctrl).await?, rtt)),
         // Full body despite a Range + If-Range → the file changed; 416 → it
         // shrank. Both mean "restart from byte 0" (handled by the caller).
         code => Err(LibfwError::Http {
@@ -464,7 +468,11 @@ async fn download_chunk_once(
 }
 
 /// Stream a `206` response body into one decompressed `Vec<u8>`.
-async fn collect_chunk(resp: &Response, timeout_ms: u32) -> Result<Vec<u8>, LibfwError> {
+async fn collect_chunk(
+    resp: &Response,
+    timeout_ms: u32,
+    ctrl: &web_sys::AbortController,
+) -> Result<Vec<u8>, LibfwError> {
     // Decide the wire format from the response header (robust against a
     // server that did not honour our Accept-Encoding).
     let format = resp
@@ -476,29 +484,25 @@ async fn collect_chunk(resp: &Response, timeout_ms: u32) -> Result<Vec<u8>, Libf
         .unwrap_or(CompressionFormat::None);
 
     let decomp = Rc::new(RefCell::new(decompressor(format)));
-    let out = Rc::new(RefCell::new(Vec::new()));
     let collected = Rc::new(RefCell::new(Vec::new()));
 
     stream_body(
         resp,
         timeout_ms,
+        ctrl,
         {
             let decomp = decomp.clone();
-            let out = out.clone();
             let collected = collected.clone();
             move |chunk| {
                 let decomp = decomp.clone();
-                let out = out.clone();
                 let collected = collected.clone();
                 async move {
+                    // Decompress straight into the collector — no intermediate
+                    // buffer or extra copy per chunk.
                     decomp
                         .borrow_mut()
-                        .decompress(&chunk, &mut out.borrow_mut())
+                        .decompress(&chunk, &mut collected.borrow_mut())
                         .map_err(|e| LibfwError::Decompress(e.to_string()))?;
-                    let data = std::mem::take(&mut *out.borrow_mut());
-                    if !data.is_empty() {
-                        collected.borrow_mut().extend_from_slice(&data);
-                    }
                     Ok(())
                 }
             }
@@ -509,12 +513,8 @@ async fn collect_chunk(resp: &Response, timeout_ms: u32) -> Result<Vec<u8>, Libf
     // Flush any final decompressed frames.
     decomp
         .borrow_mut()
-        .finish(&mut out.borrow_mut())
+        .finish(&mut collected.borrow_mut())
         .map_err(|e| LibfwError::Decompress(e.to_string()))?;
-    let tail = std::mem::take(&mut *out.borrow_mut());
-    if !tail.is_empty() {
-        collected.borrow_mut().extend_from_slice(&tail);
-    }
     Ok(std::mem::take(&mut *collected.borrow_mut()))
 }
 
@@ -723,6 +723,7 @@ async fn stream_download(
     start: u64,
     etag: &str,
     timeout_ms: u32,
+    ctrl: &web_sys::AbortController,
 ) -> Result<DownloadOutcome, LibfwError> {
     // Decide the wire format from the response header (robust against a
     // server that did not honour our Accept-Encoding).
@@ -769,6 +770,7 @@ async fn stream_download(
     stream_body(
         resp,
         timeout_ms,
+        ctrl,
         |chunk| {
             let decomp = decomp.clone();
             let out = out.clone();

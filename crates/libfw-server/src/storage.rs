@@ -4,10 +4,13 @@
 //! atomically renamed into place on [`UploadSink::commit`], so a failed or
 //! aborted upload never leaves a partial target behind.
 
+use std::collections::HashMap;
 use std::io::{Read, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use tokio::sync::OwnedMutexGuard;
 
 use async_trait::async_trait;
 use libfw_core::metadata::{etag_from_size_mtime, ChunkRange, FileMeta};
@@ -22,11 +25,13 @@ use libfw_core::StorageError;
 #[derive(Debug, Clone)]
 pub struct FsStorage {
     root: PathBuf,
-    /// Serializes read-merge-write of the per-session `.blocks` sidecars so
-    /// concurrent chunk requests never clobber each other's received-range
-    /// bookkeeping (a lost update here makes the commit coverage check reject
-    /// a fully-written file).
-    sidecar_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-target locks (keyed by temp/target path). Concurrent chunk
+    /// requests for *different* sessions/targets never serialize behind each
+    /// other — only writers of the same target (who share a `.blocks`
+    /// sidecar or an append-only resume file) take turns. Without this, a
+    /// read-merge-write of the shared sidecar loses updates (making the
+    /// commit coverage check reject a fully-written file).
+    locks: Arc<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl FsStorage {
@@ -34,8 +39,21 @@ impl FsStorage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         FsStorage {
             root: root.into(),
-            sidecar_lock: Arc::new(tokio::sync::Mutex::new(())),
+            locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Get (or create) the mutex guarding `path`.
+    fn lock_for(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.locks.lock().expect("lock registry poisoned");
+        // Drop entries no sink holds anymore so the registry cannot grow
+        // without bound across many short-lived sessions.
+        if map.len() > 1024 {
+            map.retain(|_, v| Arc::strong_count(v) > 1);
+        }
+        map.entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Resolve a virtual path against the root (pure text — no I/O).
@@ -188,10 +206,16 @@ impl StorageBackend for FsStorage {
                     written: 0,
                     blocks_path: None,
                     ranges: Vec::new(),
-                    sidecar_lock: self.sidecar_lock.clone(),
+                    target_guard: None,
                 }))
             }
             WriteMode::Resume { offset } => {
+                // Concurrent `Resume` writers of the same target would both
+                // observe the same on-disk length and interleave their
+                // appends. Hold the per-target lock for the sink's whole
+                // lifetime so they take turns (the loser re-checks the
+                // length only after the winner's commit/rejection).
+                let target_guard = Some(self.lock_for(&full).lock_owned().await);
                 let file = tokio::fs::OpenOptions::new()
                     .write(true)
                     .append(true)
@@ -220,7 +244,7 @@ impl StorageBackend for FsStorage {
                     written: offset,
                     blocks_path: None,
                     ranges: Vec::new(),
-                    sidecar_lock: self.sidecar_lock.clone(),
+                    target_guard,
                 }))
             }
         }
@@ -309,6 +333,15 @@ impl StorageBackend for FsStorage {
                 }
             }
         };
+        // Chunks of the same session share the temp + sidecar, so they
+        // serialize on the temp's per-target lock (different sessions stay
+        // fully parallel). The guard is held for the sink's whole lifetime:
+        // concurrent first requests would otherwise both load the (missing)
+        // sidecar, then each chunk write's read-merge-write would clobber the
+        // other's received-range bookkeeping.
+        let lock = self.lock_for(&tmp);
+        let target_guard = Some(lock.clone().lock_owned().await);
+
         // Load any already-received byte ranges from the sidecar so a pause /
         // resume only re-sends the missing blocks.
         let blocks_path = blocks_path_for(&tmp);
@@ -333,7 +366,7 @@ impl StorageBackend for FsStorage {
             written: 0,
             blocks_path: Some(blocks_path),
             ranges,
-            sidecar_lock: self.sidecar_lock.clone(),
+            target_guard,
         }))
     }
 
@@ -526,8 +559,12 @@ pub struct FsSink {
     /// In-memory copy of the received ranges (kept in sync with
     /// `blocks_path`).
     ranges: Vec<ChunkRange>,
-    /// Shared lock serializing sidecar read-merge-write (see `FsStorage`).
-    sidecar_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-target guard held for the sink's whole lifetime. `Some` only for
+    /// session sinks (serializing sidecar read-merge-write per target) and
+    /// for `WriteMode::Resume` (serializing concurrent appends to the same
+    /// target). `None` for plain Create/Overwrite sinks, which write to a
+    /// unique temp and rename on commit — no shared state to guard.
+    target_guard: Option<OwnedMutexGuard<()>>,
 }
 
 /// Merge `new` (a `[start, end)` half-open range) into a sorted, disjoint
@@ -583,13 +620,15 @@ impl UploadSink for FsSink {
         // sidecar so a later probe / resume knows this part is already on
         // disk and only missing gaps need to be re-sent.
         //
-        // The read-merge-write is serialized under the storage-wide lock:
-        // concurrent chunk requests each hold a *stale* in-memory `ranges`
-        // copy loaded when their sink was opened, so a bare `persist_ranges`
-        // would clobber other chunks' ranges (lost update) and make the
-        // commit coverage check reject a fully-written file.
+        // The read-merge-write is serialized by the per-target guard this
+        // sink holds for its whole lifetime: concurrent chunks of the SAME
+        // session each hold a *stale* in-memory `ranges` copy loaded when
+        // their sink was opened, so a bare `persist_ranges` would clobber
+        // other chunks' ranges (lost update) and make the commit coverage
+        // check reject a fully-written file. Re-reading under the guard
+        // keeps every writer's merge based on the latest on-disk state.
         if let Some(blocks) = self.blocks_path.clone() {
-            let guard = self.sidecar_lock.lock().await;
+            let _guard = self.target_guard.as_ref().expect("session sink holds a guard");
             let mut current = read_ranges(&blocks).await;
             merge_range(&mut current, ChunkRange {
                 start: offset,
@@ -597,7 +636,6 @@ impl UploadSink for FsSink {
             });
             persist_ranges(&blocks, &current).await?;
             self.ranges = current;
-            drop(guard);
         }
         Ok(())
     }
