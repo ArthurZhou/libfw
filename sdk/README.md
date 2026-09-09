@@ -102,10 +102,10 @@ dist/libfw-client.umd.js   UMD bundle (after build:umd)
   - `downloadWindow: number` (default `4`) — in-flight byte-range window per
     single file download (how many concurrent `Range` GETs); raise it on
     high-latency links. `1` disables parallelism (sequential downloads).
-  - `downloadChunkSize: number` (default `262144`, 256 KiB) — byte range size
-    for parallel downloads; the engine reorders in-flight chunks in memory
-    (worst case ≈ `downloadWindow * downloadChunkSize` bytes) so the SDK
-    still receives data in order.
+  - `chunkSize: number` (default `2097152`, 2 MiB) — shared size used for
+    both upload chunks and parallel download ranges; the engine reorders
+    in-flight chunks in memory (worst case ≈ `downloadWindow * chunkSize`
+    bytes) so the SDK still receives data in order.
   - `downloadMode: 'auto' | 'fs' | 'browser'` (default `'auto'`) — `'fs'`
     streams downloads through the File System Access API; `'browser'` buffers
     and triggers a traditional browser download (folders become `.zip`);
@@ -130,7 +130,7 @@ dist/libfw-client.umd.js   UMD bundle (after build:umd)
 - `tuneStatus() → { phase, params, stats, capsHash } | null` — live
   adaptive-tuning status. `phase` is `uninitialized | ramping | settled |
   degraded`; `params` is `{ concurrency, uploadWindow, downloadWindow,
-  chunkSize, downloadChunkSize, compressLevel }`; `stats` is
+  chunkSize, compressLevel }`; `stats` is
   `{ rttMs, mbps }` (EWMA request RTT, last-window throughput). `null`
   until the WASM engine is initialised.
 - Events: with `autoTune` enabled, `onEvent` additionally receives

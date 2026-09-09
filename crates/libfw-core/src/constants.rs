@@ -30,17 +30,8 @@ pub const DEFAULT_UPLOAD_WINDOW: usize = 8;
 /// `concurrency` (cross-file) and of the upload window. Kept modest because
 /// the WASM engine buffers in-flight chunks in a reorder map so it can emit
 /// them to the SDK strictly in order (append-mode writes); the buffer bound
-/// is `window * download_chunk_size`.
+/// is `window * CHUNK_SIZE`.
 pub const DEFAULT_DOWNLOAD_WINDOW: usize = 4;
-
-/// Default chunk size for parallel (byte-range) downloads — 256 KiB.
-///
-/// Deliberately smaller than the 2 MiB upload chunk: the WASM engine holds
-/// up to `download_window` of these in a reorder buffer while waiting for
-/// them to arrive in order, so `window * chunk_size` (4 × 256 KiB = 1 MiB by
-/// default) is the engine's worst-case extra allocation — comfortably under
-/// the ~2 MiB per-file memory budget.
-pub const DEFAULT_DOWNLOAD_CHUNK_SIZE: u64 = 256 * 1024;
 
 /// A file with fewer remaining bytes than this stays on the sequential
 /// single-connection download path; larger files use the parallel range-GET

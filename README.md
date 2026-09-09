@@ -360,9 +360,8 @@ const client = new LibfwClient({
   downloadWindow: 4,          // in-flight byte-range GETs per single file download
                               // (default 4; tus-style parallel download, so one file's
                               // throughput isn't limited by a single connection's RTT)
-  downloadChunkSize: 256 * 1024, // byte range size for parallel downloads (default 256 KiB)
   compress: true,             // negotiate zrip compression (default true)
-  chunkSize: 2 * 1024 * 1024, // upload chunk size (default 2 MiB)
+  chunkSize: 2 * 1024 * 1024, // shared chunk size for uploads + parallel downloads (default 2 MiB)
   maxRetries: 3,              // retries per chunk/file (default 3)
   baseRetryDelayMs: 500,      // initial exponential backoff (default 500)
   maxRetryDelayMs: 30000,     // backoff ceiling (default 30 s)
@@ -393,7 +392,7 @@ it stopped (`Range`/`If-Range` revalidation, IndexedDB-backed offsets).
 bounded by bandwidth instead of one connection's `chunkSize / RTT` — the
 same bandwidth-delay-product fill that `uploadWindow` provides for uploads.
 The engine reorders in-flight chunks in memory (worst case ≈
-`downloadWindow × downloadChunkSize` bytes) so the SDK still receives bytes
+`downloadWindow × chunkSize` bytes) so the SDK still receives bytes
 strictly in order (append-mode writes, no `.crswap` churn). Each chunk is
 retried independently, so a transient failure re-fetches only the lost part;
 on resume the client first asks the server via `HEAD` (authoritative size +
@@ -624,7 +623,7 @@ The live state is readable via `client.tuneStatus()` and pushed to
 client.tuneStatus();
 // { phase: 'settled', capsHash: 'a1b2…',
 //   params: { concurrency: 4, uploadWindow: 8, downloadWindow: 4,
-//             chunkSize: 4194304, downloadChunkSize: 262144, compressLevel: -8 },
+//             chunkSize: 4194304, compressLevel: -8 },
 //   stats:  { rttMs: 12.4, mbps: 87.3 } }
 ```
 

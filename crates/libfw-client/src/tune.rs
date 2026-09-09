@@ -101,10 +101,8 @@ pub struct TuneParams {
     pub upload_window: usize,
     /// Per-file download in-flight chunk window.
     pub download_window: usize,
-    /// Upload chunk size (bytes).
+    /// Shared transfer chunk size for both uploads and parallel downloads.
     pub chunk_size: u64,
-    /// Download byte-range chunk size (bytes).
-    pub download_chunk_size: u64,
     /// zrip level for this transfer's compressed body.
     pub compress_level: i32,
 }
@@ -117,7 +115,6 @@ impl TuneParams {
             upload_window: caps.limits.upload_window.min.max(1) as usize,
             download_window: caps.limits.download_window.min.max(1) as usize,
             chunk_size: caps.limits.chunk_size.min.max(1) as u64,
-            download_chunk_size: caps.limits.download_chunk_size.min.max(1) as u64,
             compress_level: caps.compression.zrip_levels.min,
         }
     }
@@ -129,7 +126,6 @@ impl TuneParams {
         upload_window: usize,
         download_window: usize,
         chunk_size: u64,
-        download_chunk_size: u64,
         compress_level: i32,
         caps: &Capabilities,
     ) -> TuneParams {
@@ -143,11 +139,6 @@ impl TuneParams {
                 .clamp(download_window.max(1) as i64)
                 .max(1) as usize,
             chunk_size: caps.limits.chunk_size.clamp(chunk_size.max(1) as i64).max(1) as u64,
-            download_chunk_size: caps
-                .limits
-                .download_chunk_size
-                .clamp(download_chunk_size.max(1) as i64)
-                .max(1) as u64,
             compress_level: caps.clamp_level(compress_level),
         }
     }
@@ -165,11 +156,6 @@ impl TuneParams {
                 .clamp(self.download_window as i64)
                 .max(1) as usize,
             chunk_size: caps.limits.chunk_size.clamp(self.chunk_size as i64).max(1) as u64,
-            download_chunk_size: caps
-                .limits
-                .download_chunk_size
-                .clamp(self.download_chunk_size as i64)
-                .max(1) as u64,
             compress_level: caps.clamp_level(self.compress_level),
         }
     }
@@ -181,7 +167,7 @@ impl TuneParams {
 
     /// In-flight bytes for a download: concurrency × window × chunk size.
     pub fn download_in_flight(&self) -> u64 {
-        self.concurrency as u64 * self.download_window as u64 * self.download_chunk_size
+        self.concurrency as u64 * self.download_window as u64 * self.chunk_size
     }
 }
 
@@ -540,7 +526,6 @@ impl TuningEngine {
                 upload_window: 1,
                 download_window: 1,
                 chunk_size: 1,
-                download_chunk_size: 1,
                 compress_level: 0,
             },
             stats: TuneStats::default(),
@@ -981,12 +966,7 @@ impl TuningEngine {
             RampDim::Concurrency => {
                 self.params.concurrency as i64 >= caps.limits.concurrency.max
             }
-            RampDim::ChunkSize => match self.last_transfer_kind() {
-                TransferKind::Upload => self.params.chunk_size >= caps.limits.chunk_size.max as u64,
-                TransferKind::Download => {
-                    self.params.download_chunk_size >= caps.limits.download_chunk_size.max as u64
-                }
-            },
+            RampDim::ChunkSize => self.params.chunk_size >= caps.limits.chunk_size.max as u64,
         }
     }
 
@@ -997,10 +977,7 @@ impl TuningEngine {
                 TransferKind::Download => caps.limits.download_window.max,
             },
             RampDim::Concurrency => caps.limits.concurrency.max,
-            RampDim::ChunkSize => match self.last_transfer_kind() {
-                TransferKind::Upload => caps.limits.chunk_size.max,
-                TransferKind::Download => caps.limits.download_chunk_size.max,
-            },
+            RampDim::ChunkSize => caps.limits.chunk_size.max,
         };
         // Multiplicative increase (×2) until near the cap, then additive
         // (+1) — TCP slow-start style.
@@ -1026,15 +1003,9 @@ impl TuningEngine {
             RampDim::Concurrency => {
                 self.params.concurrency = step(self.params.concurrency as i64).max(1) as usize
             }
-            RampDim::ChunkSize => match self.last_transfer_kind() {
-                TransferKind::Upload => {
-                    self.params.chunk_size = step(self.params.chunk_size as i64).max(1) as u64
-                }
-                TransferKind::Download => {
-                    self.params.download_chunk_size =
-                        step(self.params.download_chunk_size as i64).max(1) as u64
-                }
-            },
+            RampDim::ChunkSize => {
+                self.params.chunk_size = step(self.params.chunk_size as i64).max(1) as u64
+            }
         }
     }
 
@@ -1052,15 +1023,9 @@ impl TuningEngine {
             RampDim::Concurrency => {
                 self.params.concurrency = step(self.params.concurrency as i64) as usize
             }
-            RampDim::ChunkSize => match self.last_transfer_kind() {
-                TransferKind::Upload => {
-                    self.params.chunk_size = step(self.params.chunk_size as i64) as u64
-                }
-                TransferKind::Download => {
-                    self.params.download_chunk_size = step(self.params.download_chunk_size as i64)
-                        as u64
-                }
-            },
+            RampDim::ChunkSize => {
+                self.params.chunk_size = step(self.params.chunk_size as i64) as u64
+            }
         }
     }
 }
@@ -1165,7 +1130,6 @@ fn params_to_js(params: &TuneParams) -> JsValue {
     let _ = js_sys::Reflect::set(&o, &JsValue::from_str("uploadWindow"), &JsValue::from_f64(params.upload_window as f64));
     let _ = js_sys::Reflect::set(&o, &JsValue::from_str("downloadWindow"), &JsValue::from_f64(params.download_window as f64));
     let _ = js_sys::Reflect::set(&o, &JsValue::from_str("chunkSize"), &JsValue::from_f64(params.chunk_size as f64));
-    let _ = js_sys::Reflect::set(&o, &JsValue::from_str("downloadChunkSize"), &JsValue::from_f64(params.download_chunk_size as f64));
     let _ = js_sys::Reflect::set(&o, &JsValue::from_str("compressLevel"), &JsValue::from_f64(params.compress_level as f64));
     o.into()
 }
@@ -1203,7 +1167,6 @@ mod tests {
             upload_window: 8,
             download_window: 4,
             chunk_size: 2 * 1024 * 1024,
-            download_chunk_size: 256 * 1024,
             compress_level: 1,
         }
     }

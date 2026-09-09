@@ -573,7 +573,7 @@ async fn download_file_parallel(
     // Live parameter reads: the tuning engine may have changed the window or
     // chunk size since this file's transfer began.
     let window = tune.borrow().params().download_window.max(1);
-    let chunk_size = tune.borrow().params().download_chunk_size.max(1);
+    let chunk_size = tune.borrow().params().chunk_size.max(1);
 
     // Plan chunks from the resume point to EOF.
     let chunks = parallel_chunks(start, size, chunk_size);
@@ -646,9 +646,9 @@ async fn download_file_parallel(
 /// `chunk_size`, starting at `from` (a resume offset).
 fn parallel_chunks(from: u64, size: u64, chunk_size: u64) -> Vec<(u64, u64)> {
     // Defensive: a 0 chunk size (which config parsing prevents) falls back to
-    // the default rather than degenerating into 1-byte chunks.
+    // the shared default rather than degenerating into 1-byte chunks.
     let chunk_size = if chunk_size == 0 {
-        libfw_core::DEFAULT_DOWNLOAD_CHUNK_SIZE
+        libfw_core::CHUNK_SIZE
     } else {
         chunk_size
     };

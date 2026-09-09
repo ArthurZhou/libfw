@@ -55,10 +55,8 @@ export interface TuningParams {
   uploadWindow: number;
   /** In-flight byte-range GETs per single-file download. */
   downloadWindow: number;
-  /** Upload chunk size in bytes. */
+  /** Shared chunk size in bytes for uploads and parallel downloads. */
   chunkSize: number;
-  /** Download byte-range size in bytes. */
-  downloadChunkSize: number;
   /** zrip compression level (negative = faster, positive = smaller). */
   compressLevel: number;
 }
@@ -127,13 +125,6 @@ export interface LibfwClientOptions {
    * parallelism (sequential downloads). Default `4`.
    */
   downloadWindow?: number;
-  /**
-   * Byte range size for parallel downloads. The engine reorders in-flight
-   * chunks in memory (worst case ≈ `downloadWindow * downloadChunkSize`
-   * bytes) so the SDK still receives data strictly in order. Default
-   * `262144` (256 KiB).
-   */
-  downloadChunkSize?: number;
   /** Negotiate zrip compression. Default `true`. */
   compress?: boolean;
   /** Upload chunk size in bytes. Default 2 MiB. */
@@ -291,7 +282,7 @@ export declare class LibfwClient {
    * @returns `{ phase, params, stats, capsHash }` — `phase` is
    *   `uninitialized | ramping | settled | degraded`; `params` holds the
    *   tuned `concurrency` / `uploadWindow` / `downloadWindow` / `chunkSize`
-   *   / `downloadChunkSize` / `compressLevel`; `stats` is
+   *   / `compressLevel`; `stats` is
    *   `{ rttMs, mbps }` (EWMA request RTT, last-window throughput).
    *   `null` until the WASM engine is initialised (or when `autoTune` is
    *   disabled, `phase` stays `uninitialized`).

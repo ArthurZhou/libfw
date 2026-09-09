@@ -31,8 +31,8 @@ pub struct LibfwClient {
 #[wasm_bindgen]
 impl LibfwClient {
     /// Create an engine. `options` may include:
-    /// `{ concurrency, uploadWindow, downloadWindow, downloadChunkSize,
-    /// compress, compressLevel, chunkSize, maxRetries, baseRetryDelayMs,
+    /// `{ concurrency, uploadWindow, downloadWindow, compress,
+    /// compressLevel, chunkSize, maxRetries, baseRetryDelayMs,
     /// maxRetryDelayMs, timeoutMs, autoTune, tuneTtlMs }`.
     #[wasm_bindgen(constructor)]
     pub fn new(opts: JsValue) -> LibfwClient {
@@ -283,7 +283,6 @@ async fn prepare_transfer(
         config.upload_window,
         config.download_window,
         config.chunk_size,
-        config.download_chunk_size,
         level,
         &caps,
     );

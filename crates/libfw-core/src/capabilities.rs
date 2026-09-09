@@ -14,8 +14,8 @@
 
 use crate::compress::{CompressionFormat, ZRIP_DEFAULT_LEVEL, ZRIP_MAX_LEVEL, ZRIP_MIN_LEVEL};
 use crate::constants::{
-    DEFAULT_CONCURRENCY, DEFAULT_DOWNLOAD_CHUNK_SIZE, DEFAULT_DOWNLOAD_WINDOW,
-    DEFAULT_MAX_UPLOAD_SIZE, DEFAULT_UPLOAD_WINDOW, MAX_RETRIES, protocol_header_value,
+    MAX_RETRIES,
+    protocol_header_value,
 };
 use sha2::{Digest, Sha256};
 
@@ -25,9 +25,9 @@ use sha2::{Digest, Sha256};
 /// client gets by not asking at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IntRange {
-    pub min: i64,
-    pub max: i64,
     pub default: i64,
+    pub max: i64,
+    pub min: i64,
 }
 
 impl IntRange {
@@ -45,17 +45,17 @@ impl IntRange {
 /// Zrip (zstd) level range advertised by the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ZripLevels {
-    pub min: i32,
-    pub max: i32,
     pub default: i32,
+    pub max: i32,
+    pub min: i32,
 }
 
 impl Default for ZripLevels {
     fn default() -> Self {
         ZripLevels {
-            min: ZRIP_MIN_LEVEL,
-            max: ZRIP_MAX_LEVEL,
             default: ZRIP_DEFAULT_LEVEL,
+            max: ZRIP_MAX_LEVEL,
+            min: ZRIP_MIN_LEVEL,
         }
     }
 }
@@ -105,9 +105,8 @@ impl CompressionCaps {
 
 /// Tuning-parameter ranges the server will tolerate.
 ///
-/// `maxUploadSize` is a plain byte cap (no tuning dimension); everything
-/// else is an [`IntRange`]. All defaults mirror `libfw-core` constants so a
-/// server that never overrides anything still advertises sane values.
+/// `maxUploadSize`, `maxRetries` and `timeoutMs` are plain scalar limits; the
+/// rest are range hints with the server-chosen default first in the payload.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Limits {
@@ -119,55 +118,40 @@ pub struct Limits {
     pub download_window: IntRange,
     /// Upload chunk size (bytes).
     pub chunk_size: IntRange,
-    /// Download (byte-range) chunk size (bytes).
-    pub download_chunk_size: IntRange,
     /// Hard cap on a single upload body (bytes).
     pub max_upload_size: u64,
     /// Per-chunk retry budget.
-    pub max_retries: IntRange,
+    pub max_retries: u64,
     /// Request timeout the server will honor (ms).
-    pub timeout_ms: IntRange,
+    pub timeout_ms: u64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Limits {
             concurrency: IntRange {
+                default: 4,
+                max: 4,
                 min: 1,
-                max: 16,
-                default: DEFAULT_CONCURRENCY as i64,
             },
             upload_window: IntRange {
-                min: 1,
+                default: 8,
                 max: 8,
-                default: DEFAULT_UPLOAD_WINDOW as i64,
+                min: 1,
             },
             download_window: IntRange {
+                default: 4,
+                max: 4,
                 min: 1,
-                max: 8,
-                default: DEFAULT_DOWNLOAD_WINDOW as i64,
             },
             chunk_size: IntRange {
-                min: 256 * 1024,
+                default: 2 * 1024 * 1024,
                 max: 8 * 1024 * 1024,
-                default: crate::CHUNK_SIZE as i64,
+                min: 256 * 1024,
             },
-            download_chunk_size: IntRange {
-                min: 64 * 1024,
-                max: 4 * 1024 * 1024,
-                default: DEFAULT_DOWNLOAD_CHUNK_SIZE as i64,
-            },
-            max_upload_size: DEFAULT_MAX_UPLOAD_SIZE,
-            max_retries: IntRange {
-                min: 1,
-                max: 10,
-                default: MAX_RETRIES as i64,
-            },
-            timeout_ms: IntRange {
-                min: 30_000,
-                max: 1_800_000,
-                default: 600_000,
-            },
+            max_upload_size: 20 * 1024 * 1024 * 1024,
+            max_retries: MAX_RETRIES as u64,
+            timeout_ms: 60_000,
         }
     }
 }

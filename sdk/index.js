@@ -207,16 +207,11 @@ export class LibfwClient {
    *        transfer), so a single file's throughput is bounded by bandwidth
    *        instead of one connection's `chunkSize / RTT` on high-latency
    *        links. `1` disables parallelism (sequential downloads).
-   * @param {number} [options.downloadChunkSize=262144] byte range size for
-   *        parallel downloads (256 KiB default). Smaller than the upload
-   *        chunk on purpose: the engine reorders in-flight chunks in memory
-   *        (worst case ≈ `downloadWindow * downloadChunkSize` bytes) so the
-   *        SDK still receives data strictly in order.
    * @param {boolean} [options.compress=true] negotiate zrip compression
-   * @param {number} [options.chunkSize=2097152] upload chunk size in bytes
-   *        (each chunk is split into many small ~64 KiB compressed frames, so
-   *        any value works; larger = fewer, bigger POST requests — bounded
-   *        only by the server's upload limit and client memory)
+   * @param {number} [options.chunkSize=2097152] shared chunk size in bytes for
+   *        both upload chunks and parallel download ranges. The same value is
+   *        used on both paths, and any value works as long as the server and
+   *        memory budget permit it (larger = fewer, bigger requests).
    * @param {number} [options.maxRetries=3] retries per chunk/file before failing
    * @param {number} [options.baseRetryDelayMs=500] initial backoff (ms)
    * @param {number} [options.maxRetryDelayMs=30000] backoff ceiling (ms)
@@ -272,7 +267,6 @@ export class LibfwClient {
       concurrency: 4,
       uploadWindow: 8,
       downloadWindow: 4,
-      downloadChunkSize: 256 * 1024,
       compress: true,
       chunkSize: 2 * 1024 * 1024,
       maxRetries: 3,
@@ -338,7 +332,6 @@ export class LibfwClient {
       concurrency: this._options.concurrency,
       uploadWindow: this._options.uploadWindow,
       downloadWindow: this._options.downloadWindow,
-      downloadChunkSize: this._options.downloadChunkSize,
       compress: this._options.compress,
       chunkSize: this._options.chunkSize,
       maxRetries: this._options.maxRetries,
@@ -1246,8 +1239,7 @@ export class LibfwClient {
    *
    * - `phase`: `uninitialized | ramping | settled | degraded`
    * - `params`: `{ concurrency, uploadWindow, downloadWindow, chunkSize,
-   *   downloadChunkSize, compressLevel }` — the parameters the engine is
-   *   currently tuned to
+   *   compressLevel }` — the parameters the engine is currently tuned to
    * - `stats`: `{ rttMs, mbps }` — EWMA request RTT and last-window
    *   throughput of the most recent transfer
    *

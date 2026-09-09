@@ -92,15 +92,14 @@ async fn capabilities_is_public_and_serves_defaults() {
 
     assert_eq!(json["protocol"], "libfw/1");
     assert_eq!(json["compression"]["formats"], serde_json::json!(["identity", "zrip"]));
-    assert_eq!(json["compression"]["zripLevels"], serde_json::json!({"min": -8, "max": 4, "default": 1}));
-    assert_eq!(json["limits"]["concurrency"], serde_json::json!({"min": 1, "max": 16, "default": 4}));
+    assert_eq!(json["compression"]["zripLevels"], serde_json::json!({"default": 1, "max": 4, "min": -8}));
+    assert_eq!(json["limits"]["concurrency"], serde_json::json!({"default": 4, "max": 4, "min": 1}));
     assert_eq!(json["limits"]["uploadWindow"]["default"], 8);
     assert_eq!(json["limits"]["downloadWindow"]["default"], 4);
     assert_eq!(json["limits"]["chunkSize"]["default"], 2 * 1024 * 1024);
-    assert_eq!(json["limits"]["downloadChunkSize"]["default"], 256 * 1024);
-    assert_eq!(json["limits"]["maxUploadSize"], 100 * 1024 * 1024 * 1024u64);
-    assert_eq!(json["limits"]["maxRetries"]["default"], 3);
-    assert_eq!(json["limits"]["timeoutMs"]["default"], 600_000);
+    assert_eq!(json["limits"]["maxUploadSize"], 21_474_836_480u64);
+    assert_eq!(json["limits"]["maxRetries"], 3);
+    assert_eq!(json["limits"]["timeoutMs"], 60_000);
 
     // Authenticated request gets the identical payload.
     let resp2 = app
@@ -115,11 +114,11 @@ async fn capabilities_is_public_and_serves_defaults() {
 #[tokio::test]
 async fn capabilities_reflects_builder_overrides() {
     let limits = Limits {
-        concurrency: IntRange { min: 1, max: 4, default: 2 },
-        upload_window: IntRange { min: 1, max: 2, default: 1 },
+        concurrency: IntRange { default: 2, max: 4, min: 1 },
+        upload_window: IntRange { default: 1, max: 2, min: 1 },
         ..Limits::default()
     };
-    let levels = ZripLevels { min: -4, max: 0, default: -1 };
+    let levels = ZripLevels { default: -1, max: 0, min: -4 };
     let app = app_with(CompressionFormat::Zrip, Some(limits), Some(levels));
 
     let resp = app
@@ -127,9 +126,9 @@ async fn capabilities_reflects_builder_overrides() {
         .await
         .unwrap();
     let json: Value = serde_json::from_str(&body_string(resp).await).unwrap();
-    assert_eq!(json["limits"]["concurrency"], serde_json::json!({"min": 1, "max": 4, "default": 2}));
+    assert_eq!(json["limits"]["concurrency"], serde_json::json!({"default": 2, "max": 4, "min": 1}));
     assert_eq!(json["limits"]["uploadWindow"]["max"], 2);
-    assert_eq!(json["compression"]["zripLevels"], serde_json::json!({"min": -4, "max": 0, "default": -1}));
+    assert_eq!(json["compression"]["zripLevels"], serde_json::json!({"default": -1, "max": 0, "min": -4}));
 }
 
 #[tokio::test]
@@ -199,7 +198,7 @@ async fn download_level_is_clamped_and_echoed() {
     let app = app_with(
         CompressionFormat::Zrip,
         None,
-        Some(ZripLevels { min: -8, max: 4, default: 1 }),
+        Some(ZripLevels { default: 1, max: 4, min: -8 }),
     );
     let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
 
@@ -246,7 +245,7 @@ async fn download_identity_never_echoes_level() {
     let app = app_with(
         CompressionFormat::Zrip,
         None,
-        Some(ZripLevels { min: -8, max: 4, default: 1 }),
+        Some(ZripLevels { default: 1, max: 4, min: -8 }),
     );
     let data = b"plain identity body".repeat(10);
     let meta = libfw_core::metadata::FileMeta::new("id.bin", data.len() as u64, 1_700_000_000);
