@@ -245,6 +245,26 @@ export class LibfwClient {
    * @param {(event: {type: string, done: number, total: number, path?: string, error?: string}) => void} [options.onEvent]
    *        optional progress/state listener. Tuning updates arrive as
    *        `{ type: 'tuning', phase, params, stats }` events.
+   * @param {FileSystemDirectoryHandle|(() => FileSystemDirectoryHandle|Promise<FileSystemDirectoryHandle>)} [options.directoryHandle]
+   *        pre-selected directory handle (or a resolver returning one) used
+   *        instead of popping `showDirectoryPicker()` for every fs-mode
+   *        download/upload. Callers that already hold a handle (e.g. from a
+   *        picker of their own, or a persisted handle) can inject it here.
+   * @param {(path: string) => string|Promise<string>} [options.resolveDisplayName]
+   *        optional mapping from a virtual server path to the display name
+   *        used for fs-mode on-disk paths (`_ensureFileHandle` — the
+   *        directories/files actually created in the picked folder), browser
+   *        downloads (`_downloadName`), `.zip` entry names (fallback folder
+   *        downloads) and the `.zip` archive name. The resolver may be sync
+   *        or async (return a `Promise`); returned values are still validated
+   *        against zip-slip/path traversal.
+   * @param {(entry: File|{file: File, relPath?: string}, defaultPath: string) => string|Promise<string>} [options.resolveUploadPath]
+   *        optional mapping from an upload entry to its virtual path on the
+   *        server. `entry` is the ORIGINAL item passed to `upload()` — either
+   *        a bare `File` or a caller wrapper such as `{ file, relPath }` — so
+   *        custom metadata survives into the resolver. `defaultPath` is
+   *        `entry.relPath || file.webkitRelativePath || file.name`. The
+   *        resolver may be sync or async (return a `Promise`).
    */
   constructor(options = {}) {
     this._options = {
@@ -265,6 +285,9 @@ export class LibfwClient {
       autoTune: false,
       tuneTtlMs: 3600000,
       onEvent: null,
+      directoryHandle: null,
+      resolveDisplayName: null,
+      resolveUploadPath: null,
       ...options,
     };
     /** @type {WasmEngine|null} */
@@ -283,9 +306,11 @@ export class LibfwClient {
     this._uploadPlan = [];
     /**
      * Active browser-download fallback state, or `null`.
-     * @type {{isFolder:boolean, buffers:Map<string,Uint8Array[]>, order:string[], sizes:Map<string,number>}|null}
+     * @type {{isFolder:boolean, buffers:Map<string,Uint8Array[]>, order:string[], sizes:Map<string,number>, total:number, buffered:number}|null}
      */
     this._fallback = null;
+    /** Leaf-name override for the current single-file download, or `null`. */
+    this._singleFileName = null;
   }
 
   // ------------------------------------------------------------------ setup
@@ -435,6 +460,22 @@ export class LibfwClient {
   }
 
   /**
+   * Obtain the destination directory handle for fs-mode transfers: the
+   * injected `directoryHandle` option (a handle or a resolver function)
+   * wins; otherwise `showDirectoryPicker()` is popped.
+   * @returns {Promise<FileSystemDirectoryHandle>}
+   * @private
+   */
+  async _pickDirectory() {
+    const provided = this._options.directoryHandle;
+    if (provided) {
+      const handle = typeof provided === 'function' ? await provided() : provided;
+      if (handle) return handle;
+    }
+    return window.showDirectoryPicker();
+  }
+
+  /**
    * Resolve the effective download mode from the `downloadMode` option:
    * an explicit `'fs'`/`'browser'` wins; `'auto'` falls back to the browser
    * download when the File System Access API is missing.
@@ -469,7 +510,7 @@ export class LibfwClient {
     if (this._effectiveMode() === 'browser') {
       return this._downloadViaBrowser(engine, token, dirPath, true);
     }
-    this._dirHandle = await window.showDirectoryPicker();
+    this._dirHandle = await this._pickDirectory();
     this._fileHandles.clear();
     try {
       return await engine.download_folder(this._options.baseUrl, token, dirPath);
@@ -491,22 +532,35 @@ export class LibfwClient {
    *
    * @param {string} token bearer token
    * @param {string} filePath virtual server path of the file to download
+   * @param {{fileName?: string}} [opts] optional overrides; `fileName` is the
+   *        local name the file is saved as (leaf name only — parent
+   *        directories of `filePath` still apply in fs mode).
    * @returns {Promise<number>} total bytes transferred
    * @throws {LibfwError}
    */
-  async downloadFile(token, filePath) {
+  async downloadFile(token, filePath, opts = {}) {
     const engine = await this._ready();
     if (!filePath) throw new LibfwError('downloadFile requires a file path', 'path');
-    if (this._effectiveMode() === 'browser') {
-      return this._downloadViaBrowser(engine, token, filePath, false);
+    if (opts.fileName !== undefined) {
+      const name = String(opts.fileName);
+      // Reject anything that could escape the destination directory (the
+      // FS Access API would throw a raw TypeError anyway; fail uniformly).
+      if (!name || name === '.' || name === '..' || /[/\\]/.test(name)) {
+        throw new LibfwError(`invalid fileName: ${name}`, 'path');
+      }
     }
-    this._dirHandle = await window.showDirectoryPicker();
-    this._fileHandles.clear();
+    this._singleFileName = opts.fileName ? String(opts.fileName) : null;
     try {
+      if (this._effectiveMode() === 'browser') {
+        return await this._downloadViaBrowser(engine, token, filePath, false);
+      }
+      this._dirHandle = await this._pickDirectory();
+      this._fileHandles.clear();
       return await engine.download_file(this._options.baseUrl, token, filePath);
     } catch (err) {
       throw toLibfwError(err);
     } finally {
+      this._singleFileName = null;
       await this._flushWritables();
       await this._syncResumeOffsets();
     }
@@ -531,7 +585,7 @@ export class LibfwClient {
    * @private
    */
   async _downloadViaBrowser(engine, token, path, isFolder) {
-    this._fallback = { isFolder, buffers: new Map(), order: [], sizes: new Map(), total: 0 };
+    this._fallback = { isFolder, buffers: new Map(), order: [], sizes: new Map(), total: 0, buffered: 0 };
     try {
       const total = isFolder
         ? await engine.download_folder(this._options.baseUrl, token, path)
@@ -539,22 +593,36 @@ export class LibfwClient {
       const { buffers, order, sizes } = this._fallback;
       if (isFolder) {
         const entries = [];
+        // Distinct virtual paths may map to the same display name (a custom
+        // `resolveDisplayName` is not required to be injective); duplicate
+        // names would silently shadow each other on extraction.
+        const names = new Set();
+        const pushEntry = (name, data) => {
+          if (names.has(name)) {
+            throw new LibfwError(`duplicate download entry name: ${name}`, 'path');
+          }
+          names.add(name);
+          entries.push({ name, data });
+        };
         for (const p of order) {
-          entries.push({
-            name: this._safeEntryName(p),
-            data: this._concatBuffers(buffers.get(p)?.chunks || []),
-          });
+          pushEntry(
+            await this._safeEntryName(p),
+            this._concatBuffers(buffers.get(p)?.chunks || [])
+          );
         }
         // Include files that were announced but produced no bytes (empty).
         for (const p of sizes.keys()) {
           if (!buffers.has(p)) {
-            entries.push({ name: this._safeEntryName(p), data: new Uint8Array(0) });
+            pushEntry(await this._safeEntryName(p), new Uint8Array(0));
           }
         }
-        this._triggerBrowserDownload(createZip(entries), this._archiveName(path));
+        this._triggerBrowserDownload(createZip(entries), await this._archiveName(path));
       } else {
         const data = this._concatBuffers(buffers.get(path)?.chunks || []);
-        this._triggerBrowserDownload(new Blob([data], { type: 'application/octet-stream' }), this._downloadName(path));
+        this._triggerBrowserDownload(
+          new Blob([data], { type: 'application/octet-stream' }),
+          this._singleFileName || (await this._downloadName(path))
+        );
       }
       return total;
     } catch (err) {
@@ -584,25 +652,36 @@ export class LibfwClient {
   }
 
   /**
-   * Strip a leading `/` so an entry path is archive/OS friendly.
+   * Strip a leading `/` so an entry path is archive/OS/disk friendly,
+   * applying the `resolveDisplayName` option when configured. The resolver
+   * may be sync or async (return a `Promise`); both fs-mode on-disk paths
+   * (`_ensureFileHandle`) and browser-fallback archive/file names go
+   * through here, so a display-name mapping applies uniformly to every
+   * download destination.
    * @param {string} path
-   * @returns {string}
+   * @returns {Promise<string>}
    * @private
    */
-  _cleanPath(path) {
-    return String(path).replace(/^\/+/, '');
+  async _cleanPath(path) {
+    const resolve = this._options.resolveDisplayName;
+    let resolved = null;
+    if (typeof resolve === 'function') {
+      resolved = await resolve(String(path));
+    }
+    return String(resolved != null ? resolved : path).replace(/^\/+/, '');
   }
 
   /**
-   * Validate a virtual path for use as a ZIP entry name, rejecting any
-   * traversal (`..`), absolute/drive-letter prefixes or Windows-style
-   * separators that could escape the archive on extraction (zip-slip).
+   * Validate a virtual path for use as a ZIP entry name or an on-disk
+   * fs-mode path, rejecting any traversal (`..`), absolute/drive-letter
+   * prefixes or Windows-style separators that could escape the archive on
+   * extraction (zip-slip) or the picked download directory.
    * @param {string} path
-   * @returns {string}
+   * @returns {Promise<string>}
    * @private
    */
-  _safeEntryName(path) {
-    const cleaned = this._cleanPath(path);
+  async _safeEntryName(path) {
+    const cleaned = await this._cleanPath(path);
     const segs = String(cleaned).split('/');
     if (segs.some((seg) => seg === '..' || seg.includes('\\') || /^[a-zA-Z]:/.test(seg))) {
       throw new LibfwError(`unsafe path in download: ${path}`, 'path');
@@ -623,22 +702,22 @@ export class LibfwClient {
   /**
    * Derive a safe file name from a virtual path.
    * @param {string} path
-   * @returns {string}
+   * @returns {Promise<string>}
    * @private
    */
-  _downloadName(path) {
-    const name = this._cleanPath(path).split('/').pop();
+  async _downloadName(path) {
+    const name = (await this._cleanPath(path)).split('/').pop();
     return name || 'download';
   }
 
   /**
    * Derive the `.zip` archive name for a folder download.
    * @param {string} path
-   * @returns {string}
+   * @returns {Promise<string>}
    * @private
    */
-  _archiveName(path) {
-    const base = this._cleanPath(path).split('/').pop() || 'download';
+  async _archiveName(path) {
+    const base = (await this._cleanPath(path)).split('/').pop() || 'download';
     return `${base.replace(/[^\w.\- ]+/g, '_') || 'download'}.zip`;
   }
 
@@ -703,6 +782,18 @@ export class LibfwClient {
       }
       buf.chunks.push(data);
       buf.len += data.length;
+      // Runtime backstop for the in-memory cap: `onFileStart` pre-checks use
+      // the engine's declared size; an under-reported size (or a skipped
+      // fileStart on an unusual path) must still fail instead of growing the
+      // buffer unbounded.
+      this._fallback.buffered += data.length;
+      const max = this._maxFallbackBytes();
+      if (max > 0 && this._fallback.buffered > max) {
+        throw new LibfwError(
+          `browser download buffered more than the ${max}-byte in-memory limit`,
+          'too-large'
+        );
+      }
       return;
     }
     let entry = this._writables.get(path);
@@ -797,7 +888,9 @@ export class LibfwClient {
    * @private
    */
   async _ensureFileHandle(path) {
-    const segments = splitPath(path);
+    // Map through the display-name resolver (sync or async) so fs-mode
+    // streaming lands under the same names the browser fallback would use.
+    const segments = splitPath(await this._safeEntryName(path));
     if (segments.length === 0) {
       throw new LibfwError(`invalid download path: ${path}`, 'path');
     }
@@ -805,7 +898,7 @@ export class LibfwClient {
     for (let i = 0; i < segments.length - 1; i += 1) {
       dir = await dir.getDirectoryHandle(segments[i], { create: true });
     }
-    const name = segments[segments.length - 1];
+    const name = this._singleFileName || segments[segments.length - 1];
     const handle = await dir.getFileHandle(name, { create: true });
     return { dir, name, handle };
   }
@@ -836,7 +929,9 @@ export class LibfwClient {
   async _resolveFileHandle(path) {
     if (!this._dirHandle) return null;
     try {
-      const segments = splitPath(path);
+      // Same display-name mapping as `_ensureFileHandle` so a resume finds
+      // the file previously written under its resolved (display) name.
+      const segments = splitPath(await this._safeEntryName(path));
       if (segments.length === 0) return null;
       let dir = this._dirHandle;
       for (let i = 0; i < segments.length - 1; i += 1) {
@@ -945,12 +1040,14 @@ export class LibfwClient {
    *
    * If `files` is omitted, `showDirectoryPicker()` is used to select a
    * local folder whose structure is mirrored on the server. Otherwise
-   * `files` may be a `FileList`, an array of `File`s, or an array of
+   * `files` may be a `FileList`, an array of `File`s, an array of
+   * `{ file, relPath }` wrappers (custom per-file virtual paths, passed
+   * verbatim to `resolveUploadPath`), or an array of
    * `{ path, size, mtime }` plan entries (when you want to drive reading
    * yourself).
    *
    * @param {string} token bearer token
-   * @param {FileList|File[]|Array<{path:string,size:number,mtime:number}>} [files]
+   * @param {FileList|File[]|Array<{file:File,relPath?:string}>|Array<{path:string,size:number,mtime:number}>} [files]
    * @returns {Promise<number>} total bytes uploaded
    * @throws {LibfwError}
    */
@@ -977,7 +1074,7 @@ export class LibfwClient {
       if (typeof window === 'undefined' || typeof window.showDirectoryPicker !== 'function') {
         throw new LibfwError('File System Access API is not available in this browser', 'unsupported');
       }
-      const dir = await window.showDirectoryPicker();
+      const dir = await this._pickDirectory();
       this._dirHandle = dir;
       this._uploadPlan = await this._collectDirectoryFiles(dir, '');
     } else {
@@ -1031,9 +1128,35 @@ export class LibfwClient {
     }
     const list = Array.from(files || []);
     const plan = [];
-    for (const file of list) {
-      if (!(file instanceof File)) continue;
-      const path = file.webkitRelativePath || file.name;
+    const resolve = this._options.resolveUploadPath;
+    const seen = new Set();
+    for (const entry of list) {
+      // Accept bare `File`s as well as wrappers like `{ file, relPath }`;
+      // the resolver receives the ORIGINAL entry so caller-side metadata
+      // (e.g. a custom `relPath`) is visible without WeakMap workarounds.
+      const file = entry instanceof File ? entry : entry && entry.file instanceof File ? entry.file : null;
+      if (!file) continue;
+      // A wrapper-provided `relPath` is the most specific default; fall
+      // back to the browser-provided relative path, then the file name.
+      const defaultPath =
+        (entry && typeof entry === 'object' && typeof entry.relPath === 'string' && entry.relPath
+          ? entry.relPath
+          : null) ||
+        file.webkitRelativePath ||
+        file.name;
+      // The resolver may be async; a `null`/`undefined` mapping falls back
+      // to the default path (same leniency as `resolveDisplayName`).
+      let path = defaultPath;
+      if (typeof resolve === 'function') {
+        const mapped = await resolve(entry, defaultPath);
+        if (mapped != null) path = String(mapped);
+      }
+      // A mapping that collides would silently shadow one File with another
+      // (_uploadFiles keeps only the last) and upload the same path twice.
+      if (seen.has(path)) {
+        throw new LibfwError(`duplicate upload path: ${path}`, 'path');
+      }
+      seen.add(path);
       this._uploadFiles.set(path, file);
       plan.push({ path, size: file.size, mtime: Math.floor(file.lastModified / 1000) });
     }

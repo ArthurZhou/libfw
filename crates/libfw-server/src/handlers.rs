@@ -279,7 +279,21 @@ fn negotiate_download_format(state: &ServerState, req_headers: &HeaderMap) -> Co
     let wants_zrip = req_headers
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.split(',').any(|e| e.trim().eq_ignore_ascii_case("zrip")))
+        .map(|v| {
+            v.split(',').any(|e| {
+                let mut parts = e.trim().split(';');
+                if !parts.next().unwrap_or("").trim().eq_ignore_ascii_case("zrip") {
+                    return false;
+                }
+                // Honour `;q=0` — RFC 9110 treats qvalue 0 as "not acceptable".
+                !parts.any(|p| {
+                    let p = p.trim();
+                    p.len() > 2
+                        && p[..2].eq_ignore_ascii_case("q=")
+                        && p[2..].trim().parse::<f64>().map(|q| q <= 0.0).unwrap_or(false)
+                })
+            })
+        })
         .unwrap_or(false);
     if wants_zrip && state.compression == CompressionFormat::Zrip {
         CompressionFormat::Zrip

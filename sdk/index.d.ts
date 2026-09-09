@@ -36,6 +36,17 @@ export interface UploadEntry {
   mtime: number;
 }
 
+/**
+ * A `File` together with a caller-provided virtual path override. Passed
+ * verbatim to `options.resolveUploadPath`; when no resolver is configured,
+ * `relPath` itself is used as the upload path.
+ */
+export interface UploadFileEntry {
+  file: File;
+  /** Virtual path (POSIX separators) to upload the file as. */
+  relPath?: string;
+}
+
 /** Adaptive-tuning parameters the engine is currently tuned to. */
 export interface TuningParams {
   /** Cross-file transfer concurrency. */
@@ -171,6 +182,30 @@ export interface LibfwClientOptions {
   tuneTtlMs?: number;
   /** Optional progress/state listener. Tuning updates arrive as `{ type: 'tuning', phase, params, stats }`. */
   onEvent?: (event: LibfwEvent | LibfwTuningEvent) => void;
+  /**
+   * Pre-selected directory handle (or a resolver returning one) used instead
+   * of `showDirectoryPicker()` for every fs-mode download/upload.
+   */
+  directoryHandle?:
+    | FileSystemDirectoryHandle
+    | (() => FileSystemDirectoryHandle | Promise<FileSystemDirectoryHandle>);
+  /**
+   * Map a virtual server path to the display name used for fs-mode on-disk
+   * paths (directories/files created in the picked download folder),
+   * browser downloads, `.zip` entry names and the `.zip` archive name. May
+   * be async; returned values are still validated against zip-slip.
+   */
+  resolveDisplayName?: (path: string) => string | Promise<string>;
+  /**
+   * Map an upload entry to its virtual path on the server. `entry` is the
+   * original item passed to `upload()` (a bare `File` or an
+   * `UploadFileEntry` wrapper). `defaultPath` is
+   * `entry.relPath || file.webkitRelativePath || file.name`. May be async.
+   */
+  resolveUploadPath?: (
+    entry: File | UploadFileEntry,
+    defaultPath: string
+  ) => string | Promise<string>;
 }
 
 /**
@@ -204,9 +239,12 @@ export declare class LibfwClient {
    *
    * @param token bearer token
    * @param filePath virtual server path of the file to download
+   * @param opts optional overrides; `fileName` is the local name the file is
+   *        saved as (leaf name only — parent directories of `filePath` still
+   *        apply in fs mode).
    * @returns total bytes written
    */
-  downloadFile(token: string, filePath: string): Promise<number>;
+  downloadFile(token: string, filePath: string, opts?: { fileName?: string }): Promise<number>;
 
   /**
    * Upload files to the server.
@@ -220,7 +258,7 @@ export declare class LibfwClient {
    */
   upload(
     token: string,
-    files?: FileList | File[] | UploadEntry[],
+    files?: FileList | File[] | UploadFileEntry[] | UploadEntry[],
   ): Promise<number>;
 
   /** Pause the active transfer. */

@@ -92,7 +92,11 @@ impl TransferPlan {
     ///
     /// The last chunk may be shorter than `chunk_size`.
     pub fn with_chunk_size(file: FileMeta, chunk_size: u64) -> Self {
-        debug_assert!(chunk_size > 0);
+        // `chunk_size == 0` would loop forever below (`len` never advances
+        // `offset`). A `debug_assert!` is compiled out of release builds, so
+        // this must be a runtime check — misuse fails loudly instead of
+        // hanging the caller.
+        assert!(chunk_size > 0, "chunk_size must be > 0");
         let mut chunks = Vec::new();
         let mut offset = 0u64;
         while offset < file.size {

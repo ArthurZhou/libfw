@@ -51,8 +51,21 @@ export function createZip(entries) {
   const central = [];
   let offset = 0;
 
+  // This writer uses classic 32-bit ZIP fields (no ZIP64): entry sizes, the
+  // local-header offset, the central-directory size/offset and the entry
+  // count are all stored as u32/u16. Exceeding any of them would silently
+  // corrupt the archive, so fail loudly instead.
+  const MAX_U32 = 0xffffffff;
+  const MAX_U16 = 0xffff;
+  if (entries.length > MAX_U16) {
+    throw new Error(`too many zip entries: ${entries.length} > ${MAX_U16}`);
+  }
+
   for (const entry of entries) {
     const nameBytes = encoder.encode(entry.name);
+    if (nameBytes.length > MAX_U16) {
+      throw new Error(`zip entry name too long: ${entry.name.slice(0, 64)}…`);
+    }
     const data = entry.data;
     const crc = crc32(data);
 
@@ -75,6 +88,9 @@ export function createZip(entries) {
     body.push(local, data);
     central.push({ nameBytes, crc, size: data.length, offset });
     offset += local.length + data.length;
+    if (offset > MAX_U32) {
+      throw new Error('zip archive exceeds the 4 GiB limit of this writer');
+    }
   }
 
   // Central directory.
@@ -103,6 +119,9 @@ export function createZip(entries) {
     cd.set(c.nameBytes, 46);
     dir.push(cd);
     cdSize += cd.length;
+  }
+  if (cdSize > MAX_U32) {
+    throw new Error('zip central directory exceeds the 4 GiB limit of this writer');
   }
 
   const cdOffset = offset;
