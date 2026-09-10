@@ -2,12 +2,10 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 const crypto = require('crypto');
-
-const BASE = process.env.BASE || 'http://127.0.0.1:8081';
-const EXE = process.env.CHROME || `${process.env.HOME}/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`;
+const { BASE, launch, tmpFile } = require('./harness.cjs');
 
 (async () => {
-  const browser = await chromium.launch({ executablePath: EXE, headless: true });
+  const browser = await launch(chromium);
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   const cdp = await ctx.newCDPSession(page);
@@ -30,8 +28,8 @@ const EXE = process.env.CHROME || `${process.env.HOME}/Library/Caches/ms-playwri
   });
   page.on('console', (m) => { if (m.text().startsWith('[tune-ev]')) tuneEvents.push(m.text()); });
 
-  fs.mkdirSync('/tmp/libfw-e2e', { recursive: true });
-  const p = '/tmp/libfw-e2e/tune-check.bin';
+  fs.mkdirSync(require('path').dirname(tmpFile('tune-check.bin')), { recursive: true });
+  const p = tmpFile('tune-check.bin');
   fs.writeFileSync(p, crypto.randomBytes(14 * 1024 * 1024));
   await page.setInputFiles('#files', p);
 
@@ -46,7 +44,9 @@ const EXE = process.env.CHROME || `${process.env.HOME}/Library/Caches/ms-playwri
     const rtt = await page.textContent('#t-rtt').catch(() => '?');
     const mbps = await page.textContent('#t-mbps').catch(() => '?');
     samples.push({ state, phase, conc, lvl, rtt, mbps });
-    if (state === 'idle' && samples.length > 2) break;
+    // `#st-state` is `running` while a transfer is in flight and holds the
+    // terminal state (`completed` / `failed`) afterwards.
+    if (state !== 'running' && samples.length > 2) break;
     await page.waitForTimeout(250);
   }
 

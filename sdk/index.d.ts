@@ -127,7 +127,19 @@ export interface LibfwClientOptions {
   downloadWindow?: number;
   /** Negotiate zrip compression. Default `true`. */
   compress?: boolean;
-  /** Upload chunk size in bytes. Default 2 MiB. */
+  /**
+   * zrip level policy when `compress` is on. `'fast'` = advertised minimum
+   * (least CPU), `'balanced'` (default) = advertised default, `'max'` =
+   * advertised maximum (best ratio); a number is that level clamped into the
+   * advertised range.
+   *
+   * `'auto'` additionally micro-benchmarks the advertised range against a
+   * real sample of the first uploaded file while `autoTune` is enabled,
+   * choosing the level with the best bytes-saved-vs-CPU-time trade-off.
+   * Downloads request the resolved level from the server.
+   */
+  compressLevel?: number | 'auto' | 'fast' | 'balanced' | 'max';
+  /** Shared chunk size in bytes for uploads and parallel downloads. Default 2 MiB. */
   chunkSize?: number;
   /** Retries per chunk/file before failing. Default `3`. */
   maxRetries?: number;
@@ -160,15 +172,28 @@ export interface LibfwClientOptions {
   maxFallbackBytes?: number;
   /**
    * Enable the adaptive tuning engine: the engine probes the server's
-   * `/capabilities` limits and TCP-style ramps concurrency / windows /
-   * chunk sizes (and the zrip level) from the advertised minimums using
-   * real transfer stats. When disabled the configured static values are
-   * used as-is. Default `false`.
+   * `/capabilities` limits and TCP-style ramps the per-file window and
+   * cross-file concurrency from the advertised minimums using real transfer
+   * stats. The chunk size follows the measured throughput (~100 ms of it,
+   * clamped into the advertised range) and the zrip level is a client policy
+   * from `compressLevel`, never ramped. When disabled the configured static
+   * values are used as-is. Default `false`.
+   *
+   * Tuning state lives in memory for this client instance (a settle is reused
+   * by later transfers and dropped on failure) **and** is cached in
+   * `localStorage` per origin + direction, so a page reload does not re-ramp.
+   * See `tuneTtlMs` for the lifetime of that cache. Default `false`.
    */
   autoTune?: boolean;
   /**
-   * How long (ms) a settled tuning result is reused for the same server
-   * origin before re-ramping. Default `3600000` (1 hour).
+   * How long a cached tuning result stays usable, in milliseconds. Default
+   * `3600000` (1 hour); `0` disables the cache so every transfer re-ramps.
+   *
+   * The cache is browser-only (the Rust native client keeps its settle in
+   * memory) and is keyed by origin + direction. The TTL counts from the moment
+   * the ramp settled, and an entry is discarded early when the server's
+   * `/capabilities` change or a transfer fails. Ignored unless `autoTune` is
+   * enabled.
    */
   tuneTtlMs?: number;
   /** Optional progress/state listener. Tuning updates arrive as `{ type: 'tuning', phase, params, stats }`. */

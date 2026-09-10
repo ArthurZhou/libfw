@@ -207,7 +207,20 @@ export class LibfwClient {
    *        transfer), so a single file's throughput is bounded by bandwidth
    *        instead of one connection's `chunkSize / RTT` on high-latency
    *        links. `1` disables parallelism (sequential downloads).
-   * @param {boolean} [options.compress=true] negotiate zrip compression
+   * @param {boolean} [options.compress=true] negotiate zrip compression.
+   *        Master switch: `false` sends every body as identity, regardless of
+   *        `compressLevel`.
+   * @param {number|'auto'|'fast'|'balanced'|'max'} [options.compressLevel='balanced']
+   *        zrip level policy when `compress` is on. `'fast'` = advertised
+   *        minimum (least CPU, worst ratio), `'balanced'`/`'auto'`-without-a-
+   *        sample = advertised default, `'max'` = advertised maximum (best
+   *        ratio), a number = that level clamped into the advertised range.
+   *        `'auto'` additionally micro-benchmarks the advertised range against
+   *        a real sample of the first uploaded file (only while `autoTune` is
+   *        enabled) and picks the level with the best
+   *        bytes-saved-vs-CPU-time trade-off for the measured link speed.
+   *        Downloads request the resolved level from the server (no sample is
+   *        available before the transfer starts).
    * @param {number} [options.chunkSize=2097152] shared chunk size in bytes for
    *        both upload chunks and parallel download ranges. The same value is
    *        used on both paths, and any value works as long as the server and
@@ -232,11 +245,23 @@ export class LibfwClient {
    *        `0` disables the limit.
    * @param {boolean} [options.autoTune=false] enable the adaptive tuning
    *        engine: the engine probes the server's `/capabilities` limits and
-   *        TCP-style ramps concurrency / windows / chunk sizes (and the zrip
-   *        level) from the advertised minimums using real transfer stats.
-   *        When disabled the configured static values are used as-is.
-   * @param {number} [options.tuneTtlMs=3600000] how long a settled tuning
-   *        result is reused for the same server origin before re-ramping
+   *        TCP-style ramps the per-file window and cross-file concurrency from
+   *        the advertised minimums using real transfer stats; the chunk size
+   *        follows the measured throughput (~100 ms of it, clamped into the
+   *        advertised range) and the zrip level is a client policy from
+   *        `compressLevel`, never ramped. When disabled the configured static
+   *        values are used as-is. A settled result is kept in memory for this
+   *        client instance (reused by later transfers, dropped on failure)
+   *        **and** cached in `localStorage` per origin + direction, so a page
+   *        reload does not re-ramp; see `tuneTtlMs` for how long that cache
+   *        lives.
+   * @param {number} [options.tuneTtlMs=3600000] how long a cached tuning
+   *        result (browser only — the Rust native client keeps it in memory)
+   *        stays usable, in milliseconds. The TTL counts from the moment the
+   *        ramp settled, is scoped to one origin + direction, and is
+   *        invalidated early if the server's `/capabilities` change or a
+   *        transfer fails. `0` disables the cache entirely, so every transfer
+   *        (and every page load) re-ramps. Ignored unless `autoTune` is on.
    * @param {(event: {type: string, done: number, total: number, path?: string, error?: string}) => void} [options.onEvent]
    *        optional progress/state listener. Tuning updates arrive as
    *        `{ type: 'tuning', phase, params, stats }` events.
@@ -268,6 +293,7 @@ export class LibfwClient {
       uploadWindow: 8,
       downloadWindow: 4,
       compress: true,
+      compressLevel: null,
       chunkSize: 2 * 1024 * 1024,
       maxRetries: 3,
       baseRetryDelayMs: 500,
@@ -277,7 +303,7 @@ export class LibfwClient {
       downloadMode: 'auto',
       maxFallbackBytes: 512 * 1024 * 1024,
       autoTune: false,
-      tuneTtlMs: 3600000,
+      tuneTtlMs: 60 * 60 * 1000,
       onEvent: null,
       directoryHandle: null,
       resolveDisplayName: null,
@@ -333,6 +359,7 @@ export class LibfwClient {
       uploadWindow: this._options.uploadWindow,
       downloadWindow: this._options.downloadWindow,
       compress: this._options.compress,
+      compressLevel: this._options.compressLevel,
       chunkSize: this._options.chunkSize,
       maxRetries: this._options.maxRetries,
       baseRetryDelayMs: this._options.baseRetryDelayMs,
@@ -417,7 +444,15 @@ export class LibfwClient {
         // poisons a later FS-API resume. Skip persisting download state
         // while a fallback transfer is active.
         if (direction === 'download' && this._fallback) return Promise.resolve();
-        return Idb.saveState(`${direction}:${path}`, state);
+        return Idb.saveState(`${direction}:${path}`, state).then(() => {
+          // The engine reports a durable offset every few MiB: use it to
+          // COMMIT the prefix to disk, so an interrupted download (a tab
+          // refresh or a crash — no `finally` block runs) still has a partial
+          // to resume from instead of starting over.
+          if (direction === 'download') {
+            return this._checkpointDownload(path, Number(state?.offset) || 0);
+          }
+        });
       },
       getFileList: () => this._getFileList(),
       readFile: (path, offset, length) => this._readFile(path, offset, length),
@@ -818,11 +853,108 @@ export class LibfwClient {
       const writable = await handle.createWritable(
         isResume ? { keepExistingData: true } : undefined
       );
+      if (isResume) {
+        // `createWritable({ keepExistingData: true })` KEEPS the existing
+        // bytes but still positions the stream at 0 — it is not an append. A
+        // resumed tail written without seeking would overwrite the prefix and
+        // then close, leaving a file that is only the tail (measured: a
+        // 20 MiB download resumed at 6.8 MiB produced a 14.1 MiB, corrupt
+        // file). Seek past what is already on disk so the tail really
+        // appends; `_loadResumeState` clamped `offset` to the on-disk length.
+        const existing = (await handle.getFile()).size;
+        if (existing < offset) {
+          // The prefix we are asked to resume past is not on disk: appending
+          // would leave a hole. Fail loudly instead of committing a corrupt
+          // file (the caller can retry, which restarts cleanly).
+          await this._discardWritable(path, writable);
+          throw new LibfwError(
+            `cannot resume \`${path}\`: only ${existing} of ${offset} bytes are on disk`,
+            'storage'
+          );
+        }
+        try {
+          await writable.seek(offset);
+        } catch (err) {
+          await this._discardWritable(path, writable);
+          throw new LibfwError(
+            `cannot resume \`${path}\`: the destination cannot be seeked (${err?.message ?? err})`,
+            'storage'
+          );
+        }
+      }
       entry = { writable, dir, name, lastOffset: offset };
       this._writables.set(path, entry);
     }
     entry.lastOffset = offset;
     await entry.writable.write(data);
+  }
+
+  /**
+   * Commit the bytes received so far for a download to disk.
+   *
+   * `createWritable()` only publishes the file on `close()` — everything else
+   * lives in a Chromium swap file (`.name.crswap`) that is DISCARDED when the
+   * page dies. A hard refresh mid-download would therefore find a 0-byte (or
+   * stale) target and restart from byte 0. The engine reports a durable
+   * offset every few MiB (`RESUME_SAVE_EVERY`), so this closes the writable
+   * (publishing the prefix) and immediately reopens it with
+   * `keepExistingData` + `seek`, leaving a resumable partial on disk at the
+   * cost of one close/reopen per checkpoint.
+   *
+   * Called from the `saveState` callback, which the engine awaits between
+   * chunks — no write for this path is in flight here.
+   * @param {string} path
+   * @param {number} offset durable offset reported by the engine
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _checkpointDownload(path, offset) {
+    const entry = this._writables.get(path);
+    const handle = this._fileHandles.get(path);
+    if (!entry || !handle || offset <= 0) return;
+    let onDisk = 0;
+    try {
+      onDisk = (await handle.getFile()).size;
+    } catch {
+      return; // handle gone: nothing safe to commit
+    }
+    // Nothing new to publish (an earlier checkpoint already covers it), or
+    // the engine is behind the bytes we committed: leave the stream alone.
+    if (onDisk >= offset) return;
+    try {
+      await entry.writable.close();
+    } catch {
+      return; // keep the (still open) stream; the next chunk continues on it
+    }
+    try {
+      const writable = await handle.createWritable({ keepExistingData: true });
+      // The committed file now holds everything written so far; `close()`
+      // published exactly `lastOffset` bytes, so appending resumes there.
+      await writable.seek((await handle.getFile()).size);
+      entry.writable = writable;
+    } catch {
+      // Reopening failed: forget the stream so the next chunk re-opens it
+      // through the normal resume path (which re-validates the prefix).
+      this._writables.delete(path);
+    }
+  }
+
+  /**
+   * Drop an open writable (and its uncommitted swap file) without failing the
+   * caller. Used when a resume cannot be honoured so no partial/corrupt file
+   * is committed.
+   * @param {string} path
+   * @param {FileSystemWritableFileStream} writable
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _discardWritable(path, writable) {
+    this._writables.delete(path);
+    try {
+      await writable.abort();
+    } catch {
+      /* best-effort discard */
+    }
   }
 
   /**

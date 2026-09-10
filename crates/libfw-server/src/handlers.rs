@@ -535,10 +535,21 @@ async fn upload_session(
     let mut out: Vec<u8> = Vec::new();
     let mut written = 0u64;
     let mut stream = body.into_data_stream();
+    // Set when the *request body* itself fails. That is a transport event —
+    // the client went away (tab refresh, crash, dropped connection) — not
+    // invalid data, so it must NOT discard the shared session temp (see the
+    // error handling below).
+    let mut disconnected = false;
 
     let write_result: Result<(), ApiError> = async {
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| ApiError::Io(std::io::Error::other(e)))?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    disconnected = true;
+                    return Err(ApiError::Io(std::io::Error::other(e)));
+                }
+            };
             decomp
                 .decompress(&chunk, &mut out)
                 .map_err(|e| ApiError::BadRequest(format!("compressed stream invalid: {e}")))?;
@@ -559,6 +570,19 @@ async fn upload_session(
     .await;
 
     if let Err(e) = write_result {
+        if disconnected {
+            // The client vanished mid-chunk. Dropping the sink (without
+            // `abort`) releases the per-target lock and keeps the shared temp
+            // AND its sidecar: the partially received blocks are exactly what
+            // makes the next attempt resumable, so a page refresh must not
+            // wipe them. The ranges recorded so far only cover fully written
+            // slices, and positional writes are idempotent, so re-sending the
+            // interrupted block is always safe.
+            drop(sink);
+            return Err(e);
+        }
+        // Any other failure (bad compression, size limits, disk errors) means
+        // the partial may not be trustworthy: discard it.
         let _ = sink.abort().await;
         return Err(e);
     }

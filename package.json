@@ -1,4 +1,14 @@
 {
+  "private": true,
+  "scripts": {
+    "e2e:matrix": "node tests/e2e/upload-matrix.cjs",
+    "e2e:resume": "node tests/e2e/upload-resume.cjs",
+    "e2e:download": "node tests/e2e/download-check.cjs",
+    "e2e:resume-fs": "node tests/e2e/download-resume.cjs",
+    "e2e:tune": "node tests/e2e/tune-panel-check.cjs",
+    "e2e:tune-cache": "node tests/e2e/tune-cache-check.cjs",
+    "e2e:refresh": "node tests/e2e/resume-refresh.cjs"
+  },
   "devDependencies": {
     "playwright": "^1.62.1"
   }

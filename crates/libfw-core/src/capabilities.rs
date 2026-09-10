@@ -32,8 +32,17 @@ pub struct IntRange {
 
 impl IntRange {
     /// Clamp `v` into `min..=max`.
+    ///
+    /// The bounds arrive from a peer we do not control, so an inverted (or
+    /// otherwise empty) range falls back to `default` instead of panicking
+    /// the way `i64::clamp` would — the same guard
+    /// [`ZripLevels::clamp_level`] applies.
     pub fn clamp(&self, v: i64) -> i64 {
-        v.clamp(self.min, self.max)
+        if self.min <= self.max {
+            v.clamp(self.min, self.max)
+        } else {
+            self.default
+        }
     }
 
     /// Whether `v` lies inside `min..=max`.
@@ -119,6 +128,12 @@ pub struct Limits {
     /// Upload chunk size (bytes).
     pub chunk_size: IntRange,
     /// Hard cap on a single upload body (bytes).
+    ///
+    /// Advisory and conservative by default — [`ServerState::capabilities`]
+    /// clamps it to the limit the server actually enforces, so the
+    /// advertisement can never overstate it.
+    ///
+    /// [`ServerState::capabilities`]: https://docs.rs/libfw-server/latest/libfw_server/struct.ServerState.html#method.capabilities
     pub max_upload_size: u64,
     /// Per-chunk retry budget.
     pub max_retries: u64,
@@ -254,6 +269,9 @@ mod tests {
         // Out-of-range clamps.
         assert_eq!(negotiate_level(Some(-20), -8, 4, 1), -8);
         assert_eq!(negotiate_level(Some(99), -8, 4, 1), 4);
+        // Inverted range → default (never panic).
+        assert_eq!(negotiate_level(Some(1), 4, -8, 1), 1);
+        assert_eq!(negotiate_level(None, 4, -8, 1), 1);
     }
 
     #[test]
@@ -277,6 +295,17 @@ mod tests {
         assert_eq!(r.clamp(8), 8);
         assert!(r.contains(16));
         assert!(!r.contains(17));
+
+        // An inverted (empty) advertised range must fall back to `default`
+        // instead of panicking inside `i64::clamp`.
+        let inverted = IntRange {
+            min: 16,
+            max: 1,
+            default: 4,
+        };
+        assert_eq!(inverted.clamp(8), 4);
+        assert_eq!(inverted.clamp(1_000_000), 4);
+        assert!(!inverted.contains(8));
     }
 
     #[test]

@@ -156,13 +156,17 @@
 
   <section class="card">
     <h2>Adaptive tuning <span class="badge" id="tune-on">—</span></h2>
+    <div class="row" style="margin-bottom:8px;align-items:center;gap:8px">
+      <label for="tune-ttl" style="font-size:12px;opacity:.8">cached result TTL (minutes, 0 = re-ramp every time)</label>
+      <input id="tune-ttl" type="number" min="0" step="5" value="60" style="width:90px" />
+      <span class="badge" id="tune-cache">cache: —</span>
+    </div>
     <div class="tune-grid" id="tune-grid">
       <span class="chip" id="tune-phase-chip"><b>phase</b><i id="t-phase">—</i></span>
       <span class="chip"><b>concurrency</b><i id="t-conc">—</i></span>
       <span class="chip"><b>upload win</b><i id="t-uw">—</i></span>
       <span class="chip"><b>download win</b><i id="t-dw">—</i></span>
       <span class="chip"><b>chunk</b><i id="t-chunk">—</i></span>
-      <span class="chip"><b>dl chunk</b><i id="t-dchunk">—</i></span>
       <span class="chip"><b>zrip level</b><i id="t-level">—</i></span>
       <span class="chip"><b>rtt</b><i id="t-rtt">—</i></span>
       <span class="chip"><b>throughput</b><i id="t-mbps">—</i></span>
@@ -199,6 +203,7 @@
   let speed = { done: 0, t: 0, rate: 0, last: 0 };
 
   function newClient() {
+    const ttlMs = Math.max(0, Number($('tune-ttl').value) || 0) * 60_000;
     client = new LibfwClient({
       baseUrl: $('base').value.replace(/\/+$/, ''),
       concurrency: 4,
@@ -207,6 +212,9 @@
       compress: true,
       chunkSize: 2 * 1024 * 1024,
       autoTune: true,
+      // A settled result is cached in localStorage for this long, so a page
+      // reload skips the ramp instead of measuring the link again.
+      tuneTtlMs: ttlMs,
       onEvent: (e) => {
         if (e.type === 'progress') onProgress(e.done, e.total);
         else if (e.type === 'fileStart') addFileRow(e.path, e.total, '▶');
@@ -214,7 +222,31 @@
         else if (e.type === 'tuning') renderTune({ phase: e.phase, params: e.params, stats: e.stats });
       },
     });
-    $('tune-on').textContent = 'enabled (autoTune)';
+    $('tune-on').textContent = ttlMs > 0
+      ? `enabled (autoTune, cache ${ttlMs / 60000} min)`
+      : 'enabled (autoTune, no cache)';
+    renderTuneCache();
+  }
+
+  /// Show what the engine persisted in `localStorage` for this origin.
+  function renderTuneCache() {
+    const el = $('tune-cache');
+    if (!el) return;
+    const rows = [];
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (!key || !key.startsWith('libfw.tune.')) continue;
+        const entry = JSON.parse(localStorage.getItem(key));
+        if (!entry || !entry.params) continue;
+        const p = entry.params;
+        const upload = key.includes('.upload.');
+        const win = upload ? p.upload_window : p.download_window;
+        const age = Math.max(0, Math.round((Date.now() - entry.saved_at_ms) / 1000));
+        rows.push(`${upload ? 'upload' : 'download'} ${p.concurrency}×${win} @ ${fmt(p.chunk_size)} (${age}s ago)`);
+      }
+    } catch (_) { /* storage disabled: nothing to show */ }
+    el.textContent = rows.length ? `cache: ${rows.join(' | ')}` : 'cache: empty';
   }
 
   const PHASE_LABEL = {
@@ -236,7 +268,6 @@
     set('t-uw', p.uploadWindow ?? '—');
     set('t-dw', p.downloadWindow ?? '—');
     set('t-chunk', p.chunkSize ? fmt(p.chunkSize) : '—');
-    set('t-dchunk', p.downloadChunkSize ? fmt(p.downloadChunkSize) : '—');
     set('t-level', p.compressLevel ?? '—');
     set('t-rtt', s.rttMs ? `${Math.round(s.rttMs)} ms` : '—');
     set('t-mbps', s.mbps ? `${s.mbps.toFixed(1)} Mb/s` : '—');
@@ -287,6 +318,11 @@
     $('st-state').textContent = 'running';
     $('files').textContent = '';
     log(`▶ ${what}`);
+    // A settled engine skips the ramp: either the in-memory settle of the
+    // previous transfer, or a cached one from an earlier page load.
+    if (client?.tuneStatus?.()?.phase === 'settled') {
+      log('· tuning already settled — reusing (memory/cache)', 'ok');
+    }
     try {
       const bytes = await fn(token);
       if (bytes > 0) {
@@ -297,7 +333,12 @@
       $('st-state').textContent = 'completed';
       refresh();
     } catch (err) {
-      log(`✖ ${what} failed: ${err?.message ?? err}`, 'err');
+      // A user-initiated stop is not a crash: `cancel()` rejects the transfer
+      // with an AbortError and the partial upload stays on the server for the
+      // next attempt to resume. The engine classifies it as `Failed`, so the
+      // pill keeps that vocabulary and the log line explains what happened.
+      const cancelled = err?.name === 'AbortError' || /cancel|abort/i.test(String(err?.message ?? ''));
+      log(`✖ ${what} ${cancelled ? 'cancelled' : 'failed'}: ${err?.message ?? err}`, cancelled ? 'warn' : 'err');
       $('st-state').textContent = 'failed';
     } finally {
       startedAt = 0;
@@ -305,8 +346,11 @@
       $('st-speed').textContent = '—';
       $('st-eta').textContent = '—';
       if (client) renderTune(client.tuneStatus());
+      renderTuneCache();
       setBusy(false);
-      if (busy === false) $('st-state').textContent = 'idle';
+      // Keep the terminal state visible (`completed` / `failed` / `cancelled`)
+      // until the next transfer starts — flipping straight back to `idle` hid
+      // the outcome from both users and automation.
     }
   }
 

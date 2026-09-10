@@ -727,9 +727,10 @@ fn blocks_path_for(tmp: &Path) -> PathBuf {
 async fn read_ranges(blocks: &Path) -> Result<Vec<ChunkRange>, StorageError> {
     match tokio::fs::read_to_string(blocks).await {
         Ok(text) => serde_json::from_str::<Vec<ChunkRange>>(&text).map_err(|e| {
+            // This message reaches clients as a 500 body, so it must not
+            // disclose server-side filesystem paths.
             StorageError::Other(std::io::Error::other(format!(
-                "corrupt sidecar {}: {e}",
-                blocks.display()
+                "corrupt session state: {e}"
             )))
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -737,12 +738,25 @@ async fn read_ranges(blocks: &Path) -> Result<Vec<ChunkRange>, StorageError> {
     }
 }
 
-/// Persist the received byte ranges to a session temp sidecar (best-effort).
+/// Persist the received byte ranges to a session temp sidecar.
+///
+/// Write-then-rename: [`read_ranges`] treats a malformed sidecar as fatal, so
+/// a torn write (crash or error mid-update) must never be observable.
+/// Same-directory rename is atomic on POSIX and replaces on Windows; the
+/// `.tmp` sibling is itself a `.libfw-sess-*` file, so the stale-session
+/// sweeper collects any leftovers.
 async fn persist_ranges(blocks: &Path, ranges: &[ChunkRange]) -> Result<(), StorageError> {
     let text = serde_json::to_string(ranges).unwrap_or_else(|_| "[]".to_string());
-    tokio::fs::write(blocks, text)
+    let mut tmp = blocks.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    tokio::fs::write(&tmp, text)
         .await
-        .map_err(|e| StorageError::Other(e))
+        .map_err(StorageError::Other)?;
+    tokio::fs::rename(&tmp, blocks)
+        .await
+        .map_err(StorageError::Other)?;
+    Ok(())
 }
 
 /// Remove a session temp sidecar (best-effort; missing file is fine).
@@ -892,7 +906,47 @@ mod tests {
         let res = storage
             .write_stream_session("f.txt", "session", "owner", WriteMode::Create)
             .await;
-        assert!(res.is_err(), "malformed sidecar should not be accepted");
+        let err = match res {
+            Ok(_) => panic!("malformed sidecar should not be accepted"),
+            Err(e) => e,
+        };
+        // The message is surfaced to clients as a 500 body — it must not leak
+        // the server-side storage root.
+        let msg = err.to_string();
+        assert!(msg.contains("corrupt session state"), "{msg}");
+        assert!(
+            !msg.contains(&dir.path().display().to_string()),
+            "error leaked the server path: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_sidecar_is_written_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path());
+        let mut sink = storage
+            .write_stream_session("f.txt", "session", "owner", WriteMode::Create)
+            .await
+            .unwrap();
+
+        sink.write_at(4, b"abcd").await.unwrap();
+        assert_eq!(
+            sink.received_ranges().await.unwrap(),
+            vec![ChunkRange { start: 4, end: 8 }]
+        );
+        sink.write_at(8, b"ef").await.unwrap();
+
+        // The sidecar always holds complete, parseable JSON…
+        let blocks = dir.path().join(".libfw-sess-owner-session-f.txt.blocks");
+        let text = std::fs::read_to_string(&blocks).unwrap();
+        let ranges: Vec<ChunkRange> = serde_json::from_str(&text).unwrap();
+        assert_eq!(ranges, vec![ChunkRange { start: 4, end: 10 }]);
+        // …and the write-then-rename leaves no temporary sibling behind.
+        assert!(!dir
+            .path()
+            .join(".libfw-sess-owner-session-f.txt.blocks.tmp")
+            .exists());
+        sink.abort().await.unwrap();
     }
 
     #[tokio::test]

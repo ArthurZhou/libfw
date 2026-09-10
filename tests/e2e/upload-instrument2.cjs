@@ -1,10 +1,11 @@
 /* Instrument _collectProvidedFiles + _ready to find where the plan goes empty. */
 const { chromium } = require('playwright');
-const BASE = process.env.BASE || 'http://127.0.0.1:8081';
-const EXE = process.env.CHROME || `${process.env.HOME}/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`;
+const fs = require('fs');
+const crypto = require('crypto');
+const { launch, sampleFile } = require('./harness.cjs');
 
 (async () => {
-  const browser = await chromium.launch({ executablePath: EXE, headless: true });
+  const browser = await launch(chromium);
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   const logs = [];
@@ -35,7 +36,7 @@ const EXE = process.env.CHROME || `${process.env.HOME}/Library/Caches/ms-playwri
     };
   });
 
-  await page.setInputFiles('#files', process.env.FILE || '/tmp/libfw-upload-test.bin');
+  await page.setInputFiles('#files', sampleFile());
   const deadline = Date.now() + 60000;
   let state = '?';
   while (Date.now() < deadline) {

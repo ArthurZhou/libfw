@@ -51,10 +51,12 @@ impl TaskState {
 
 /// A bounded async semaphore (single-threaded WASM friendly).
 ///
-/// Grants at most `max` outstanding permits. The engine uses one shared
-/// pool (sized by `concurrency`) so `concurrency` bounds the TOTAL number of
-/// in-flight HTTP transfers — regardless of how many files or per-file
-/// windows are active — which is what actually controls network parallelism.
+/// Grants at most `max` outstanding permits. The engine uses one shared pool
+/// as a **bound** on in-flight HTTP transfers — for upload blocks and download
+/// range GETs alike — sized `concurrency × per-file window`
+/// ([`crate::tune::request_budget`]) so it can never become the bottleneck:
+/// sized by `concurrency` alone it serialized every chunk while a ramp was
+/// still at the advertised minimum of 1.
 #[derive(Debug, Clone)]
 pub struct Semaphore {
     inner: Rc<SemaphoreInner>,
@@ -202,7 +204,8 @@ impl TaskControl {
     }
 
     /// Create a fresh control block whose global in-flight HTTP transfer pool
-    /// is capped at `max_parallel` (from the client's `concurrency` option).
+    /// is capped at `max_parallel` — normally
+    /// [`crate::tune::request_budget`] (`concurrency × per-file window`).
     pub fn with_max_parallel(max_parallel: usize) -> Self {
         TaskControl {
             state: Rc::new(Cell::new(TaskState::Idle)),
@@ -232,7 +235,7 @@ impl TaskControl {
     }
 
     /// Resize the global pool at runtime (adaptive tuning changes the
-    /// concurrency dimension mid-transfer).
+    /// concurrency *or* window dimensions mid-transfer).
     pub fn set_max_parallel(&self, max_parallel: usize) {
         self.semaphore.set_max(max_parallel);
     }
@@ -319,10 +322,9 @@ impl TaskControl {
 
     /// Remove previously-counted progress (saturating).
     ///
-    /// Exposed as a helper for callers (e.g. the SDK) that need to undo
-    /// progress they counted but later decided not to transfer. Not used
-    /// internally by the current engine, hence `allow(dead_code)`.
-    #[allow(dead_code)]
+    /// Used by the download path: a chunk's body reports progress as it
+    /// streams (so the bar moves during the fetch), and a failed attempt rolls
+    /// its partial bytes back before the retry re-fetches them.
     pub fn subtract_progress(&self, bytes: u64) {
         self.done_bytes.set(self.done_bytes.get().saturating_sub(bytes));
     }

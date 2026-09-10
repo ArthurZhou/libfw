@@ -10,7 +10,7 @@ use libfw_core::{
     CHUNK_SIZE, DEFAULT_CONCURRENCY, DEFAULT_DOWNLOAD_WINDOW, DEFAULT_UPLOAD_WINDOW, MAX_RETRIES,
 };
 
-use crate::tune::{CompressLevel, DEFAULT_TUNE_TTL_MS};
+use crate::tune::CompressLevel;
 
 /// Default delay before the first retry (milliseconds).
 pub const DEFAULT_BASE_RETRY_MS: u32 = 500;
@@ -63,8 +63,13 @@ pub struct ClientConfig {
     pub timeout_ms: u32,
     /// Adaptive tuning (TCP-style ramp over real transfers). Off by default
     /// so legacy callers behave exactly as before.
+    ///
+    /// In the browser a settled result is persisted in `localStorage` (per
+    /// origin + direction) for up to `tune_ttl_ms`, so a page refresh does not
+    /// re-ramp; the native client keeps it in memory only.
     pub auto_tune: bool,
-    /// TTL of the persisted tuning cache (default 1h).
+    /// How long a cached tuning result stays usable (milliseconds, default
+    /// 1 hour). `0` disables the cache entirely — every transfer re-ramps.
     pub tune_ttl_ms: u64,
     /// Client-side compression level policy.
     ///
@@ -88,9 +93,24 @@ impl Default for ClientConfig {
             max_retry_delay_ms: DEFAULT_MAX_RETRY_MS,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             auto_tune: false,
-            tune_ttl_ms: DEFAULT_TUNE_TTL_MS,
+            tune_ttl_ms: crate::tune::DEFAULT_TUNE_TTL_MS,
             compress_level: CompressLevel::Balanced,
         }
+    }
+}
+
+impl ClientConfig {
+    /// Concurrent HTTP requests the client may keep in flight:
+    /// `concurrency` files × the widest per-file window.
+    ///
+    /// Sizing the shared in-flight pool to `concurrency` alone made the
+    /// per-file window ineffective (see `tune::request_budget`); the pool is a
+    /// bound, not the parallelism knob.
+    pub fn request_budget(&self) -> usize {
+        crate::tune::request_budget(
+            self.concurrency,
+            self.upload_window.max(self.download_window),
+        )
     }
 }
 
@@ -202,7 +222,7 @@ impl ClientConfig {
         if let Some(v) = opt_bool(opts, "autoTune") {
             cfg.auto_tune = v;
         }
-        if let Some(v) = opt_u64(opts, "tuneTtlMs").filter(|&v| v > 0) {
+        if let Some(v) = opt_u64(opts, "tuneTtlMs") {
             cfg.tune_ttl_ms = v;
         }
         cfg
@@ -303,5 +323,39 @@ mod tests {
         assert_eq!(cfg.concurrency, DEFAULT_CONCURRENCY);
         let cfg = ClientConfig::from_js(&JsValue::UNDEFINED);
         assert_eq!(cfg.chunk_size, CHUNK_SIZE);
+    }
+
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn parses_compress_level_policy() {
+        let with = |key: &str, value: &JsValue| {
+            let obj = js_sys::Object::new();
+            js_sys::Reflect::set(&obj, &JsValue::from_str(key), value).unwrap();
+            ClientConfig::from_js(&obj)
+        };
+        // Named policies map to the matching enum arm.
+        assert_eq!(
+            with("compressLevel", &JsValue::from_str("max")).compress_level,
+            CompressLevel::Max
+        );
+        assert_eq!(
+            with("compressLevel", &JsValue::from_str("FAST")).compress_level,
+            CompressLevel::Fast
+        );
+        assert_eq!(
+            with("compressLevel", &JsValue::from_str("auto")).compress_level,
+            CompressLevel::Auto
+        );
+        // A number is an explicit level.
+        assert_eq!(
+            with("compressLevel", &JsValue::from_f64(3.0)).compress_level,
+            CompressLevel::Fixed(3)
+        );
+        // `null` (the SDK's default when the option is unset) falls back to
+        // the legacy `compress` flag → Balanced.
+        assert_eq!(
+            with("compressLevel", &JsValue::NULL).compress_level,
+            CompressLevel::Balanced
+        );
     }
 }

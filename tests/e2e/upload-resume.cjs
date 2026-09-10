@@ -4,10 +4,8 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 const crypto = require('crypto');
-
-const BASE = process.env.BASE || 'http://127.0.0.1:8081';
-const EXE = process.env.CHROME || `${process.env.HOME}/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`;
-const TOKEN = 'dev-token';
+const path = require('path');
+const { BASE, TOKEN, DATA, launch, tmpFile } = require('./harness.cjs');
 
 const results = [];
 function check(name, ok, detail = '') {
@@ -16,7 +14,7 @@ function check(name, ok, detail = '') {
 }
 
 (async () => {
-  const browser = await chromium.launch({ executablePath: EXE, headless: true });
+  const browser = await launch(chromium);
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
 
@@ -59,13 +57,14 @@ function check(name, ok, detail = '') {
   const waitIdle = async (timeoutMs = 30000) => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if ((await page.textContent('#st-state').catch(() => 'idle')) === 'idle') return;
+      const state = await page.textContent('#st-state').catch(() => 'idle');
+      if (state !== 'running' && state !== 'paused') return;
       await page.waitForTimeout(50);
     }
   };
 
-  fs.mkdirSync('/tmp/libfw-e2e', { recursive: true });
-  const filePath = '/tmp/libfw-e2e/resume.bin';
+  fs.mkdirSync(require('path').dirname(tmpFile('resume.bin')), { recursive: true });
+  const filePath = tmpFile('resume.bin');
   const bytes = crypto.randomBytes(30 * 1024 * 1024 + 777); // 15 chunks @ 2MiB (window 8 -> real gaps on cancel)
   const FULL = bytes.length;
   fs.writeFileSync(filePath, bytes);
@@ -96,11 +95,11 @@ function check(name, ok, detail = '') {
   check('run1: cancel issued mid-transfer', cancelled, `chunkOffsets run1=${chunkOffsets.slice(0, 5).join(',')}… (${chunkOffsets.length} total)`);
   await waitIdle();
   await page.waitForTimeout(500);
-  const partials = fs.readdirSync('/tmp/libfw-storage').filter((f) => f.includes('.libfw-sess-'));
-  check('run1: server holds session temp + sidecar', partials.length >= 1, JSON.stringify(partials));
+  const partials = fs.readdirSync(DATA).filter((f) => f.includes('.libfw-sess-'));
+  check('run1: server holds session temp + sidecar', partials.length >= 1, `${DATA} -> ${JSON.stringify(partials)}`);
   const blocks = partials
     .filter((f) => f.endsWith('.blocks'))
-    .map((f) => fs.readFileSync(`/tmp/libfw-storage/${f}`, 'utf8'));
+    .map((f) => fs.readFileSync(path.join(DATA, f), 'utf8'));
   check('run1: sidecar has received ranges', blocks.some((b) => /"start":\d+,"end":\d+/.test(b)), JSON.stringify(blocks));
 
   // ---- run 2: re-upload same file, must resume ----------------------------
@@ -137,13 +136,20 @@ function check(name, ok, detail = '') {
   );
 
   // ---- integrity -----------------------------------------------------------
-  const serverBytes = await page.evaluate(async ({ base, token }) => {
+  // Hash in the page: shipping 30 MiB of numbers over CDP is needlessly slow.
+  const serverInfo = await page.evaluate(async ({ base, token }) => {
     const r = await fetch(`${base}/file/resume.bin`, { headers: { Authorization: `Bearer ${token}` } });
     if (!r.ok) throw new Error(`GET ${r.status}`);
-    return Array.from(new Uint8Array(await r.arrayBuffer()));
+    const buf = await r.arrayBuffer();
+    const digest = await crypto.subtle.digest('SHA-256', buf);
+    const sha = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+    return { length: buf.byteLength, sha };
   }, { base: BASE, token: TOKEN });
-  const got = Buffer.from(serverBytes);
-  check('run2: final file byte-identical', got.length === FULL && crypto.createHash('sha256').update(got).digest('hex') === expectedSha, `${got.length} vs ${FULL}`);
+  check(
+    'run2: final file byte-identical',
+    serverInfo.length === FULL && serverInfo.sha === expectedSha,
+    `${serverInfo.length} vs ${FULL}, ${serverInfo.sha.slice(0, 12)} vs ${expectedSha.slice(0, 12)}`
+  );
 
   console.log('\n=== SUMMARY ===');
   const failed = results.filter((r) => !r.ok);

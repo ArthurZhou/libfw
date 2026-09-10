@@ -171,9 +171,9 @@ async fn download_file(
         control.wait_ready().await?;
         control.check()?;
 
-        // 2. Parallel path for large remaining transfers (tus-style).
-        let window = tune.borrow().params().download_window;
-        if should_parallel(file.size, offset, window) {
+        // 2. Chunked path for large remaining transfers (tus-style): the loop
+        //    inside re-reads the tuned window / chunk size before each batch.
+        if should_chunked(file.size, offset) {
             match download_file_parallel(
                 base_url, token, file, &etag, offset, callbacks, control, config, tune, level,
             )
@@ -235,7 +235,7 @@ async fn download_file(
                         // Full content: the file changed (or first attempt).
                         etag = response_etag(&resp).unwrap_or(etag);
                         let outcome =
-                            stream_download(&resp, file, callbacks, control, 0, &etag, config.timeout_ms, &ctrl)
+                            stream_download(&resp, file, callbacks, control, tune, 0, &etag, config.timeout_ms, &ctrl)
                                 .await?;
                         if tune.borrow().enabled() {
                             tune_tick(tune, control, control.done_bytes(), Some(rtt), false);
@@ -252,6 +252,7 @@ async fn download_file(
                             file,
                             callbacks,
                             control,
+                            tune,
                             start,
                             &etag,
                             config.timeout_ms,
@@ -291,14 +292,15 @@ async fn download_file(
     }
 }
 
-/// Whether `file` should use the parallel (byte-range GET) download path.
+/// Whether `file` should use the chunked byte-range download path.
 ///
-/// Requires a per-file window > 1 and enough remaining bytes that the extra
-/// per-request overhead pays off. Small files (and the tail of a large one)
-/// stay on the sequential single-connection path.
-fn should_parallel(size: u64, resume_offset: u64, window: usize) -> bool {
-    window > 1
-        && size >= MIN_PARALLEL_DOWNLOAD_BYTES
+/// Any transfer with enough remaining bytes to amortise the per-request
+/// overhead uses it, even when the (tuned) window is 1: the loop re-reads
+/// `download_window`/`chunk_size` before every batch, so a ramp that grows
+/// them mid-file takes effect immediately. Small files and short tails stay
+/// on the plain sequential path, where one request wins.
+fn should_chunked(size: u64, resume_offset: u64) -> bool {
+    size >= MIN_PARALLEL_DOWNLOAD_BYTES
         && size.saturating_sub(resume_offset) >= MIN_PARALLEL_DOWNLOAD_BYTES
 }
 
@@ -381,6 +383,12 @@ async fn download_chunk_with_retry(
     loop {
         control.wait_ready().await?;
         control.check()?;
+        // Bytes this *attempt* has already reported as progress. A failed
+        // attempt rolls them back (see below) so a retry cannot inflate the
+        // bar, while a successful one leaves them counted — `collect_chunk`
+        // reports as the body streams, which is what keeps the bar moving
+        // while a range GET is still in flight.
+        let counted = std::rc::Rc::new(std::cell::Cell::new(0u64));
         match download_chunk_once(
             base_url,
             token,
@@ -392,6 +400,9 @@ async fn download_chunk_with_retry(
             Some(level),
             config.timeout_ms,
             control.semaphore(),
+            control,
+            callbacks,
+            &counted,
         )
         .await
         {
@@ -403,10 +414,26 @@ async fn download_chunk_with_retry(
                         end - start
                     )));
                 }
+                // Top up the (usually tiny) tail the streaming loop did not
+                // report — the decompressor's final flush — so each successful
+                // chunk contributes exactly its length and the bar reaches
+                // 100 % without double counting.
+                let reported = counted.get();
+                let len = data.len() as u64;
+                if reported < len {
+                    control.add_progress(len - reported);
+                    control.report_progress_if(callbacks)?;
+                }
                 return Ok((data, rtt));
             }
             Err(e) if is_restart_err(&e) => return Err(e),
             Err(e) => {
+                // Undo the partial progress this attempt reported: those bytes
+                // are not on disk (and will be re-fetched).
+                let rollback = counted.get();
+                if rollback > 0 {
+                    control.subtract_progress(rollback);
+                }
                 if attempts >= config.max_retries {
                     return Err(e);
                 }
@@ -438,6 +465,9 @@ async fn download_chunk_once(
     level: Option<i32>,
     timeout_ms: u32,
     semaphore: &Semaphore,
+    control: &TaskControl,
+    callbacks: &Callbacks,
+    counted: &std::rc::Rc<std::cell::Cell<u64>>,
 ) -> Result<(Vec<u8>, f64), LibfwError> {
     let headers = auth_headers(token, compress, level)?;
     let last = end.saturating_sub(1);
@@ -457,7 +487,10 @@ async fn download_chunk_once(
     let resp = fetch(&req, timeout_ms, &ctrl).await?;
     let rtt = now_ms() - t0;
     match resp.status() {
-        206 => Ok((collect_chunk(&resp, timeout_ms, &ctrl).await?, rtt)),
+        206 => Ok((
+            collect_chunk(&resp, timeout_ms, &ctrl, control, callbacks, counted).await?,
+            rtt,
+        )),
         // Full body despite a Range + If-Range → the file changed; 416 → it
         // shrank. Both mean "restart from byte 0" (handled by the caller).
         code => Err(LibfwError::Http {
@@ -467,11 +500,21 @@ async fn download_chunk_once(
     }
 }
 
-/// Stream a `206` response body into one decompressed `Vec<u8>`.
+/// Stream a `206` response body into one decompressed `Vec<u8>`, reporting
+/// progress **as the body arrives** (one event per decompressed slice).
+///
+/// Reporting per received slice — instead of only once the whole range has
+/// been buffered — is what makes the bar move while a fetch is still in
+/// flight: a single range GET can be many MiB, and on a slow link waiting for
+/// it to complete looked like "progress is frozen". `counted` accumulates the
+/// bytes this attempt reported so a failed attempt can roll them back.
 async fn collect_chunk(
     resp: &Response,
     timeout_ms: u32,
     ctrl: &web_sys::AbortController,
+    control: &TaskControl,
+    callbacks: &Callbacks,
+    counted: &std::rc::Rc<std::cell::Cell<u64>>,
 ) -> Result<Vec<u8>, LibfwError> {
     // Decide the wire format from the response header (robust against a
     // server that did not honour our Accept-Encoding).
@@ -493,16 +536,32 @@ async fn collect_chunk(
         {
             let decomp = decomp.clone();
             let collected = collected.clone();
+            let control = control.clone();
+            let callbacks = callbacks.clone();
+            let counted = counted.clone();
             move |chunk| {
                 let decomp = decomp.clone();
                 let collected = collected.clone();
+                let control = control.clone();
+                let callbacks = callbacks.clone();
+                let counted = counted.clone();
                 async move {
                     // Decompress straight into the collector — no intermediate
                     // buffer or extra copy per chunk.
+                    let before = collected.borrow().len() as u64;
                     decomp
                         .borrow_mut()
                         .decompress(&chunk, &mut collected.borrow_mut())
                         .map_err(|e| LibfwError::Decompress(e.to_string()))?;
+                    // Report the *decompressed* growth so the counter matches
+                    // what lands on disk (a compressed body would otherwise
+                    // scale progress by the compression ratio).
+                    let delta = (collected.borrow().len() as u64).saturating_sub(before);
+                    if delta > 0 {
+                        counted.set(counted.get().saturating_add(delta));
+                        control.add_progress(delta);
+                        control.report_progress_if(&callbacks)?;
+                    }
                     Ok(())
                 }
             }
@@ -570,55 +629,81 @@ async fn download_file_parallel(
         control.report_progress_if(callbacks)?;
     }
 
-    // Live parameter reads: the tuning engine may have changed the window or
-    // chunk size since this file's transfer began.
-    let window = tune.borrow().params().download_window.max(1);
-    let chunk_size = tune.borrow().params().chunk_size.max(1);
-
-    // Plan chunks from the resume point to EOF.
-    let chunks = parallel_chunks(start, size, chunk_size);
-
-    // Give the stream its own ETag copy so `meta_etag` stays free for the
-    // return value (the stream borrows the closure until it is dropped).
-    let stream_etag = meta_etag.clone();
-    let mut stream = futures::stream::iter(chunks.into_iter().map(move |(s, e)| {
-        let base_url = base_url.to_string();
-        let token = token.to_string();
-        let path = file.path.clone();
-        let etag = stream_etag.clone();
-        let callbacks = callbacks.clone();
-        let control = control.clone();
-        let config = config.clone();
-        async move {
-            let (data, rtt) = download_chunk_with_retry(
-                &base_url, &token, &path, &etag, s, e, &callbacks, &control, &config, level,
-            )
-            .await?;
-            Ok::<_, LibfwError>((s, data, rtt))
-        }
-    }))
-    .buffer_unordered(window);
-
-    // Reorder completed chunks so the SDK receives them in ascending order.
-    // Worst-case memory = `window` in-flight chunks ≈ window * chunk_size.
-    let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    // Live, per-batch parameter reads: the tuning engine may have raised the
+    // window or the chunk size since the previous batch, and a download must
+    // act on that immediately (this is what makes "ramp up like TCP" visible
+    // within a single file instead of only for the next transfer).
     let mut contiguous = start;
     let mut last_saved = 0u64;
 
-    while let Some(res) = stream.next().await {
+    while contiguous < size {
         control.wait_ready().await?;
         control.check()?;
-        let (chunk_start, data, rtt) = res?;
-        pending.insert(chunk_start, data);
+        let window = tune.borrow().params().download_window.max(1);
+        let chunk_size = tune.borrow().params().chunk_size.max(1);
+        // One batch = the next `window` chunks (never planning the whole file
+        // up front, so the ramp can change the shape mid-transfer).
+        let batch: Vec<(u64, u64)> = chunk_batch(contiguous, size, chunk_size, window);
+
+        let results: Vec<Result<(u64, Vec<u8>, f64), LibfwError>> = {
+            let etag = meta_etag.clone();
+            let path = file.path.clone();
+            futures::stream::iter(batch.iter().map(|&(s, e)| {
+                let base_url = base_url.to_string();
+                let token = token.to_string();
+                let path = path.clone();
+                let etag = etag.clone();
+                let callbacks = callbacks.clone();
+                let control = control.clone();
+                let config = config.clone();
+                async move {
+                    let (data, rtt) = download_chunk_with_retry(
+                        &base_url, &token, &path, &etag, s, e, &callbacks, &control, &config, level,
+                    )
+                    .await?;
+                    Ok::<_, LibfwError>((s, data, rtt))
+                }
+            }))
+            .buffer_unordered(window)
+            .collect()
+            .await
+        };
+
+        // A batch that lost a chunk permanently ends the file's attempt: feed
+        // the engine so it shrinks the parameters, and let the caller decide
+        // (retry / restart) with the contiguous offset already persisted.
+        let mut ordered: BTreeMap<u64, (Vec<u8>, f64)> = BTreeMap::new();
+        for result in results {
+            match result {
+                Ok((s, data, rtt)) => {
+                    ordered.insert(s, (data, rtt));
+                }
+                Err(e) => {
+                    if tune.borrow().enabled() {
+                        tune_tick(tune, control, control.done_bytes(), None, true);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
         // Emit strictly in order (append-safe for the SDK's writable).
-        while let Some(data) = pending.remove(&contiguous) {
+        for (chunk_start, (data, rtt)) in ordered {
+            if chunk_start != contiguous {
+                return Err(LibfwError::Protocol(format!(
+                    "download of `{}` lost its contiguous offset ({contiguous} != {chunk_start})",
+                    file.path
+                )));
+            }
             callbacks.on_write_chunk(&file.path, contiguous, &data).await?;
             let len = data.len() as u64;
             contiguous = contiguous.saturating_add(len);
-            control.add_progress(len);
-            control.report_progress_if(callbacks)?;
-            // Persist the absolute contiguous offset periodically so a crash
-            // mid-transfer can resume from disk's real end.
+            // The bytes were already counted (and reported) while the chunk's
+            // body streamed in — `collect_chunk` reports per read slice — so
+            // progress stayed live during the fetch instead of jumping once
+            // the whole range landed. Here we only persist the absolute
+            // contiguous offset periodically, so a crash mid-transfer can
+            // resume from disk's real end.
             if contiguous >= last_saved.saturating_add(RESUME_SAVE_EVERY) {
                 last_saved = contiguous;
                 let _ = callbacks
@@ -626,7 +711,7 @@ async fn download_file_parallel(
                     .await;
             }
             // Feed the tuning engine: one measurement per emitted chunk
-            // (coalesced into 1 s windows by the engine).
+            // (coalesced into 1 s windows by the engine, so this is cheap).
             if tune.borrow().enabled() {
                 tune_tick(tune, control, control.done_bytes(), Some(rtt), false);
             }
@@ -642,29 +727,53 @@ async fn download_file_parallel(
     Ok((meta_etag, DownloadOutcome { size: contiguous }))
 }
 
-/// The contiguous `[start, end)` chunks covering `[from, size)` at
-/// `chunk_size`, starting at `from` (a resume offset).
-fn parallel_chunks(from: u64, size: u64, chunk_size: u64) -> Vec<(u64, u64)> {
+/// At most `window` consecutive `[start, end)` chunks covering `[from, size)`.
+///
+/// Computed on demand rather than planned up front so a long download can
+/// re-read the tuned chunk size between batches, and so a 10 GiB file never
+/// materialises its whole chunk list.
+fn chunk_batch(from: u64, size: u64, chunk_size: u64, window: usize) -> Vec<(u64, u64)> {
     // Defensive: a 0 chunk size (which config parsing prevents) falls back to
-    // the shared default rather than degenerating into 1-byte chunks.
+    // the protocol default rather than degenerating into 1-byte chunks.
     let chunk_size = if chunk_size == 0 {
         libfw_core::CHUNK_SIZE
     } else {
         chunk_size
     };
-    let mut chunks = Vec::new();
-    let mut off = from.min(size);
-    while off < size {
-        let end = (off + chunk_size).min(size);
-        chunks.push((off, end));
-        off = end;
+    let mut out = Vec::with_capacity(window.min(1024));
+    let mut offset = from.min(size);
+    for _ in 0..window {
+        if offset >= size {
+            break;
+        }
+        let end = (offset + chunk_size).min(size);
+        out.push((offset, end));
+        offset = end;
     }
-    chunks
+    out
+}
+
+/// The contiguous `[start, end)` chunks covering `[from, size)` at
+/// `chunk_size`, starting at `from` (a resume offset).
+fn parallel_chunks(from: u64, size: u64, chunk_size: u64) -> Vec<(u64, u64)> {
+    chunk_batch(from, size, chunk_size, usize::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_batch_stops_at_the_window() {
+        // At most `window` chunks, always starting exactly at `from`.
+        assert_eq!(chunk_batch(0, 100, 10, 3), vec![(0, 10), (10, 20), (20, 30)]);
+        // The last chunk of the file is clamped to `size`.
+        assert_eq!(chunk_batch(95, 100, 10, 3), vec![(95, 100)]);
+        // Starting at EOF yields nothing (no empty chunk).
+        assert!(chunk_batch(100, 100, 10, 3).is_empty());
+        // A window of 1 is the sequential case.
+        assert_eq!(chunk_batch(0, 100, 10, 1), vec![(0, 10)]);
+    }
 
     #[test]
     fn parallel_chunks_cover_file_from_resume() {
@@ -682,16 +791,16 @@ mod tests {
     }
 
     #[test]
-    fn should_parallel_requires_size_and_window() {
-        // Large file, fresh → parallel.
-        assert!(should_parallel(10 * 1024 * 1024, 0, 4));
-        // Window of 1 → sequential.
-        assert!(!should_parallel(10 * 1024 * 1024, 0, 1));
-        // Small file → sequential.
-        assert!(!should_parallel(64 * 1024, 0, 4));
+    fn should_chunked_needs_a_large_remaining_transfer() {
+        // A large file uses the chunked path even when the tuned window is 1:
+        // the loop re-reads the window/chunk size before every batch, so the
+        // ramp can widen it mid-file.
+        assert!(should_chunked(10 * 1024 * 1024, 0));
+        // Small file → one plain sequential request wins.
+        assert!(!should_chunked(64 * 1024, 0));
         // Large file, only a tiny tail left → sequential (avoid per-request
         // overhead on the last few bytes).
-        assert!(!should_parallel(10 * 1024 * 1024, 10 * 1024 * 1024 - 1024, 4));
+        assert!(!should_chunked(10 * 1024 * 1024, 10 * 1024 * 1024 - 1024));
     }
 
     #[test]
@@ -720,6 +829,7 @@ async fn stream_download(
     file: &FileEntry,
     callbacks: &Callbacks,
     control: &TaskControl,
+    tune: &TuneHandle,
     start: u64,
     etag: &str,
     timeout_ms: u32,
@@ -763,6 +873,7 @@ async fn stream_download(
     let last_saved = Rc::new(Cell::new(0u64));
     let callbacks = callbacks.clone();
     let control = control.clone();
+    let tune = tune.clone();
     let path = file.path.clone();
     let etag = etag.to_string();
     let final_size = file.size;
@@ -778,6 +889,7 @@ async fn stream_download(
             let last_saved = last_saved.clone();
             let callbacks = callbacks.clone();
             let control = control.clone();
+            let tune = tune.clone();
             let path = path.clone();
             let etag = etag.clone();
             async move {
@@ -797,6 +909,15 @@ async fn stream_download(
                     // single-file download (throttled to whole-percent
                     // boundaries; previously files sat at 0% → 100%).
                     control.report_progress_if(&callbacks)?;
+
+                    // Feed the tuning engine per read: a single-request
+                    // download must still produce 1-second measurement
+                    // windows, otherwise a slow link never ramps (and a short
+                    // file never contributes to a settle).
+                    // No fresh RTT sample here (one request = one TTFB).
+                    if tune.borrow().enabled() {
+                        tune_tick(&tune, &control, control.done_bytes(), None, false);
+                    }
 
                     // Persist an absolute resume offset every so often so a
                     // crash mid-transfer can continue instead of restarting.

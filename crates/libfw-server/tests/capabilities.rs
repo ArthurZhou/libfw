@@ -131,6 +131,27 @@ async fn capabilities_reflects_builder_overrides() {
     assert_eq!(json["compression"]["zripLevels"], serde_json::json!({"default": -1, "max": 0, "min": -4}));
 }
 
+/// The advertised `maxUploadSize` must never exceed what the server
+/// actually enforces — a client chunks uploads by it, so overstating it
+/// would turn every large transfer into a 413 loop.
+#[tokio::test]
+async fn capabilities_never_overstate_the_enforced_upload_cap() {
+    let state = Arc::new(
+        ServerState::builder()
+            .storage(FsStorage::new(tempfile::tempdir().unwrap().path()))
+            .verifier(DevVerifier)
+            .validator(PathValidator::new())
+            .max_upload_size(4 * 1024 * 1024)
+            .build(),
+    );
+    let resp = router(state)
+        .oneshot(request("GET", "/capabilities", HeaderMap::new(), Body::empty()))
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(json["limits"]["maxUploadSize"], 4 * 1024 * 1024);
+}
+
 #[tokio::test]
 async fn capabilities_formats_follow_configured_compression() {
     // Server without zrip compression advertises identity only — clients

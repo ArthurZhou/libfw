@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "WASM engine + JS SDK for libfw browser clients"
+description = "libfw client: native Rust client + WASM engine + JS SDK"
 keywords = ["wasm", "browser", "upload", "download", "resumable"]
 categories = ["wasm", "web-programming"]
 
@@ -22,7 +22,6 @@ console_error_panic_hook = "0.1"
 serde_json.workspace = true
 thiserror.workspace = true
 zrip.workspace = true
-sha2.workspace = true
 
 # Keep the web-sys surface minimal and explicit.
 web-sys = { workspace = true, features = [
@@ -43,5 +42,23 @@ web-sys = { workspace = true, features = [
     "console",
 ] }
 
+# Native (non-WASM) HTTP transport for `native::NativeClient`.
+#
+# Declared per-target so a `wasm32` build (wasm-pack / the npm package) never
+# even resolves them: the browser engine uses `fetch`/XHR instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = [
+    "http2",
+    "stream",
+    "rustls-tls-native-roots",
+] }
+tokio = { workspace = true }
+
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+
+# Native-client integration tests run a real libfw server over TCP.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+libfw-server = { workspace = true }
+axum.workspace = true
+tempfile = "3"

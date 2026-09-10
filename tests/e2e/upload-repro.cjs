@@ -1,11 +1,12 @@
 /* Repro: upload a file through the axum UI and capture everything. */
 const { chromium } = require('playwright');
-
-const BASE = process.env.BASE || 'http://127.0.0.1:8081';
-const EXE = process.env.CHROME || `${process.env.HOME}/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`;
+const fs = require('fs');
+const crypto = require('crypto');
+const path = require('path');
+const { BASE, launch, sampleFile } = require('./harness.cjs');
 
 (async () => {
-  const browser = await chromium.launch({ executablePath: EXE, headless: true });
+  const browser = await launch(chromium);
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
 
@@ -26,7 +27,7 @@ const EXE = process.env.CHROME || `${process.env.HOME}/Library/Caches/ms-playwri
   await page.waitForTimeout(500);
 
   // Pick a file
-  await page.setInputFiles('#files', process.env.FILE || '/tmp/libfw-upload-test.bin');
+  await page.setInputFiles('#files', sampleFile());
   consoleMsgs.push('[ui] files input set, waiting for transfer to finish...');
 
   // Wait until state is completed or failed (max 60s)

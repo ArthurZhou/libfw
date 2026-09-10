@@ -372,6 +372,12 @@ impl ServerState {
         if let Some(limits) = &self.limits {
             caps.limits = limits.clone();
         }
+        // The advertised upload cap must never exceed what this server
+        // actually enforces: a client schedules/chunks uploads by it, so
+        // overstating it turns every large transfer into a 413 loop. The
+        // enforced limit (which includes `ServerStateBuilder::max_upload_size`)
+        // therefore always wins when it is the smaller of the two.
+        caps.limits.max_upload_size = caps.limits.max_upload_size.min(self.max_upload_size);
         if let Some(levels) = &self.zrip_levels {
             caps.compression.zrip_levels = *levels;
         }

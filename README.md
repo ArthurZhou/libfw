@@ -4,7 +4,8 @@ A high-performance, low-memory **streaming file & folder transfer library** for
 Rust, built as a Cargo workspace. It features resumable transfers
 (`Range`/`ETag`/`If-Range`), automatic zstd compression (via
 [`zrip`](https://crates.io/crates/zrip)), fine-grained bearer-token
-authorization, and a browser SDK backed by a WASM engine.
+authorization, adaptive tuning for good *and* bad networks, and a client that
+works both as a **native Rust crate** and as a **browser SDK** (WASM + npm).
 
 ## Documentation
 
@@ -15,10 +16,11 @@ authorization, and a browser SDK backed by a WASM engine.
 crates/
   libfw-core/     shared contracts: claims, validator, storage, compression, ranges
   libfw-server/   embeddable axum handlers: routing, auth, Range/ETag, streaming I/O
-  libfw-client/   WASM engine (wasm-bindgen) + JS SDK in sdk/
+  libfw-client/   client: native Rust transport + WASM engine (wasm-bindgen)
 examples/
   axum-server/    runnable axum file server with an embedded web UI at `/`
   actix-server/   minimal actix-web integration example (API only, no frontend)
+  rust-client/    native Rust client CLI (upload/download/list/capabilities)
 sdk/              libfw-client npm package (ESM + TS types + wasm)
 ```
 
@@ -56,6 +58,7 @@ sdk/              libfw-client npm package (ESM + TS types + wasm)
 - [Quick start: run a server](#quick-start-run-a-server)
 - [Browser demo](#browser-demo)
 - [Embedding in a Rust app](#embedding-in-a-rust-app)
+- [Rust client (native)](#rust-client-native)
 - [Authorization](#authorization)
 - [Path translation (shadow paths)](#path-translation-shadow-paths)
 - [Storage backends](#storage-backends)
@@ -190,6 +193,54 @@ The example reuses `libfw_core` (`TokenVerifier`, `PathValidator`,
 `StorageBackend`, compression) plus `libfw_server` helpers
 (`FsStorage`, `ServerState`, `parse_range_header`, `content_range_value`, …)
 to implement the same `/file/{path}` and `/dir/{path}` routes.
+
+## Rust client (native)
+
+The same crate that powers the browser SDK also works as an ordinary Rust
+dependency on any non-`wasm32` target: `libfw_client::native::NativeClient` is
+an async `tokio` + `reqwest` transport speaking the identical wire protocol
+(session uploads, `Range`/`ETag` resume, zrip compression, `/capabilities`
+driven adaptive tuning). The browser-only bits (File System Access API,
+IndexedDB) are replaced by plain file IO and a JSON resume sidecar, and it
+tunes exactly like the browser engine. Tuning state is kept **in memory** for
+the lifetime of the client: a settle is reused by later transfers of the same
+client, and a failure drops it so the next transfer re-ramps. A new client
+re-measures the link from the advertised minimums — the native client installs
+no persistence, so `tuneTtlMs` has no effect here (the browser engine caches
+its settle, see [Adaptive tuning](#adaptive-tuning)).
+
+```toml
+[dependencies]
+libfw-client = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+```rust,no_run
+use libfw_client::{ClientConfig, native::NativeClient};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Same knobs as the SDK options; `auto_tune` adapts to the link.
+    let config = ClientConfig { auto_tune: true, ..ClientConfig::default() };
+    let client = NativeClient::new("http://127.0.0.1:8080", "dev-token", config);
+
+    let bytes = client.download_file("docs/plan.pdf", "./plan.pdf").await?;
+    println!("downloaded {bytes} bytes (0 = already complete)");
+
+    client.upload_file("./plan.pdf".as_ref(), "archive/plan.pdf").await?;
+    Ok(())
+}
+```
+
+A runnable CLI (`ls` / `download` / `upload` / `capabilities`, with progress
+and tuning output) lives in `examples/rust-client` — see its
+[README](examples/rust-client/README.md) / [中文说明](examples/rust-client/README.zh-CN.md):
+
+```bash
+cargo run -p axum-server -- dev-data 8080   # terminal 1: a server
+cargo run -p rust-client -- --url http://127.0.0.1:8080 --token dev-token \
+    --auto-tune upload ./big.bin docs/big.bin
+```
 
 ## Authorization
 
@@ -361,14 +412,16 @@ const client = new LibfwClient({
                               // (default 4; tus-style parallel download, so one file's
                               // throughput isn't limited by a single connection's RTT)
   compress: true,             // negotiate zrip compression (default true)
+  compressLevel: 'balanced',  // zrip level policy (default 'balanced');
+                              // 'auto' micro-benchmarks the advertised range
+                              // for uploads while autoTune is on
   chunkSize: 2 * 1024 * 1024, // shared chunk size for uploads + parallel downloads (default 2 MiB)
   maxRetries: 3,              // retries per chunk/file (default 3)
   baseRetryDelayMs: 500,      // initial exponential backoff (default 500)
   maxRetryDelayMs: 30000,     // backoff ceiling (default 30 s)
   timeoutMs: 60000,           // per-request timeout (default 60 s)
   autoTune: false,            // adaptive tuning engine (default false; see
-                              // "Adaptive tuning" — ramps windows/chunk/level)
-  tuneTtlMs: 3600000,         // reuse a settled tuning for this long (default 1 h)
+                              // "Adaptive tuning" — ramps windows/concurrency/chunk)
   onEvent: (e) => {},         // progress / lifecycle / tuning listener
 });
 ```
@@ -382,10 +435,18 @@ const bytes = await client.downloadFolder('your_token_here');
 const bytes = await client.downloadFolder('your_token_here', '/docs');
 ```
 
-Bytes are streamed from the server, decompressed, and written with
-`createWritable({ type: 'write', position, data })`. Because writables open
-with `keepExistingData: true`, an interrupted download resumes exactly where
-it stopped (`Range`/`If-Range` revalidation, IndexedDB-backed offsets).
+Bytes are streamed from the server, decompressed, and written sequentially
+into one `createWritable()` per file (opened with `keepExistingData: true` on a
+resume, then seeked past the bytes already on disk). An interrupted download
+therefore resumes exactly where it stopped (`Range`/`If-Range` revalidation,
+IndexedDB-backed offsets) and the committed file is byte-identical. Because
+`createWritable()` only publishes a file on `close()`, the SDK also
+**checkpoints** the prefix to disk whenever the engine reports a durable offset
+(~4 MiB), so even a hard page refresh (which runs no cleanup code at all)
+resumes from the last checkpoint instead of restarting from byte 0. Resume
+needs an on-disk partial, i.e. `downloadMode: 'fs'` (or an injected
+`directoryHandle`); the in-memory `'browser'` fallback always restarts from
+byte 0.
 
 **tus-style parallel download** (default on): a large file is fetched as
 `downloadWindow` concurrent `Range` GETs, so a single file's throughput is
@@ -428,7 +489,12 @@ lost after the server already wrote the data), and a failed commit triggers a
 fresh probe + refill instead of failing the task. A final `x-libfw-final`
 request verifies the merged size then renames the temp into place. Interrupted
 uploads leave a resumable session temp on the server, which the server
-periodically garbage-collects once it is older than the session TTL.
+periodically garbage-collects once it is older than the session TTL. The
+session id is the file's ETag (size + mtime), so it survives a page refresh:
+the reloaded page probes the same session and continues. A chunk request whose
+connection dies mid-body (refresh, crashed tab, dropped link) is treated as a
+transport event — the blocks already received are kept, never discarded, so
+nothing is re-sent needlessly.
 
 ### Controls and state machine
 
@@ -610,11 +676,34 @@ With `autoTune: true` (SDK option) the client fetches the server's
 `/capabilities` advertisement (protocol version, compression support, tuning
 limits, zrip levels), picks the advertised minimums as a starting point, and
 then **TCP-style ramps** real transfer parameters as measurements come in:
-concurrency → upload/download windows → chunk sizes (and the zrip level),
-using 1-second EWMA RTT / throughput samples. Errors halve the parameters
-(`degraded`), which then hold for two stable windows before settling;
-settled results are cached per origin for `tuneTtlMs` (default 1 h) and
-re-ramp automatically on RTT drift or capability changes.
+per-file window → cross-file concurrency, using 1-second EWMA RTT /
+throughput samples. The zrip level is a client *policy* (from
+`compressLevel`), never a ramped dimension, and the **chunk size follows the
+measured link** (≈100 ms of the current throughput, clamped into the
+advertised range): a wider/faster link gets fewer, bigger requests while a
+narrow link keeps the advertised minimum. Errors halve the parameters
+(`degraded`), which then hold for two stable windows before settling.
+
+Tuning state is kept **in memory** for the lifetime of the client instance — a
+settle is reused by the next transfer (so a folder of many files does not
+re-ramp per file) and a failure drops it so the next transfer re-ramps — and,
+in the browser, it is **cached in `localStorage`** so a page reload does not
+pay for another ramp. A cached result is keyed by origin **and** direction
+(an upload settle says nothing about a download), is tagged with the
+capabilities it was measured against, and expires `tuneTtlMs` after the ramp
+settled (default 1 hour; `0` disables the cache entirely):
+
+```js
+new LibfwClient({ baseUrl: '/', autoTune: true });                    // cache for 1 h
+new LibfwClient({ baseUrl: '/', autoTune: true, tuneTtlMs: 300000 }); // …5 min
+new LibfwClient({ baseUrl: '/', autoTune: true, tuneTtlMs: 0 });      // always re-ramp
+```
+
+The TTL counts from the moment the ramp settled — not from the last reuse — so
+a link measured long ago is re-measured even if it is used constantly. An entry
+is also discarded early when the server's `/capabilities` change or a transfer
+fails. The native Rust client keeps everything in memory and ignores
+`tuneTtlMs`.
 
 The live state is readable via `client.tuneStatus()` and pushed to
 `options.onEvent` as `{ type: 'tuning', phase, params, stats }` events:
@@ -649,6 +738,42 @@ npm --prefix sdk run build:umd
 ```bash
 cargo test --workspace            # unit + integration tests (native)
 wasm-pack test crates/libfw-client --node   # WASM-side tests (Node)
+```
+
+`cargo test --workspace` includes the native-client suite
+(`crates/libfw-client/tests/native_client.rs`), which starts a real libfw
+server on an ephemeral port and drives uploads, resumable downloads, folder
+round-trips and adaptive tuning over TCP.
+
+The browser path is covered by Playwright scripts under `tests/e2e/`
+(`upload-matrix.cjs` = full upload/download matrix, `upload-resume.cjs` =
+abort-then-resume upload, `download-resume.cjs` = fs-mode download resume via an
+injected OPFS directory, `download-check.cjs` = chunked download + live tuning,
+`tune-panel-check.cjs` = live tuning panel, `tune-cache-check.cjs` = the
+browser tuning cache across a page reload / TTL expiry / `tuneTtlMs: 0`,
+`resume-refresh.cjs` = resume both directions across a HARD page refresh;
+`upload-concurrency.cjs` is a diagnostic that prints the block-request timeline
+and peak in-flight count).
+They are cross-platform (Windows/macOS/Linux) and configured through the
+environment:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `BASE` | `http://127.0.0.1:8080` | web UI origin of a running example server |
+| `TOKEN` | `dev-token` | bearer token |
+| `LIBFW_DATA` | `<tmp>/libfw-storage` | the **server's** data dir (the resume suite inspects its session sidecars) |
+| `LIBFW_TMP` | `<tmp>/libfw-e2e` | scratch dir for the fixtures the scripts write |
+| `CHROME` | Playwright's own Chromium | optional explicit browser binary |
+
+`npm run e2e:matrix` / `e2e:resume` / `e2e:download` / `e2e:resume-fs` /
+`e2e:tune` / `e2e:tune-cache` / `e2e:refresh` run the suites (the launcher also
+accepts a system Chrome/Edge when Playwright's own browser is not installed).
+
+```bash
+npx playwright install chromium                 # once
+wasm-pack build crates/libfw-client --target web --out-dir ..\..\sdk\pkg --release
+cargo run -p axum-server -- <data-dir> 8080 &   # or: .\target\release\axum-server.exe <data-dir> 8080
+LIBFW_DATA=<data-dir> node tests/e2e/upload-matrix.cjs
 ```
 
 ## License

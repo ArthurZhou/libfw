@@ -112,6 +112,11 @@ pub fn is_valid_zrip_level(level: i32) -> bool {
 /// are clamped (and the actual level echoed back on the response header),
 /// keeping the wire format honest without hard-failing older clients.
 pub fn negotiate_level(req: Option<i32>, min: i32, max: i32, default: i32) -> i32 {
+    if min > max {
+        // Empty range (misconfigured advertisement): fall back to the
+        // default rather than panicking inside `i32::clamp`.
+        return default;
+    }
     match req {
         None => default,
         Some(l) => l.clamp(min, max),

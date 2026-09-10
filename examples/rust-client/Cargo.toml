@@ -1,0 +1,12 @@
+[package]
+name = "rust-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal native Rust client example for libfw (upload/download/list/capabilities)"
+publish = false
+
+[dependencies]
+libfw-client.workspace = true
+tokio.workspace = true

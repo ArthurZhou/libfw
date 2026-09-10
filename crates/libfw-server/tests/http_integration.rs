@@ -264,6 +264,148 @@ async fn session_upload_probe_reports_received_ranges_and_resumes() {
 }
 
 #[tokio::test]
+async fn a_disconnected_session_chunk_keeps_the_partial_for_a_resume() {
+    // A page refresh (or a dropped connection / crashed tab) kills the body of
+    // an in-flight chunk request. That is a transport event, not invalid data:
+    // the blocks already received must survive so the next attempt resumes
+    // instead of re-sending the whole file.
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        ServerState::builder()
+            .storage(FsStorage::new(dir.path()))
+            .verifier(DevVerifier)
+            .validator(PathValidator::new())
+            .build(),
+    );
+    let app = router(state);
+
+    let data = b"0123456789abcdefghij".to_vec(); // 20 bytes
+    let meta = libfw_core::metadata::FileMeta::new("kill.bin", data.len() as u64, 0);
+    let session = "kill-sess-1";
+
+    fn chunk_headers(
+        session: &str,
+        offset: u64,
+        meta: &libfw_core::metadata::FileMeta,
+    ) -> HeaderMap {
+        let mut headers = auth_header("tok");
+        headers
+            .insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(meta)).unwrap());
+        headers.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+        headers
+            .insert(HEADER_OFFSET, HeaderValue::from_str(&offset.to_string()).unwrap());
+        headers
+    }
+
+    // Block [0,8) is delivered and acked.
+    let resp = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/file/kill.bin",
+            chunk_headers(session, 0, &meta),
+            Body::from(data[0..8].to_vec()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // The next chunk's body dies mid-transfer (the page went away).
+    let body = Body::from_stream(futures::stream::iter(vec![
+        Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&data[8..12])),
+        Err(std::io::Error::other("client went away")),
+    ]));
+    let resp = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/file/kill.bin",
+            chunk_headers(session, 8, &meta),
+            body,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        resp.status() == StatusCode::BAD_REQUEST || resp.status().is_server_error(),
+        "a truncated body must fail, got {}",
+        resp.status()
+    );
+
+    // The session temp + sidecar are still there, still reporting block 0..8.
+    let temps: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with(".libfw-sess-"))
+        .collect();
+    assert!(
+        temps.iter().any(|n| n.ends_with("kill.bin")) && temps.iter().any(|n| n.ends_with(".blocks")),
+        "the session temp and its sidecar must survive a disconnect: {temps:?}"
+    );
+
+    let mut probe_headers = auth_header("tok");
+    probe_headers.insert(
+        HEADER_FILE_META,
+        HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap(),
+    );
+    probe_headers.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    probe_headers.insert(HEADER_SESSION_STATUS, HeaderValue::from_static("1"));
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/kill.bin", probe_headers, Body::empty()))
+        .await
+        .unwrap();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let ranges: Vec<[u64; 2]> = v["ranges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let a = r.as_array().unwrap();
+            [a[0].as_u64().unwrap(), a[1].as_u64().unwrap()]
+        })
+        .collect();
+    assert!(
+        ranges.iter().any(|r| r[0] == 0 && r[1] >= 8),
+        "probe must still report the acked block (0..8): {ranges:?}"
+    );
+    assert!(
+        ranges.iter().all(|r| r[1] <= data.len() as u64),
+        "the reported coverage must stay inside the file: {ranges:?}"
+    );
+
+    // …and the resumed upload finishes byte-identically (the tail is re-sent).
+    let resp = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/file/kill.bin",
+            chunk_headers(session, 8, &meta),
+            Body::from(data[8..].to_vec()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let mut final_headers = chunk_headers(session, data.len() as u64, &meta);
+    final_headers.insert(HEADER_FINAL, HeaderValue::from_static("1"));
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/kill.bin", final_headers, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .oneshot(request("GET", "/file/kill.bin", auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_string(resp).await.into_bytes(), data);
+}
+
+#[tokio::test]
 async fn session_upload_rejects_commit_with_wrong_size() {
     let app = app(DevVerifier);
     let data = b"0123456789".to_vec();

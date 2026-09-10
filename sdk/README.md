@@ -3,6 +3,11 @@
 The browser SDK for [libfw](../README.md): a zero-config wrapper around the
 WASM engine, the File System Access API and IndexedDB.
 
+> The same protocol engine is also available as a **native Rust client** for
+> non-browser programs — `libfw_client::native::NativeClient` (async
+> `tokio` + `reqwest`), with a runnable CLI in
+> [`examples/rust-client`](../examples/rust-client/README.md).
+
 ## Usage
 
 ```js
@@ -16,8 +21,12 @@ const client = new LibfwClient({
   downloadWindow: 4,    // parallel byte-range GETs per single file download
                         // (raise to reduce download stutter on high-latency links)
   compress: true,       // zrip per-block compression
+  compressLevel: 'auto',// zrip level policy: 'auto' benchmarks uploads
+                        // (needs autoTune) / 'fast' / 'balanced' / 'max' / N
   autoTune: true,       // adaptive tuning: probes /capabilities and ramps
-                        // concurrency/windows/chunk sizes from real stats
+  tuneTtlMs: 3600000,   // how long a settled result stays cached (browser,
+                        // localStorage); 0 = never cache, re-ramp each time
+                        // concurrency/windows/chunk size from real stats
   onEvent: (e) => {
     if (e.type === 'progress') updateProgressBar(e.done, e.total);
     else if (e.type === 'tuning') renderTuning(e.phase, e.params, e.stats);
@@ -71,8 +80,14 @@ client.cancel();
   into place. Only the chunks the server still misses are re-sent
   (`x-libfw-session-status` probe seeds resume), so interrupted uploads
   resume BitTorrent-style (only the broken/lost parts are re-transmitted).
+  A dropped connection (page refresh, crashed tab) keeps that partial on the
+  server, so a reloaded page resumes exactly where it stopped.
 - Resume state (`etag`, `offset`, `size`) is persisted per path in
-  IndexedDB and re-validated on every retry.
+  IndexedDB and re-validated on every retry. `createWritable()` only
+  publishes a file on `close()`, so a download **checkpoints** its prefix to
+  disk every time the engine reports a durable offset (~4 MiB) — a hard page
+  refresh mid-download therefore resumes from the last checkpoint instead of
+  restarting from byte 0.
 - Pause/resume/cancel drive the WASM state machine
   (`idle → downloading/uploading → paused → resumed → completed/failed`).
 
@@ -106,21 +121,50 @@ dist/libfw-client.umd.js   UMD bundle (after build:umd)
     both upload chunks and parallel download ranges; the engine reorders
     in-flight chunks in memory (worst case ≈ `downloadWindow * chunkSize`
     bytes) so the SDK still receives data in order.
+  - `compress: boolean` (default `true`) — master switch for zrip
+    compression; `false` sends every body as identity.
+  - `compressLevel: number | 'auto' | 'fast' | 'balanced' | 'max'` (default
+    `'balanced'`) — zrip level policy when `compress` is on. `'fast'` is the
+    advertised minimum (least CPU, worst ratio), `'balanced'` the advertised
+    default, `'max'` the advertised maximum (best ratio); a number is clamped
+    into the advertised range. `'auto'` additionally micro-benchmarks the
+    advertised range against a real sample of the first uploaded file (while
+    `autoTune` is enabled) and picks the best bytes-saved-vs-CPU-time
+    trade-off for the measured link speed; downloads request the resolved
+    level from the server.
   - `downloadMode: 'auto' | 'fs' | 'browser'` (default `'auto'`) — `'fs'`
     streams downloads through the File System Access API; `'browser'` buffers
     and triggers a traditional browser download (folders become `.zip`);
     `'auto'` uses `'fs'` when the API exists and falls back to `'browser'`.
+    **Download resume requires `'fs'`** (or an injected `directoryHandle`):
+    an interrupted fs-mode download is continued from the bytes already on
+    disk, while the memory-backed `'browser'` fallback always restarts from
+    byte 0 — there is no partial file to continue from.
   - `maxFallbackBytes: number` (default `536870912`, 512 MiB) — memory cap
     for the in-memory `'browser'` fallback. File sizes are pre-checked
     against it before buffering; a download that would exceed it rejects
     with a `too-large` `LibfwError` instead of risking an OOM. `0` disables.
   - `autoTune: boolean` (default `false`) — enable the adaptive tuning
     engine. The engine probes the server's `/capabilities` limits and
-    TCP-style ramps concurrency / windows / chunk sizes (and the zrip
-    level) from the advertised minimums using real transfer stats. When
-    disabled, the configured static values are used as-is.
-  - `tuneTtlMs: number` (default `3600000`, 1 h) — how long a settled
-    tuning result is reused for the same server origin before re-ramping.
+    TCP-style ramps the per-file window and cross-file concurrency from the
+    advertised minimums using real transfer stats; the chunk size follows the
+    measured throughput (~100 ms of it, clamped into the advertised range) and
+    the zrip level is a client policy from `compressLevel`, never ramped. When
+    disabled, the configured static values are used as-is. Tuning state is
+    **in memory** for the lifetime of the client (a settle is reused by later
+    transfers and dropped on failure) **and** is cached in `localStorage` per
+    origin + direction, so a page refresh does not re-ramp — see `tuneTtlMs`.
+  - `tuneTtlMs: number` (default `3600000`, 1 hour) — how long a cached
+    tuning result stays usable. The cache is keyed by origin **and**
+    direction (an upload settle says nothing about a download), is tagged with
+    the `/capabilities` it was measured against, and expires `tuneTtlMs`
+    *after the ramp settled* — not after the last reuse — so a link measured
+    long ago is re-measured even if it is used constantly. An entry is also
+    discarded early when the capabilities change or a transfer fails. `0`
+    disables the cache entirely (every transfer re-ramps). Ignored unless
+    `autoTune` is enabled. Storage failures (private mode, quota, disabled
+    storage) are swallowed: caching is an optimisation and never fails a
+    transfer.
 - `downloadFolder(token, dirPath?) → Promise<number>`
 - `downloadFile(token, filePath) → Promise<number>`
 - `upload(token, files?) → Promise<number>`
@@ -130,7 +174,9 @@ dist/libfw-client.umd.js   UMD bundle (after build:umd)
 - `tuneStatus() → { phase, params, stats, capsHash } | null` — live
   adaptive-tuning status. `phase` is `uninitialized | ramping | settled |
   degraded`; `params` is `{ concurrency, uploadWindow, downloadWindow,
-  chunkSize, compressLevel }`; `stats` is
+  chunkSize, compressLevel }` (the zrip level is the resolved *policy*, i.e.
+  what downloads request — uploads may use an `'auto'`-benchmarked level for
+  the session); `stats` is
   `{ rttMs, mbps }` (EWMA request RTT, last-window throughput). `null`
   until the WASM engine is initialised.
 - Events: with `autoTune` enabled, `onEvent` additionally receives

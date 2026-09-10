@@ -35,7 +35,10 @@ pub(crate) fn tune_tick(
 ) -> Option<TuneEvent> {
     let event = tune.borrow_mut().tick(now_ms(), done_bytes, rtt_ms, error);
     if let Some(ev) = &event {
-        control.set_max_parallel(ev.params.concurrency);
+        // The pool covers `concurrency × window`, so a window raise unblocks
+        // the extra block POSTs immediately instead of waiting for the
+        // concurrency dimension to ramp (the advertised minimum is 1).
+        control.set_max_parallel(ev.params.request_budget());
     }
     event
 }
@@ -205,7 +208,12 @@ async fn probe_session(
 ///
 /// Used after a probe to compute exactly which blocks are still missing, so
 /// only the broken/lost parts get re-transmitted (tus-style resume).
-fn aligned_missing(file: &FileEntry, chunk_size: u64, received: &[(u64, u64)]) -> Vec<(u64, u64)> {
+/// Shared with the native client ([`crate::native`]).
+pub(crate) fn aligned_missing(
+    file: &FileEntry,
+    chunk_size: u64,
+    received: &[(u64, u64)],
+) -> Vec<(u64, u64)> {
     let mut missing = Vec::new();
     for (start, end) in chunk_bounds(file, chunk_size, 0) {
         missing.extend(missing_ranges(start, end, received));
@@ -217,7 +225,7 @@ fn aligned_missing(file: &FileEntry, chunk_size: u64, received: &[(u64, u64)]) -
 ///
 /// Used after a probe to compute exactly which bytes are still missing, so
 /// only the broken/lost parts get re-transmitted (BitTorrent-style resume).
-fn missing_ranges(start: u64, end: u64, received: &[(u64, u64)]) -> Vec<(u64, u64)> {
+pub(crate) fn missing_ranges(start: u64, end: u64, received: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut missing = vec![(start, end)];
     for range in received {
         let (rs0, re0) = *range;
@@ -255,6 +263,7 @@ async fn upload_one_chunk(
     file: &FileEntry,
     callbacks: &Callbacks,
     control: &TaskControl,
+    tune: &TuneHandle,
     config: &ClientConfig,
     start: u64,
     end: u64,
@@ -366,6 +375,13 @@ async fn upload_one_chunk(
     // (throttled to whole-percent boundaries so a 200 MB file doesn't sit at
     // 0% until it jumps to 100%).
     control.report_progress_if(callbacks)?;
+    // Feed the tuning engine once per block: block-level samples are what let
+    // an upload ramp (and eventually settle + cache) at all — a single tick
+    // per completed file never closes two 1-second windows.
+    // XHR cannot expose TTFB, so there is no RTT sample on this path.
+    if tune.borrow().enabled() {
+        tune_tick(tune, control, control.done_bytes(), None, false);
+    }
     Ok(len)
 }
 
@@ -483,9 +499,9 @@ async fn upload_session_resumable(
         control.wait_ready().await?;
         control.check()?;
 
-        // Live parameter reads: the tuning engine may have raised/lowered
-        // the window or chunk size since the last round.
-        let window = tune.borrow().params().upload_window.max(1);
+        // Live parameter reads: the tuning engine may have raised/lowered the
+        // chunk size since the last round (the window is re-read per batch in
+        // the send loop below).
         let chunk_size = tune.borrow().params().chunk_size.max(1);
 
         // 1. Server is the source of truth for what it already holds. Round
@@ -539,29 +555,40 @@ async fn upload_session_resumable(
         //    high-latency links. Per-block failures are collected, not fatal:
         //    each block's 201 response is its ack, and a rejected ack only
         //    retries that block.
-        let mut stream = futures::stream::iter(missing.into_iter().map(|(start, end)| {
-            let base_url = base_url.to_string();
-            let token = token.to_string();
-            let file = file.clone();
-            let callbacks = callbacks.clone();
-            let control = control.clone();
-            let config = config.clone();
-            let session = session.clone();
-            async move {
-                upload_one_chunk(
-                    &base_url, &token, &file, &callbacks, &control, &config, start, end,
-                    &session, compress, level,
-                )
-                .await
-            }
-        }))
-        .buffer_unordered(window);
-
+        //
+        //    The work is consumed in batches and the window is re-read before
+        //    each batch, so a ramp that grew it while this file was uploading
+        //    takes effect for the remaining blocks (minimal start → measure →
+        //    ramp, within a single file).
+        let mut queue: std::collections::VecDeque<(u64, u64)> = missing.into();
         let mut round_errors = 0u32;
-        while let Some(res) = stream.next().await {
-            if let Err(e) = res {
-                round_errors += 1;
-                first_error.get_or_insert(e);
+        while !queue.is_empty() {
+            let window = tune.borrow().params().upload_window.max(1);
+            let batch: Vec<(u64, u64)> = queue.drain(..queue.len().min(window)).collect();
+            let mut stream = futures::stream::iter(batch.into_iter().map(|(start, end)| {
+                let base_url = base_url.to_string();
+                let token = token.to_string();
+                let file = file.clone();
+                let callbacks = callbacks.clone();
+                let control = control.clone();
+                let config = config.clone();
+                let tune = tune.clone();
+                let session = session.clone();
+                async move {
+                    upload_one_chunk(
+                        &base_url, &token, &file, &callbacks, &control, &tune, &config, start, end,
+                        &session, compress, level,
+                    )
+                    .await
+                }
+            }))
+            .buffer_unordered(window);
+
+            while let Some(res) = stream.next().await {
+                if let Err(e) = res {
+                    round_errors += 1;
+                    first_error.get_or_insert(e);
+                }
             }
         }
 

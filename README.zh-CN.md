@@ -2,10 +2,11 @@
 
 libfw 是一个面向 Rust 的高性能、低内存流式文件/目录传输库，适用于浏览器和服务端之间的可恢复大文件传输。它使用 Cargo workspace 组织代码，核心能力包括：
 
-- 可恢复传输：`Range` / `ETag` / `If-Range`
+- 可恢复传输：`Range` / `ETag` / `If-Range`；刷新页面后也能续传（上传由服务端保留已收分块，下载每 ~4 MiB 落盘一次检查点）
 - 自动压缩：基于 `zrip` 的分块 zstd 压缩
 - 细粒度鉴权：`Authorization: Bearer <token>`
-- 浏览器 SDK：基于 WASM 的客户端引擎
+- 客户端双形态：既能作为原生 Rust crate 使用，也能作为浏览器 SDK（WASM + npm）使用
+- 自适应传输：面向好/差网络环境自动调优并发与分块
 - 服务器端可嵌入：支持 axum / actix-web
 
 ## 仓库结构
@@ -14,10 +15,11 @@ libfw 是一个面向 Rust 的高性能、低内存流式文件/目录传输库�
 crates/
   libfw-core/     共享协议、鉴权、存储、压缩、范围处理
   libfw-server/   可嵌入的 axum 路由和 HTTP 处理逻辑
-  libfw-client/   WASM 引擎，生成 sdk/ 下的 JS/TS 包
+  libfw-client/   客户端：原生 Rust 传输层 + WASM 引擎（生成 sdk/ 包）
 examples/
   axum-server/    带浏览器 UI 的 axum 示例服务器
   actix-server/   actix-web 集成示例（API 参考实现）
+  rust-client/    原生 Rust 客户端 CLI（上传/下载/列目录/能力查询）
 sdk/              npm 包：ESM + TS 类型 + wasm 文件
 ```
 
@@ -84,6 +86,41 @@ LIBFW_PATH_KEY=$(openssl rand -hex 32) cargo run -p axum-server
 ### actix 示例
 
 `examples/actix-server` 是最小化的 actix-web 集成参考实现，便于你在自己的框架里复用 `libfw_core` 与 `libfw_server` 的能力。
+
+### rust-client 示例（原生 Rust 客户端）
+
+同一个 crate 除了驱动浏览器 SDK，也能在任何非 `wasm32` 目标上当作普通 Rust 依赖使用：`libfw_client::native::NativeClient` 是基于 `tokio` + `reqwest` 的异步传输层，协议与浏览器引擎完全一致（session 上传、`Range`/`ETag` 断点续传、zrip 压缩、基于 `/capabilities` 的自适应调优）。浏览器专有的部分（File System Access API、IndexedDB）改为普通文件读写 + JSON 续传边车文件；调优状态**只保存在内存中**（随该客户端实例存活，供后续传输复用），原生客户端不安装任何持久化，因此 `tuneTtlMs` 对原生端无效（浏览器引擎会缓存调优结果，见英文 README 的 “Adaptive tuning” 一节）。
+
+```toml
+[dependencies]
+libfw-client = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+```rust,no_run
+use libfw_client::{ClientConfig, native::NativeClient};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 选项与 SDK 一致；auto_tune 会按网络自适应
+    let config = ClientConfig { auto_tune: true, ..ClientConfig::default() };
+    let client = NativeClient::new("http://127.0.0.1:8080", "dev-token", config);
+
+    let bytes = client.download_file("docs/plan.pdf", "./plan.pdf").await?;
+    println!("已下载 {bytes} 字节（0 表示本地已是最新）");
+
+    client.upload_file("./plan.pdf".as_ref(), "archive/plan.pdf").await?;
+    Ok(())
+}
+```
+
+可直接运行的 CLI（`ls` / `download` / `upload` / `capabilities`，带进度与调优输出）见 `examples/rust-client`：[README](examples/rust-client/README.md) / [中文说明](examples/rust-client/README.zh-CN.md)。
+
+```bash
+cargo run -p axum-server -- dev-data 8080   # 终端 1：启动服务端
+cargo run -p rust-client -- --url http://127.0.0.1:8080 --token dev-token \
+    --auto-tune upload ./big.bin docs/big.bin
+```
 
 ## 鉴权与路径控制
 

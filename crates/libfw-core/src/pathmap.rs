@@ -48,6 +48,11 @@ pub enum PathCodecError {
     /// The shadow does not belong to any configured mapping.
     #[error("shadow path does not match any configured mapping: `{0}`")]
     Unmapped(String),
+    /// The host has no usable OS CSPRNG, so AES-GCM path encryption cannot
+    /// generate safe nonces (see [`EncryptedPathCodec`]).
+    #[cfg(feature = "path-encrypt")]
+    #[error("path encryption unavailable: {0}")]
+    RngUnavailable(String),
 }
 
 /// Converts between real storage paths and client-visible shadow paths.
@@ -264,30 +269,33 @@ const NONCE_LEN: usize = 12;
 #[cfg(feature = "path-encrypt")]
 fn random_bytes() -> [u8; NONCE_LEN] {
     let mut nonce = [0u8; NONCE_LEN];
-    match getrandom::getrandom(&mut nonce) {
-        Ok(()) => nonce,
-        Err(_) => {
-            // Some constrained hosts have no usable OS RNG. Fall back to an
-            // in-process PRNG seeded from time so the codec still works without
-            // panicking, while remaining explicit that this is a degraded path.
-            let mut state = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            for i in &mut nonce {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                *i = (state >> 32) as u8;
-            }
-            nonce
-        }
-    }
+    // AES-GCM is catastrophically broken by nonce reuse under a fixed key: two
+    // messages sharing a nonce leak their XOR *and* the GHASH subkey (which in
+    // turn allows forging tags). There is therefore no safe "degraded" source —
+    // a time-seeded PRNG hands an attacker predictable nonces — so this never
+    // substitutes a weaker one. The CSPRNG is validated at construction
+    // (`EncryptedPathCodec::from_hex`); reaching this abort means the host lost
+    // its OS RNG after startup, where failing loudly beats emitting a nonce
+    // that could silently defeat the encryption.
+    getrandom::getrandom(&mut nonce)
+        .expect("OS CSPRNG unavailable: refusing to generate a predictable AES-GCM nonce");
+    nonce
 }
 
 #[cfg(feature = "path-encrypt")]
 impl EncryptedPathCodec {
     /// Build the codec from a 32-byte key.
+    ///
+    /// # Panics
+    ///
+    /// If the host has no usable OS CSPRNG: AES-GCM nonces must be
+    /// unpredictable (see [`random_bytes`]), so the codec refuses to exist
+    /// rather than silently emit predictable nonces. Use
+    /// [`EncryptedPathCodec::from_hex`] to get this as a recoverable error.
     pub fn new(key: [u8; 32]) -> Self {
         use aes_gcm::KeyInit;
+        // Fail closed at construction, not per request.
+        let _probe = random_bytes();
         EncryptedPathCodec {
             cipher: Arc::new(aes_gcm::Aes256Gcm::new((&key).into())),
         }
@@ -298,6 +306,14 @@ impl EncryptedPathCodec {
         let key = decode_hex(hex).ok_or_else(|| {
             PathCodecError::InvalidShadow("LIBFW_PATH_KEY must be 64 hex chars (32 bytes)".into())
         })?;
+        // Fail closed with a recoverable error: without an OS CSPRNG the
+        // nonces would be predictable (nonce reuse breaks AES-GCM), so an
+        // encrypted deployment must not start half-working.
+        if getrandom::getrandom(&mut [0u8; NONCE_LEN]).is_err() {
+            return Err(PathCodecError::RngUnavailable(
+                "OS CSPRNG unavailable; refusing to enable AES-GCM path encryption".into(),
+            ));
+        }
         Ok(Self::new(key))
     }
 }

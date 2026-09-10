@@ -12,11 +12,43 @@ use crate::config::ClientConfig;
 use crate::error::LibfwError;
 use crate::js::Callbacks;
 use crate::state::{TaskControl, TaskState};
-use crate::tune::{LocalStore, TuningEngine, TuneHandle, TuneParams, TransferKind, now_ms};
+use crate::tune::{TuningEngine, TuneHandle, TuneParams, TransferKind, now_ms};
 
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
+}
+
+/// A [`TuneStore`](crate::tune::TuneStore) backed by `window.localStorage`.
+///
+/// Every failure (no window, storage disabled by policy, quota exceeded,
+/// private-mode restrictions) is swallowed on purpose: a stale or missing
+/// cache entry only costs one extra ramp, and a storage exception must never
+/// break a transfer.
+struct LocalStore;
+
+impl LocalStore {
+    fn storage() -> Option<web_sys::Storage> {
+        web_sys::window()?.local_storage().ok().flatten()
+    }
+}
+
+impl crate::tune::TuneStore for LocalStore {
+    fn get(&self, key: &str) -> Option<String> {
+        Self::storage().and_then(|s| s.get_item(key).ok().flatten())
+    }
+
+    fn set(&self, key: &str, value: &str) {
+        if let Some(s) = Self::storage() {
+            let _ = s.set_item(key, value);
+        }
+    }
+
+    fn remove(&self, key: &str) {
+        if let Some(s) = Self::storage() {
+            let _ = s.remove_item(key);
+        }
+    }
 }
 
 /// WASM engine facade. Construct via `new LibfwClient(options)`.
@@ -37,17 +69,22 @@ impl LibfwClient {
     #[wasm_bindgen(constructor)]
     pub fn new(opts: JsValue) -> LibfwClient {
         let config = ClientConfig::from_js(&opts);
+        let tune: TuneHandle = std::rc::Rc::new(std::cell::RefCell::new(TuningEngine::new(
+            config.auto_tune,
+            config.compress_level,
+        )));
+        // In the browser a settled result outlives the page: it is kept in
+        // `localStorage` per origin + direction, and expires after
+        // `tuneTtlMs` so a link measured long ago is re-ramped.
+        tune.borrow_mut()
+            .set_cache(std::rc::Rc::new(LocalStore), config.tune_ttl_ms);
         LibfwClient {
             config: config.clone(),
             callbacks: Callbacks::new(),
             // The global in-flight HTTP pool is sized by `concurrency`, so it
             // bounds total network parallelism (not just concurrent files).
-            control: TaskControl::with_max_parallel(config.concurrency.max(1)),
-            tune: std::rc::Rc::new(std::cell::RefCell::new(TuningEngine::new(
-                config.auto_tune,
-                config.tune_ttl_ms,
-                config.compress_level,
-            ))),
+            control: TaskControl::with_max_parallel(config.request_budget()),
+            tune,
         }
     }
 
@@ -105,12 +142,12 @@ impl LibfwClient {
             .await
             {
                 Ok(total) => {
-                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), true);
+                    tune.borrow_mut().transfer_end(true);
                     control.complete();
                     Ok(JsValue::from_f64(total as f64))
                 }
                 Err(e) => {
-                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), false);
+                    tune.borrow_mut().transfer_end(false);
                     control.fail();
                     Err(e.to_js())
                 }
@@ -155,12 +192,12 @@ impl LibfwClient {
             .await
             {
                 Ok(total) => {
-                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), true);
+                    tune.borrow_mut().transfer_end(true);
                     control.complete();
                     Ok(JsValue::from_f64(total as f64))
                 }
                 Err(e) => {
-                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), false);
+                    tune.borrow_mut().transfer_end(false);
                     control.fail();
                     Err(e.to_js())
                 }
@@ -193,12 +230,12 @@ impl LibfwClient {
             };
             match crate::upload::upload(&base_url, &token, &callbacks, &control, &config, &tune).await {
                 Ok(total) => {
-                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), true);
+                    tune.borrow_mut().transfer_end(true);
                     control.complete();
                     Ok(JsValue::from_f64(total as f64))
                 }
                 Err(e) => {
-                    tune.borrow_mut().transfer_end(&base_url, &LocalStore, now_ms(), false);
+                    tune.borrow_mut().transfer_end(false);
                     control.fail();
                     Err(e.to_js())
                 }
@@ -289,9 +326,12 @@ async fn prepare_transfer(
     let params = {
         let mut t = tune.borrow_mut();
         t.set_direction(direction);
-        t.begin_transfer(base_url, &caps, &LocalStore, now_ms(), &static_params)
+        // Scope the persisted settle to this server: different origins have
+        // different links, so they must not share a tuning result.
+        t.set_origin(base_url);
+        t.begin_transfer(&caps, now_ms(), &static_params)
     };
-    control.set_max_parallel(params.concurrency);
+    control.set_max_parallel(params.request_budget());
     Ok(params.compress_level)
 }
 

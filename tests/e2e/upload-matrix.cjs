@@ -10,10 +10,8 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 const crypto = require('crypto');
-
-const BASE = process.env.BASE || 'http://127.0.0.1:8081';
-const EXE = process.env.CHROME || `${process.env.HOME}/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`;
-const TOKEN = 'dev-token';
+const path = require('path');
+const { BASE, TOKEN, TMP, launch, tmpFile } = require('./harness.cjs');
 
 const results = [];
 function check(name, ok, detail = '') {
@@ -22,7 +20,7 @@ function check(name, ok, detail = '') {
 }
 
 (async () => {
-  const browser = await chromium.launch({ executablePath: EXE, headless: true });
+  const browser = await launch(chromium);
   const ctx = await browser.newContext({ acceptDownloads: true });
   const page = await ctx.newPage();
 
@@ -53,7 +51,8 @@ function check(name, ok, detail = '') {
   const waitIdle = async (timeoutMs = 10000) => {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if ((await page.textContent('#st-state').catch(() => 'idle')) === 'idle') return;
+      const state = await page.textContent('#st-state').catch(() => 'idle');
+      if (state !== 'running' && state !== 'paused') return;
       await page.waitForTimeout(50);
     }
   };
@@ -95,8 +94,7 @@ function check(name, ok, detail = '') {
 
   // ---------------------------------------------------------------- fixtures
   const fix = (name, bytes) => {
-    const p = `/tmp/libfw-e2e/${name}`;
-    fs.mkdirSync('/tmp/libfw-e2e', { recursive: true });
+    const p = tmpFile(name);
     fs.writeFileSync(p, bytes);
     return { p, bytes, sha: sha(bytes) };
   };
@@ -159,10 +157,10 @@ function check(name, ok, detail = '') {
   // ---------------------------------------------------------------- 5. folder upload (webkitdirectory)
   const readme = Buffer.from('# readme\nhello folder\n');
   const notes = Buffer.from('nested note\n'.repeat(500));
-  const fdir = '/tmp/libfw-e2e/folder-src';
-  fs.mkdirSync(fdir + '/docs/deep', { recursive: true });
-  fs.writeFileSync(fdir + '/docs/readme.md', readme);
-  fs.writeFileSync(fdir + '/docs/deep/notes.txt', notes);
+  const fdir = path.join(TMP, 'folder-src');
+  fs.mkdirSync(path.join(fdir, 'docs', 'deep'), { recursive: true });
+  fs.writeFileSync(path.join(fdir, 'docs', 'readme.md'), readme);
+  fs.writeFileSync(path.join(fdir, 'docs', 'deep', 'notes.txt'), notes);
   log = await doUpload('#folder', fdir, 'folder');
   check('folder: upload done', log.includes('✔ done'), log.slice(0, 80));
   await page.waitForTimeout(400);
@@ -202,8 +200,9 @@ function check(name, ok, detail = '') {
   const dlPromise = page.waitForEvent('download', { timeout: 60000 });
   await page.locator('#listing tr', { hasText: 'download-me.bin' }).first().locator('[data-act="dl"]').click();
   const download = await dlPromise;
-  await download.saveAs('/tmp/libfw-e2e/downloaded-me.bin');
-  const downloaded = fs.readFileSync('/tmp/libfw-e2e/downloaded-me.bin');
+  const dlPath = tmpFile('downloaded-me.bin');
+  await download.saveAs(dlPath);
+  const downloaded = fs.readFileSync(dlPath);
   check('download: bytes match source', sha(downloaded) === dl.sha, `${dl.bytes.length}B`);
 
   // ---------------------------------------------------------------- summary
