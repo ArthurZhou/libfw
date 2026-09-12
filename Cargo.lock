@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "libfw-client"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "axum",
  "console_error_panic_hook",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "libfw-core"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1250,7 +1250,7 @@ dependencies = [
 
 [[package]]
 name = "libfw-server"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "async-trait",
  "axum",
@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "rust-client"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "libfw-client",
  "tokio",

@@ -746,7 +746,13 @@ export class LibfwClient {
    */
   async _archiveName(path) {
     const base = (await this._cleanPath(path)).split('/').pop() || 'download';
-    return `${base.replace(/[^\w.\- ]+/g, '_') || 'download'}.zip`;
+    // Strip only genuinely illegal filesystem characters. `\w` must NOT be
+    // used as a whitelist here: it is ASCII-only, so every non-ASCII name
+    // (中文, кириллица, accents, …) collapsed to `_` and the archive came out
+    // as `_.zip`. Path traversal is already rejected by `_safeEntryName`.
+    // eslint-disable-next-line no-control-regex
+    const safe = base.replace(/[\u0000-\u001f<>:"/\\|?*]+/g, '_').trim();
+    return `${safe || 'download'}.zip`;
   }
 
   /**

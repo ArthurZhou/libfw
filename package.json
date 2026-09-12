@@ -7,7 +7,8 @@
     "e2e:resume-fs": "node tests/e2e/download-resume.cjs",
     "e2e:tune": "node tests/e2e/tune-panel-check.cjs",
     "e2e:tune-cache": "node tests/e2e/tune-cache-check.cjs",
-    "e2e:refresh": "node tests/e2e/resume-refresh.cjs"
+    "e2e:refresh": "node tests/e2e/resume-refresh.cjs",
+    "test:unit": "node tests/unit/sdk-zip.test.cjs"
   },
   "devDependencies": {
     "playwright": "^1.62.1"

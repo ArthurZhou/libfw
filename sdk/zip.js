@@ -6,7 +6,10 @@
  * {@link createZip}. The archive uses the STORE method (no compression) —
  * the SDK stays dependency-free (no deflate implementation) and CPU cost is
  * negligible. Entries carry the full virtual path (with `/` separators), so
- * extractors recreate the folder structure automatically.
+ * extractors recreate the folder structure automatically. Entry names are
+ * UTF-8 encoded and the EFS general purpose flag (bit 11) is set in both the
+ * local and central headers, so non-ASCII names survive extraction on any
+ * platform instead of being decoded with the local OEM code page.
  *
  * @module libfw/zip
  */
@@ -74,7 +77,9 @@ export function createZip(entries) {
     const dv = new DataView(local.buffer);
     dv.setUint32(0, 0x04034b50, true); // "PK\x03\x04"
     dv.setUint16(4, 20, true); // version needed to extract
-    dv.setUint16(6, 0, true); // general purpose flags
+    // Bit 11 (0x0800) = EFS: the name/comment are UTF-8. Entry names are
+    // always encoded with TextEncoder above, so the flag is unconditional.
+    dv.setUint16(6, 0x0800, true); // general purpose flags
     dv.setUint16(8, 0, true); // compression method: STORE
     dv.setUint16(10, 0, true); // last mod time
     dv.setUint16(12, 0x0021, true); // last mod date (1980-01-01)
@@ -102,7 +107,7 @@ export function createZip(entries) {
     dv.setUint32(0, 0x02014b50, true); // "PK\x01\x02"
     dv.setUint16(4, 20, true); // version made by
     dv.setUint16(6, 20, true); // version needed to extract
-    dv.setUint16(8, 0, true); // flags
+    dv.setUint16(8, 0x0800, true); // flags (bit 11 = EFS, UTF-8 names)
     dv.setUint16(10, 0, true); // method: STORE
     dv.setUint16(12, 0, true); // mod time
     dv.setUint16(14, 0x0021, true); // mod date
