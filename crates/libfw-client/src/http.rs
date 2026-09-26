@@ -475,8 +475,8 @@ pub fn auth_headers(token: &str, accept_zrip: bool, level: Option<i32>) -> Resul
 /// Fetch the server's capability advertisement (`GET /capabilities`).
 ///
 /// The endpoint is public by design (no credentials needed — the payload is
-/// a non-sensitive contract for adaptive clients). A 404 means a legacy
-/// server without the route; the caller decides how to fall back.
+/// a non-sensitive contract for adaptive clients). A `404` means the server
+/// does not serve the route; the caller decides how to fall back.
 pub async fn fetch_capabilities(
     base_url: &str,
     timeout_ms: u32,

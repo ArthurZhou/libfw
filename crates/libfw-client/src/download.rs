@@ -109,8 +109,8 @@ async fn sleep_ms(ms: u32) {
 /// sequential single-connection path. Both paths resume from the persisted
 /// contiguous offset and re-validate it against the server (which is the
 /// source of truth for what exists).
-// M3 tuning plumbing (tune handle + negotiated level) pushed this past the
-// 7-arg lint; grouping them would churn every call site for no gain.
+// The tuning plumbing (tune handle + negotiated level) makes this past the
+// 7-arg lint; grouping it would churn every call site for no gain.
 #[allow(clippy::too_many_arguments)]
 async fn download_file(
     base_url: &str,
@@ -505,8 +505,8 @@ async fn download_chunk_once(
 ///
 /// Reporting per received slice — instead of only once the whole range has
 /// been buffered — is what makes the bar move while a fetch is still in
-/// flight: a single range GET can be many MiB, and on a slow link waiting for
-/// it to complete looked like "progress is frozen". `counted` accumulates the
+/// flight: a single range GET can be many MiB, and on a slow link a bar that
+/// only moves at the end reads as frozen. `counted` accumulates the
 /// bytes this attempt reported so a failed attempt can roll them back.
 async fn collect_chunk(
     resp: &Response,
@@ -580,7 +580,7 @@ async fn collect_chunk(
 /// Download a large file with the tus-style parallel path: `download_window`
 /// concurrent byte-range GETs, reordered in memory and emitted to the SDK
 /// **strictly in order** (so the SDK's append-mode writable stays correct and
-/// the `.crswap` fix is preserved).
+/// never churns a `.crswap` swap file).
 ///
 /// - **Server-authoritative**: starts with a `HEAD` to learn the real size
 ///   and ETag, validates the persisted resume offset against that ETag, and
@@ -907,7 +907,8 @@ async fn stream_download(
                     control.add_progress(data.len() as u64);
                     // Report smooth intermediate progress during a long
                     // single-file download (throttled to whole-percent
-                    // boundaries; previously files sat at 0% → 100%).
+                    // boundaries, so the bar never sits frozen at 0% before
+                    // jumping to 100%).
                     control.report_progress_if(&callbacks)?;
 
                     // Feed the tuning engine per read: a single-request
@@ -999,8 +1000,8 @@ async fn finish_download(
 }
 
 /// Download an entire folder (or the root when `path` is empty).
-// M3 tuning plumbing (tune handle + negotiated level) pushed this past the
-// 7-arg lint; grouping them would churn every call site for no gain.
+// The tuning plumbing (tune handle + negotiated level) makes this past the
+// 7-arg lint; grouping it would churn every call site for no gain.
 #[allow(clippy::too_many_arguments)]
 pub async fn download_folder(
     base_url: &str,
@@ -1051,8 +1052,8 @@ pub async fn download_folder(
 }
 
 /// Download a single file at `path` (size/etag discovered from the server).
-// M3 tuning plumbing (tune handle + negotiated level) pushed this past the
-// 7-arg lint; grouping them would churn every call site for no gain.
+// The tuning plumbing (tune handle + negotiated level) makes this past the
+// 7-arg lint; grouping it would churn every call site for no gain.
 #[allow(clippy::too_many_arguments)]
 pub async fn download_single(
     base_url: &str,

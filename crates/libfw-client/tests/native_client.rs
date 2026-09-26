@@ -310,11 +310,10 @@ async fn folder_round_trip_preserves_structure() {
 
 #[tokio::test]
 async fn large_download_is_split_into_many_range_requests() {
-    // Regression: a large download used to be fetched as ONE whole-file
-    // request (a single 206 spanning the file) because the fresh adaptive
-    // ramp starts at `download_window = 1` and the path decision was made
-    // once. Now the chunked loop re-reads the window/chunk size per batch, so
-    // even a minimal start still fetches the file in bounded chunks.
+    // A large download must be split into many byte-range requests, never one
+    // whole-file 206: the fresh adaptive ramp starts at
+    // `download_window = 1`, so the chunked loop re-reads the window/chunk
+    // size per batch and even a minimal start still fetches bounded chunks.
     let server = start_server().await;
     let client = client(&server, |c| {
         c.auto_tune = true;

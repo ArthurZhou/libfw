@@ -57,7 +57,8 @@ pub enum StorageError {
         #[source]
         source: io::Error,
     },
-    /// The backend is not read-only writable, etc.
+    /// The backend does not support the requested operation (e.g. writing
+    /// through a read-only handle).
     #[error("operation not supported: {0}")]
     Unsupported(&'static str),
     /// Any other backend failure.

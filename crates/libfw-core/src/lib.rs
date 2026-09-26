@@ -4,7 +4,8 @@
 //! `libfw-core` is the foundation crate consumed by both
 //! [`libfw-server`](https://docs.rs/libfw-server) (server routing /
 //! middleware) and [`libfw-client`](https://docs.rs/libfw-client) (WASM
-//! engine + JS SDK). It contains no I/O of its own: it defines the *contracts*.
+//! engine + JS SDK). It contains no I/O of its own: it defines the
+//! *contracts*.
 //!
 //! # Highlights
 //!
@@ -19,7 +20,7 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```
 //! use libfw_core::auth::{Action, PathValidator, Validator};
 //! use libfw_core::claims::{TokenClaims, Permission};
 //!
@@ -30,6 +31,7 @@
 //!     allowed_paths: vec!["/docs/".into()],
 //! };
 //! let validator = PathValidator::new();
+//! // `/docs/spec.pdf` sits under the allowed `/docs/` prefix.
 //! assert!(validator.validate(&claims, "/docs/spec.pdf", Action::Read).is_ok());
 //! ```
 

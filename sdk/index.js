@@ -347,7 +347,7 @@ export class LibfwClient {
       // ESM-only `import.meta.url` fallback is never exercised — that
       // fallback throws when the SDK is bundled for a classic <script>/UMD
       // context. See _wasmUrl() for how the URL is resolved. The
-      // `{ module_or_path }` object form is the glue's non-deprecated API.
+      // `{ module_or_path }` object form is the glue's supported API.
       this._initPromise = init({ module_or_path: this._wasmUrl() }).catch((err) => {
         this._initPromise = null;
         throw toLibfwError(err);
@@ -1061,7 +1061,7 @@ export class LibfwClient {
     if (!this._dirHandle) return null;
     try {
       // Same display-name mapping as `_ensureFileHandle` so a resume finds
-      // the file previously written under its resolved (display) name.
+      // the file already written under its resolved (display) name.
       const segments = splitPath(await this._safeEntryName(path));
       if (segments.length === 0) return null;
       let dir = this._dirHandle;

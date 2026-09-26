@@ -725,10 +725,10 @@ async fn compressed_upload_and_download_roundtrip() {
 
 #[tokio::test]
 async fn browser_zstd_accept_encoding_does_not_trigger_zrip() {
-    // Regression: a browser sends `Accept-Encoding: gzip, deflate, br,
-    // zstd` automatically. This must NOT be interpreted as a request for
-    // libfw's private zrip wire format (which a plain browser `fetch`
-    // cannot decode) — the server must reply identity instead.
+    // A browser offers `Accept-Encoding: gzip, deflate, br, zstd`
+    // automatically, and none of those tokens ask for libfw's private zrip
+    // wire format — the response must stay identity, which a plain browser
+    // `fetch` reads verbatim.
     let app = app(DevVerifier);
     let data = b"plain text body".to_vec();
     let meta = libfw_core::metadata::FileMeta::new("z.bin", data.len() as u64, 0);

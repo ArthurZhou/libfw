@@ -28,8 +28,8 @@ impl std::fmt::Display for Permission {
 
 /// Parsed, verified token payload used for fine-grained authorization.
 ///
-/// All fields except `sub` are optional so that minimal tokens remain
-/// usable (validation is performed by the [`Validator`](crate::auth::Validator)).
+/// All fields except `sub` are optional so that minimal tokens stay usable;
+/// validation is performed by the [`Validator`](crate::auth::Validator).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenClaims {
     /// Subject — the user or client the token belongs to.
@@ -48,10 +48,8 @@ pub struct TokenClaims {
 impl TokenClaims {
     /// Returns true if `now` (unix seconds) is past `exp`.
     ///
-    /// Per RFC 7519 §4.1.4 the token is valid while `now < exp`; a token
-    /// whose `exp` equals the current second is already expired.  The
-    /// previous `now >= exp` was correct — this comment preserves the
-    /// intent explicitly.
+    /// Per RFC 7519 §4.1.4 the token is valid while `now < exp`, so a token
+    /// whose `exp` equals the current second is already expired.
     pub fn is_expired(&self, now: i64) -> bool {
         self.exp.is_some_and(|exp| now >= exp)
     }

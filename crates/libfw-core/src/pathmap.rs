@@ -14,7 +14,7 @@
 //!
 //! Authorization is unaffected by translation: the server validates the
 //! *real* path against `allowed_paths` (see the `resolve_client_path`
-//! helper in `libfw-server`), so token semantics stay exactly as before.
+//! helper in `libfw-server`), so claims always apply to the real path.
 //!
 //! **Hierarchical composition:** `resolve_client_path` also accepts a
 //! shadow with literal child segments appended (`{dirShadow}/sub/file`):

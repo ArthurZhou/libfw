@@ -320,7 +320,7 @@ impl TaskControl {
         self.done_bytes.set(self.done_bytes.get().saturating_add(bytes));
     }
 
-    /// Remove previously-counted progress (saturating).
+    /// Remove already-counted progress (saturating).
     ///
     /// Used by the download path: a chunk's body reports progress as it
     /// streams (so the bar moves during the fetch), and a failed attempt rolls
@@ -505,8 +505,8 @@ mod tests {
 
     #[test]
     fn clones_share_counters_and_flags() {
-        // Regression: the WASM facade clones the control into each transfer
-        // task. Clones must share progress and pause/cancel state, otherwise
+        // The WASM facade clones the control into each transfer task. Clones
+        // must share progress and pause/cancel state, otherwise
         // `done_bytes()`/`progress()` report 0 and controls never reach the
         // running task.
         let c = TaskControl::new();

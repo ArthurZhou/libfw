@@ -64,7 +64,7 @@ pub const HEADER_COMPRESS: &str = "x-libfw-compress";
 /// Sent by the client on both upload and download; on download the server
 /// validates/clamps it and **echoes the actual level used** back on the same
 /// header, so a client can never assume its request was honored verbatim.
-/// Absent (older clients) → the server's default level.
+/// Absent → the server's default level.
 pub const HEADER_COMPRESS_LEVEL: &str = "x-libfw-compress-level";
 
 /// HTTP header carrying JSON-encoded [`FileMeta`](crate::metadata::FileMeta)
@@ -78,8 +78,8 @@ pub const HEADER_OFFSET: &str = "x-libfw-offset";
 ///
 /// When present (value `1`/`true`), the server verifies that the resulting
 /// file size equals the declared `x-libfw-file-meta` size before committing,
-/// so a client cannot commit a truncated file. Absent (older clients) skips
-/// the check — the header is optional and backward compatible.
+/// so a client cannot commit a truncated file. Absent skips the check, so
+/// the header is optional.
 pub const HEADER_FINAL: &str = "x-libfw-final";
 
 /// HTTP header carrying a per-upload **session id**.
@@ -89,7 +89,7 @@ pub const HEADER_FINAL: &str = "x-libfw-final";
 /// per-session temp file (positional writes), and the final
 /// `x-libfw-final` request commits it. This lets a client pipeline many
 /// chunks in flight (hiding round-trip latency) instead of serializing one
-/// request per chunk. Absent → legacy per-request sequential upload.
+/// request per chunk. Absent → per-request sequential upload.
 ///
 /// A session id should be **stable for a given file version** (derived from
 /// the ETag) so an interrupted upload can be found again on resume: the
@@ -106,9 +106,8 @@ pub const HEADER_SESSION: &str = "x-libfw-session";
 /// uses this to compute which blocks are still missing and re-send only
 /// those — a BitTorrent-style "only retransmit the broken parts" resume.
 ///
-/// Absent (older clients) keeps the previous behavior; legacy servers that
-/// ignore this header simply write nothing for the empty probe body and
-/// return an empty range set, which degrades to a full re-send (idempotent
+/// Absent → the server writes nothing for the empty probe body and returns
+/// an empty range set, which degrades to a full re-send (idempotent
 /// positional writes make that correct too).
 pub const HEADER_SESSION_STATUS: &str = "x-libfw-session-status";
 

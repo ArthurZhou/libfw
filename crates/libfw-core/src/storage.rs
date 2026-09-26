@@ -119,8 +119,9 @@ pub trait StorageBackend: Send + Sync + 'static {
         _owner: &str,
         mode: WriteMode,
     ) -> Result<Box<dyn UploadSink>, StorageError> {
-        // Default: single-request path is not concurrent; behave like a
-        // normal `write_stream` for backends that don't opt into sessions.
+        // Backends that do not opt into sessions fall back to a plain
+        // `write_stream`, whose destination is written one sequential
+        // stream rather than positionally.
         self.write_stream(path, mode).await
     }
 

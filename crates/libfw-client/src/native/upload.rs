@@ -283,9 +283,9 @@ impl NativeClient {
             #[serde(default)]
             ranges: Vec<[u64; 2]>,
         }
-        // An empty range list means "nothing received" — or a legacy server
-        // that echoed the meta without a range list; both are safe, because a
-        // full re-send is idempotent under positional writes.
+        // An empty range list means "nothing received" — or a server that
+        // echoed the meta without a range list; both are safe, because a full
+        // re-send is idempotent under positional writes.
         let parsed: Ranges = serde_json::from_slice(&body)
             .map_err(|e| LibfwError::Protocol(format!("bad session-status JSON: {e}")))?;
         Ok(parsed

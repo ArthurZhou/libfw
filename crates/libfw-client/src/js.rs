@@ -195,9 +195,10 @@ pub fn u8_vec_from_js(value: &JsValue) -> Result<Vec<u8>, LibfwError> {
 pub const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 
 /// Convert a JS number to a `u64`, rejecting non-finite, negative or
-/// > 2^53−1 values instead of rounding them into a wrong offset. A missing /
-/// non-numeric field falls back to `0` (matching the previous lenient
-/// behaviour for optional fields).
+/// `> 2^53−1` values instead of rounding them into a wrong offset.
+///
+/// A missing or non-numeric field falls back to `0`, which is what makes
+/// optional protocol fields safe to omit.
 pub fn safe_u64(value: &JsValue, field: &str) -> Result<u64, LibfwError> {
     let Some(n) = value.as_f64() else {
         return Ok(0);

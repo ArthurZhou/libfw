@@ -45,7 +45,8 @@ pub enum AuthError {
     /// The `Authorization` header is absent or malformed.
     #[error("missing or malformed bearer token")]
     MissingToken,
-    /// The token payload could not be verified (bad signature, unknown issuer, …).
+    /// The token payload could not be verified (bad signature, unknown
+    /// issuer, …).
     #[error("invalid token: {0}")]
     Invalid(String),
     /// The token has expired.
@@ -89,11 +90,9 @@ pub trait Validator: Send + Sync + 'static {
 
 /// The default validator: permission check + path-prefix check.
 ///
-/// A request is allowed when:
-///
-/// 1. the token is not expired ([`TokenClaims::exp`]), and
-/// 2. it carries the [`Permission`] required by `action`, and
-/// 3. the requested path starts with one of `allowed_paths`.
+/// A request is allowed when the token is not expired
+/// ([`TokenClaims::exp`]), carries the [`Permission`] required by `action`,
+/// and the requested path starts with one of `allowed_paths`.
 ///
 /// Paths are compared on a segment boundary: `allowed_paths = ["/docs"]`
 /// matches `/docs`, `/docs/a.txt` and `/docs/` but **not** `/docshop/x`.
@@ -101,8 +100,8 @@ pub trait Validator: Send + Sync + 'static {
 /// empty `allowed_paths` list denies everything.
 #[derive(Debug, Clone, Default)]
 pub struct PathValidator {
-    /// When true, `allowed_paths` are treated as raw string prefixes
-    /// (no segment-boundary normalization). Default: false.
+    /// When true, `allowed_paths` are treated as raw string prefixes with
+    /// no segment-boundary normalization. Defaults to `false`.
     pub raw_prefix_match: bool,
 }
 
@@ -150,7 +149,7 @@ impl Validator for PathValidator {
 /// Segment-boundary prefix match for a path against a list of prefixes.
 ///
 /// Normalizes a leading `/` so `/docs`, `docs` and `docs/` are equivalent.
-/// A root prefix (`""`, `"/"`, `"/"`-like) matches **everything**, which is
+/// A prefix of only slashes (`""`, `"/"`) matches **everything**, which is
 /// how `allowed_paths: ["/"]` is conventionally used to grant full access.
 fn path_matches_any(path: &str, prefixes: &[String]) -> bool {
     let p = path.trim_start_matches('/');

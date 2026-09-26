@@ -635,7 +635,7 @@ fast with a clear error instead of corrupting transfers.
   positionally into a shared per-session temp, so chunks can be pipelined
   out of order; `x-libfw-session-status` probes the already-received byte
   ranges, and `x-libfw-final: 1` commits (size-verified rename). Absent on a
-  request → legacy sequential per-request upload.
+  request → sequential per-request upload.
   **Isolation**: the server namespaces session temps per authenticated
   subject (a SHA-256 prefix of the bearer-token `sub` is embedded in the
   temp filename), so two users can never collide on — or read — each
@@ -717,8 +717,8 @@ client.tuneStatus();
 ```
 
 `phase` is `uninitialized | ramping | settled | degraded`. A server without
-the `/capabilities` route (pre-0.3.3 builds) simply disables tuning — the
-client falls back to the configured static values.
+the `/capabilities` route simply disables tuning — the client falls back to the
+configured static values.
 
 ## Building from source
 

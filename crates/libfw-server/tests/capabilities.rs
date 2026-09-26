@@ -246,15 +246,17 @@ async fn download_level_is_clamped_and_echoed() {
 }
 
 #[tokio::test]
-async fn download_level_legacy_mode_is_unchanged() {
-    // Builder without zrip_levels: the header is ignored, nothing is
-    // echoed, and the body is zrip at the library default — exactly the
-    // pre-0.3.3 behavior, so old servers paired with new clients stay safe.
+async fn download_without_zrip_levels_ignores_level_header() {
+    // Builder without zrip_levels: the header is ignored, nothing is echoed,
+    // and the body is zrip at the library default level.
     let app = app_with(CompressionFormat::Zrip, None, None);
     let data: Vec<u8> = (0..50_000u32).map(|i| (i % 31) as u8).collect();
-    let (status, headers, body) = upload_then_download(app, "legacy.bin", &data, Some(4)).await;
+    let (status, headers, body) = upload_then_download(app, "no-levels.bin", &data, Some(4)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(headers.get(HEADER_COMPRESS_LEVEL).is_none(), "legacy mode must not echo a level");
+    assert!(
+        headers.get(HEADER_COMPRESS_LEVEL).is_none(),
+        "an unconfigured server must not echo a level"
+    );
     assert_eq!(headers.get(HEADER_COMPRESS).unwrap(), "zrip");
     assert_eq!(decompress_zrip(&body), data);
 }

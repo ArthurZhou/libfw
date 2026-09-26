@@ -64,8 +64,8 @@ pub(crate) async fn sleep_ms(ms: u32) {
 /// When `session` is non-empty the request uses the concurrent "session"
 /// protocol: the server writes the body at `offset` into a shared per-session
 /// temp file and does NOT commit unless `final_chunk` is set. When `session`
-/// is empty the legacy sequential protocol is used (offset = resume point,
-/// commit on `final_chunk`).
+/// is empty there is no shared temp — the server commits on `final_chunk` and
+/// `offset` is the resume point.
 ///
 /// `semaphore` is the engine-wide in-flight HTTP pool (sized by
 /// `concurrency`): every data request takes a permit so `concurrency` bounds
@@ -151,10 +151,10 @@ fn session_id_for(file: &FileEntry) -> String {
 ///
 /// Returns `Ok(Some(ranges))` when the server understood the probe (it
 /// replies with `{"ranges": [[start, end], ...]}`). Returns `Ok(None)` when
-/// the response has no `ranges` field — a legacy server that ignores the
-/// probe header and simply echoes the file meta; the caller then treats the
-/// session as empty (a full re-send, which is correct thanks to idempotent
-/// positional writes).
+/// the response has no `ranges` field — a server that ignores the probe header
+/// and simply echoes the file meta; the caller then treats the session as
+/// empty (a full re-send, which is correct thanks to idempotent positional
+/// writes).
 async fn probe_session(
     base_url: &str,
     token: &str,
@@ -192,7 +192,7 @@ async fn probe_session(
     let parsed: Ranges = serde_json::from_slice(&body)
         .map_err(|e| LibfwError::Protocol(format!("bad session-status JSON: {e}")))?;
     // Empty `ranges` could mean either "nothing received yet" (legit) or a
-    // legacy server that echoed meta without a range list; in both cases the
+    // server that echoed meta without a range list; in both cases the
     // caller treats it as "nothing received", which is safe.
     Ok(Some(
         parsed
@@ -457,10 +457,10 @@ async fn commit_upload(
 /// whose write was truly lost is re-sent, and a failed commit triggers a
 /// fresh probe + refill instead of failing the task.
 ///
-/// A legacy server that ignores the probe yields an empty range list → a
+/// A server that ignores the probe yields an empty range list → a
 /// full re-send, which is correct thanks to idempotent positional writes.
-// M3 tuning plumbing (tune handle + negotiated level) pushed this past the
-// 7-arg lint; grouping them would churn every call site for no gain.
+// The tuning plumbing (tune handle + negotiated level) makes this past the
+// 7-arg lint; grouping it would churn every call site for no gain.
 #[allow(clippy::too_many_arguments)]
 async fn upload_session_resumable(
     base_url: &str,
@@ -704,8 +704,8 @@ fn covered_bytes(received: &[(u64, u64)]) -> u64 {
 /// partially-received session temp on the server; the next attempt probes it
 /// and retransmits only the broken/lost parts (BitTorrent-style), never the
 /// whole file.
-// M3 tuning plumbing (tune handle + negotiated level) pushed this past the
-// 7-arg lint; grouping them would churn every call site for no gain.
+// The tuning plumbing (tune handle + negotiated level) makes this past the
+// 7-arg lint; grouping it would churn every call site for no gain.
 #[allow(clippy::too_many_arguments)]
 async fn upload_file(
     base_url: &str,

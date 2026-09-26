@@ -373,7 +373,7 @@ async fn file_upload(
 
     // Concurrent "session" upload path: chunks carry their ABSOLUTE offset
     // and are written into a shared per-session temp file (positional);
-    // only the final request commits. Absent → legacy sequential upload.
+    // only the final request commits. Absent → sequential per-request upload.
     if let Some(session) = headers
         .get(HEADER_SESSION)
         .and_then(|v| v.to_str().ok())

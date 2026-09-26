@@ -13,10 +13,11 @@
 //! throughput, clamped into the server's advertised range and the client's
 //! in-flight budget. That gives a wider/faster link fewer, bigger requests and
 //! a narrow link the advertised minimum, and it applies for the whole
-//! transfer (including after the ramp settles). It used to be the *last* ramp
-//! dimension, which in practice never ran: the BDP rule settles the ramp on
-//! the window/concurrency dimensions first, so the chunk stayed pinned at the
-//! advertised minimum (256 KiB) on every link.
+//! transfer (including after the ramp settles). Sizing it from the link instead
+//! of ramping it is what makes it useful at all: the BDP saturation rule
+//! settles the ramp on the window and concurrency dimensions, so a chunk
+//! dimension in the ramp order would never be reached and the chunk would stay
+//! pinned at the advertised minimum (256 KiB) on every link.
 //!
 //! # Lifetime of a tuning result
 //!
@@ -149,10 +150,10 @@ pub struct TuneParams {
 /// `concurrency` files × the widest per-file window, clamped to
 /// [`HARD_MAX_IN_FLIGHT_REQUESTS`].
 ///
-/// The pool exists to *bound* parallelism, not to define it. Sizing it to
-/// `concurrency` alone made the per-file window a dead letter: right after an
-/// adaptive ramp starts, the advertised `concurrency` minimum is 1, so every
-/// chunk was serialized and growing the window changed nothing (measured:
+/// The pool exists to *bound* parallelism, not to define it. A pool sized to
+/// `concurrency` alone would make the per-file window a dead letter: right
+/// after an adaptive ramp starts the advertised `concurrency` minimum is 1, so
+/// every chunk serializes and growing the window changes nothing (measured:
 /// 1.1 MiB/s on a 4 MiB/s link with `uploadWindow = 4`).
 pub fn request_budget(concurrency: usize, per_file_window: usize) -> usize {
     concurrency
@@ -182,7 +183,7 @@ pub const TUNE_CACHE_VERSION: u32 = 1;
 /// implementation, because caching is an optimisation and must never fail a
 /// transfer.
 pub trait TuneStore {
-    /// Read a previously stored result.
+    /// Read a stored result.
     fn get(&self, key: &str) -> Option<String>;
     /// Store (or replace) a result.
     fn set(&self, key: &str, value: &str);
@@ -292,8 +293,10 @@ impl TuneParams {
         }
     }
 
-    /// A static table derived from the client configuration (no tuning:
-    /// legacy behavior, but still level-resolved and clamped to the caps).
+    /// A static table derived from the client configuration.
+    ///
+    /// The configured values, level-resolved and clamped into the advertised
+    /// caps — the table a transfer runs with while tuning is off.
     pub fn from_config(
         concurrency: usize,
         upload_window: usize,
@@ -412,15 +415,10 @@ pub fn bdp_bytes(mbps: f64, rtt_ms: f64) -> u64 {
 
 /// Minimum transfer time one chunk should represent (ms).
 ///
-/// The chunk size follows the *measured link* instead of being ramped last
-/// (which in practice never happened: the ramp settles on the window /
-/// concurrency dimensions first — the BDP rule stops it — so the chunk stayed
-/// at the advertised minimum forever, e.g. 256 KiB even on a 30 Mb/s link).
-///
 /// One chunk should carry about this much of the link's throughput, so a
 /// wide/faster link gets few big requests (less per-request overhead, better
 /// per-request compression) while a narrow link keeps the advertised minimum
-/// (fine granularity, bounded memory).
+/// (fine granularity, bounded memory) — 256 KiB even on a 30 Mb/s link.
 ///
 /// Deliberately *throughput-only*: an RTT term would make a single chunk as
 /// big as the whole bandwidth-delay product, which immediately satisfies the
@@ -704,8 +702,8 @@ pub struct TuningEngine {
     /// RTT the *current ramp* started from (the link's baseline latency).
     ///
     /// Saturation is judged against this fixed reference, not against the
-    /// previous window's EWMA (comparing the EWMA with itself is always 0
-    /// and made the RTT-inflation rule dead code).
+    /// previous window's EWMA (comparing the EWMA with itself is always 0,
+    /// which would make the RTT-inflation rule unreachable).
     rtt_baseline: Option<f64>,
     prev_mbps: f64,
     low_gain_windows: u32,
@@ -830,7 +828,7 @@ impl TuningEngine {
         let entry: TuneCache = match serde_json::from_str(&raw) {
             Ok(entry) => entry,
             Err(_) => {
-                // Unreadable (a corrupted row or an older layout): drop it.
+                // Unreadable (a corrupted row or an unrecognized layout): drop it.
                 store.remove(&key);
                 return None;
             }
@@ -895,8 +893,10 @@ impl TuningEngine {
         self.enabled
     }
 
-    /// Force-disable tuning for the rest of this client's lifetime (used
-    /// when the server has no `/capabilities` route — a legacy peer).
+    /// Force-disable tuning for the rest of this client's lifetime.
+    ///
+    /// A server that does not serve `/capabilities` offers nothing to tune
+    /// against, so the client stops asking.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
@@ -953,9 +953,9 @@ impl TuningEngine {
     ///    refresh (or a later visit) skips the ramp;
     /// 3. otherwise the advertised minimums (a fresh ramp).
     ///
-    /// Returns the parameters the transfer should start with. When tuning is
-    /// disabled this returns static config-derived params (legacy), so
-    /// callers can always use the result.
+    /// Returns the parameters the transfer should start with. With tuning
+    /// disabled this is the static config-derived table, so callers can
+    /// always use the result.
     pub fn begin_transfer(
         &mut self,
         caps: &Capabilities,
@@ -1075,10 +1075,8 @@ impl TuningEngine {
         // link gets bigger chunks (fewer requests, better per-request
         // compression), a narrow one keeps the advertised minimum. This runs
         // on every window — including after the ramp settles — so the chunk
-        // size tracks the link for the whole transfer instead of only being
-        // explored once the window and concurrency dimensions were exhausted
-        // (which the BDP rule almost always pre-empted, leaving the chunk at
-        // the 256 KiB minimum forever).
+        // size tracks the link for the whole transfer, not only while the
+        // window and concurrency dimensions are still being ramped.
         self.retune_chunk_size(mbps, &caps);
 
         // BDP / RTT saturation only applies while actively ramping: a
@@ -1231,7 +1229,7 @@ impl TuningEngine {
     fn rtt_inflation(&self) -> f64 {
         // Inflation is measured against the latency the *ramp* started from,
         // never against the current EWMA (comparing the EWMA with itself is
-        // always 0, which made this rule unreachable).
+        // always 0, which would make this rule unreachable).
         match (self.rtt_ewma, self.rtt_baseline) {
             (Some(cur), Some(base)) if base > 0.0 => (cur / base - 1.0).max(0.0),
             _ => 0.0,
@@ -1616,8 +1614,8 @@ mod tests {
         assert_eq!(low, 1, "first below-threshold window holds");
 
         // Second below-threshold window → the dimension is exhausted. Not the
-        // last dimension → explore the next one (chunk size still matters even
-        // when the window stopped helping).
+        // last dimension → explore the next one (cross-file concurrency still
+        // matters when the window stopped helping).
         let flat2 = RampInput { low_gain_windows: 1, ..flat };
         let (action, low) = ramp_action(&flat2);
         assert_eq!(action, RampAction::AdvanceDim);
@@ -1948,8 +1946,8 @@ mod tests {
         let mut e = engine();
         // Constant throughput after the first raise: every dimension gets its
         // 2 flat windows and the ramp then moves on to the next one instead of
-        // settling. The chunk size is not a ramp dimension any more — it
-        // follows the measured link (see the `chunk_for_link` tests).
+        // settling. The chunk size is not a ramp dimension — it follows the
+        // measured link (see the `chunk_for_link` tests).
         let step = 12_500_000u64;
         let mut done = step;
         let mut t = 1_000.0;

@@ -383,7 +383,7 @@ impl NativeClient {
         let caps = if self.cfg.client.auto_tune {
             match self.fetch_capabilities().await {
                 Ok(caps) => caps,
-                // A legacy server without the route → tuning off, defaults on.
+                // A 404 on the capabilities route → tuning off, defaults on.
                 Err(LibfwError::Http { status: 404, .. }) => {
                     self.with_tune(|t| t.set_enabled(false));
                     Capabilities::default()

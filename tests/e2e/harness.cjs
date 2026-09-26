@@ -1,7 +1,7 @@
 /* Shared, cross-platform plumbing for the browser e2e suites.
  *
- * Everything that used to be hard-coded per script (the macOS Playwright
- * Chrome path, `/tmp/...` scratch dirs, port 8081) lives here so the same
+ * Cross-platform plumbing shared by the browser e2e suites: the Playwright
+ * Chrome path, `/tmp/...` scratch dirs and port 8081 live here so the same
  * scripts run on macOS, Linux and Windows:
  *
  *   BASE        web UI origin            (env BASE, default :8080 like dev-test.bat)

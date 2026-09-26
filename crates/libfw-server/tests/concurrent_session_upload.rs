@@ -1,5 +1,5 @@
-//! Regression probes for the upload "commit yields 0 bytes" bug and the
-//! 2 MiB frame-boundary compression path.
+//! Session-upload commit probes: the 2 MiB frame boundary of a full chunk,
+//! and a chunk that carries several small frames.
 
 use std::sync::Arc;
 
@@ -132,10 +132,10 @@ async fn concurrent_compressed_chunks_then_commit() {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn chunk_larger_than_frame_cap_commits_when_split_into_small_frames() {
-    // Regression for the `chunkSize` config: a 4 MiB chunk (larger than the
-    // server's MAX_FRAME_OUTPUT == 2 MiB) must still upload. The client splits
-    // each chunk into ~64 KiB frames, so no single frame exceeds the cap and
-    // the per-call decompression budget (MAX_OUTPUT_PER_CALL) is never hit.
+    // A `chunkSize` of 4 MiB (larger than the server's MAX_FRAME_OUTPUT ==
+    // 2 MiB) must still upload: the client splits each chunk into ~64 KiB
+    // frames, so no single frame exceeds the cap and the per-call
+    // decompression budget (MAX_OUTPUT_PER_CALL) is never hit.
     let app = app();
     let data: Vec<u8> = (0..(libfw_core::CHUNK_SIZE as usize * 2 + 12_345))
         .map(|i| (i % 251) as u8)

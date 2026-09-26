@@ -111,8 +111,8 @@ pub struct ServerState {
     /// Advertised tuning-parameter ranges; `None` exports the libfw
     /// built-in defaults (and enforces nothing beyond existing hard caps).
     pub limits: Option<Limits>,
-    /// Advertised zrip level range; `None` keeps the legacy behavior:
-    /// the level header is ignored and downloads always use
+    /// Advertised zrip level range; `None` ignores the level header, so
+    /// every zrip download uses
     /// [`ZRIP_DEFAULT_LEVEL`](libfw_core::ZRIP_DEFAULT_LEVEL).
     pub zrip_levels: Option<ZripLevels>,
     /// Sweep period of the stale session-temp cleaner (tus `Expiration`),
@@ -323,8 +323,8 @@ impl ServerStateBuilder {
     /// Zrip level range for downloads: validates/clamps the
     /// `x-libfw-compress-level` request header and echoes the actual level.
     ///
-    /// `None` (default) keeps the legacy behavior — the header is ignored
-    /// and every zrip download uses [`ZRIP_DEFAULT_LEVEL`].
+    /// `None` (default) ignores the header, so every zrip download uses
+    /// [`ZRIP_DEFAULT_LEVEL`](libfw_core::ZRIP_DEFAULT_LEVEL).
     pub fn zrip_levels(mut self, levels: ZripLevels) -> Self {
         self.zrip_levels = Some(levels);
         self
@@ -430,7 +430,7 @@ impl ServerState {
 /// version with `426 Upgrade Required`.
 ///
 /// Requests *without* the handshake header are allowed, so raw HTTP clients
-/// (curl, tests, older builds) keep working; the WASM/SDK client always
+/// (curl, hand-written scripts) work without one; the WASM/SDK client always
 /// sends the header so it is guaranteed to be matched with this server.
 async fn validate_protocol(req: Request, next: Next) -> Response {
     if let Some(value) = req

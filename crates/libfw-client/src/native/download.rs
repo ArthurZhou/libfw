@@ -549,7 +549,7 @@ mod tests {
         assert!(should_chunked(big, 0));
         // Window 1 is not known here on purpose: the batch loop re-reads the
         // live window per batch, so a minimal start still fetches bounded
-        // chunks (regression: one whole-file 206 that could never be tuned).
+        // chunks — never one whole-file 206 that could not be tuned.
         assert!(!should_chunked(1024, 0), "small files stay sequential");
         assert!(
             !should_chunked(MIN_PARALLEL_DOWNLOAD_BYTES, MIN_PARALLEL_DOWNLOAD_BYTES - 1),

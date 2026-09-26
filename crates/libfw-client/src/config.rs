@@ -61,8 +61,10 @@ pub struct ClientConfig {
     pub max_retry_delay_ms: u32,
     /// Per-request timeout in ms (default 60s).
     pub timeout_ms: u32,
-    /// Adaptive tuning (TCP-style ramp over real transfers). Off by default
-    /// so legacy callers behave exactly as before.
+    /// Adaptive tuning (TCP-style ramp over real transfers), off by default.
+    ///
+    /// Opting in is what makes the engine measure the link: without it the
+    /// knobs below are used exactly as configured.
     ///
     /// In the browser a settled result is persisted in `localStorage` (per
     /// origin + direction) for up to `tune_ttl_ms`, so a page refresh does not
@@ -71,12 +73,13 @@ pub struct ClientConfig {
     /// How long a cached tuning result stays usable (milliseconds, default
     /// 1 hour). `0` disables the cache entirely — every transfer re-ramps.
     pub tune_ttl_ms: u64,
-    /// Client-side compression level policy.
+    /// Client-side compression level policy, defaulting to
+    /// [`CompressLevel::Balanced`].
     ///
-    /// Absent config resolves to [`CompressLevel::Balanced`] (the server's
-    /// advertised default = the historical level-1 behavior), so callers
-    /// that never set it are byte-identical to pre-0.3.3. `compress: false`
-    /// still forces identity regardless of this field.
+    /// Absent config resolves to whatever the server advertises as its own
+    /// default level, so a client that never sets the field negotiates the
+    /// server's choice. `compress: false` still forces identity regardless of
+    /// this field.
     pub compress_level: CompressLevel,
 }
 
@@ -103,9 +106,9 @@ impl ClientConfig {
     /// Concurrent HTTP requests the client may keep in flight:
     /// `concurrency` files × the widest per-file window.
     ///
-    /// Sizing the shared in-flight pool to `concurrency` alone made the
-    /// per-file window ineffective (see `tune::request_budget`); the pool is a
-    /// bound, not the parallelism knob.
+    /// The pool is a *bound*, not the parallelism knob: sized to
+    /// `concurrency` alone it would clamp every file to one request and make
+    /// the per-file window ineffective (see `tune::request_budget`).
     pub fn request_budget(&self) -> usize {
         crate::tune::request_budget(
             self.concurrency,
@@ -172,10 +175,11 @@ impl ClientConfig {
         if !opts.is_object() {
             return cfg;
         }
-        // Legacy `compress: bool` compatibility: when `compressLevel` is
-        // absent, `compress: true` maps to Balanced (the old fixed level-1
-        // behavior) and `compress: false` maps to identity (the level is
-        // then unused anyway). An explicit `compressLevel` wins.
+        // With no `compressLevel` in the options, the `compress: bool` flag
+        // picks the policy: `compress: true` maps to Balanced (the server's
+        // advertised default level) and `compress: false` maps to identity
+        // (the level is then unused anyway). An explicit `compressLevel`
+        // wins.
         if let Some(level) = opt_compress_level(opts) {
             cfg.compress_level = level;
         } else if let Some(compress) = opt_bool(opts, "compress") {
@@ -352,7 +356,7 @@ mod tests {
             CompressLevel::Fixed(3)
         );
         // `null` (the SDK's default when the option is unset) falls back to
-        // the legacy `compress` flag → Balanced.
+        // the `compress` flag → Balanced.
         assert_eq!(
             with("compressLevel", &JsValue::NULL).compress_level,
             CompressLevel::Balanced

@@ -109,8 +109,8 @@ pub fn is_valid_zrip_level(level: i32) -> bool {
 /// Clamp a requested zrip level into `min..=max`.
 ///
 /// Servers must never trust a client-supplied level: out-of-range requests
-/// are clamped (and the actual level echoed back on the response header),
-/// keeping the wire format honest without hard-failing older clients.
+/// are clamped, and the level actually used is echoed back on the response
+/// header, so the wire format always reports what the client got.
 pub fn negotiate_level(req: Option<i32>, min: i32, max: i32, default: i32) -> i32 {
     if min > max {
         // Empty range (misconfigured advertisement): fall back to the
@@ -276,7 +276,8 @@ impl Compressor for ZripCompressor {
             .encoder
             .as_mut()
             .ok_or_else(|| std::io::Error::other("compressor already finished"))?;
-        // Finalize the previous chunk's frame and hand its compressed bytes back.
+        // Finalize the previous chunk's frame and hand back its compressed
+        // bytes.
         if self.dirty {
             let finished = encoder.reset(Vec::new())?;
             out.extend_from_slice(&finished);

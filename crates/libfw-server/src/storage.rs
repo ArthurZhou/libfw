@@ -324,8 +324,8 @@ impl StorageBackend for FsStorage {
                 }
                 // Resumable sessions are driven by the per-block probe (the
                 // client asks "what ranges do you have?" and sends only the
-                // gaps), not by a contiguous offset append, so a legacy
-                // `Resume` mode is not applicable here.
+                // gaps), not by a contiguous offset append, so a
+                // `WriteMode::Resume` request has no meaning here.
                 WriteMode::Resume { .. } => {
                     return Err(StorageError::Unsupported(
                         "session upload does not support contiguous resume; use the block probe".into(),
@@ -479,13 +479,12 @@ impl StorageBackend for FsStorage {
                     Ok(ft) => ft,
                     Err(_) => continue,
                 };
-                // On Linux/macOS `FileType::is_dir()` and `is_symlink()` are
-                // mutually exclusive: a symlink to a directory reports
-                // `is_symlink()=true`, `is_dir()=false`. The old nested guard
-                // (`is_dir() && !is_symlink()`) was therefore always true when
-                // `is_dir()` was true, and symlink-to-directory entries were
-                // skipped by the outer `is_symlink()` check. Simplified below
-                // to make the intent unambiguous.
+                // On Linux/macOS `is_dir()` and `is_symlink()` are mutually
+                // exclusive: a symlink to a directory reports
+                // `is_symlink()=true`, `is_dir()=false`. The symlink check
+                // below therefore rules out every symlinked directory
+                // before the walk descends into it, and the two tests can
+                // stay independent.
                 if ft.is_symlink() {
                     // Never follow symlinks into directories.
                     continue;

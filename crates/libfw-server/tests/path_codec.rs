@@ -1,6 +1,6 @@
 //! End-to-end tests for shadow-path translation (`PathCodec`).
 //!
-//! Covers the design's test plan:
+//! Covers the shadow contract end to end:
 //! - encrypted round-trip: shadow from `encode()` works in upload/download
 //! - `list_dir` returns shadows that are directly usable in a follow-up
 //!   transfer (the "link-level" contract)
@@ -199,8 +199,8 @@ async fn allowed_paths_apply_to_real_path_not_shadow() {
     assert_eq!(resp.status(), StatusCode::OK, "allowed subtree must pass");
 
     // Outside the allowed subtree: the shadow decodes fine, but the real
-    // path fails authorization → 403, exactly like the pre-translation
-    // behavior for a real-path request.
+    // path fails authorization → 403, the same verdict a direct real-path
+    // request gets.
     let out_shadow = codec.encode("etc/passwd");
     let resp = app
         .clone()

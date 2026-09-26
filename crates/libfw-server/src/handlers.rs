@@ -95,8 +95,8 @@ impl IntoResponse for ApiError {
                 )
                     .into_response();
             }
-            // A resume offset that no longer matches tells the client to
-            // reset its local progress (RFC 7232 / libfw protocol).
+            // A resume offset that disagrees with the on-disk size tells the
+            // client to reset its local progress (RFC 7232 / libfw protocol).
             ApiError::Storage(StorageError::WriteFailed { .. }) => {
                 return (
                     StatusCode::PRECONDITION_FAILED,
@@ -307,10 +307,9 @@ fn negotiate_download_format(state: &ServerState, req_headers: &HeaderMap) -> Co
 ///
 /// Returns `(level, echo)`: `echo` is true when the server actively
 /// negotiated a level and the response must carry the actual level back on
-/// [`HEADER_COMPRESS_LEVEL`]. When the builder left `zrip_levels` unset
-/// (legacy mode) the header is ignored, downloads use the default level and
-/// nothing is echoed — exactly the pre-0.3.3 behavior. Identity responses
-/// never echo (there is no compression to negotiate).
+/// [`HEADER_COMPRESS_LEVEL`]. `zrip_levels` unset → the header is ignored,
+/// downloads use [`ZRIP_DEFAULT_LEVEL`] and nothing is echoed. Identity
+/// responses never echo (there is no compression to negotiate).
 fn negotiate_download_level(
     state: &ServerState,
     format: CompressionFormat,
@@ -444,12 +443,6 @@ async fn write_at_batch(
     Ok(())
 }
 
-/// Handle one request of the concurrent "session" upload protocol.
-///
-/// Data-chunk requests write their body at the ABSOLUTE `x-libfw-offset`
-/// into a shared per-session temp file and do not finalize; the
-/// `x-libfw-final` (commit) request verifies the temp holds exactly
-/// `meta.size` bytes, then atomically renames it into place.
 /// Derive a short, stable owner tag from a token subject.
 ///
 /// The tag is embedded in the session temp filename so that sessions belonging
@@ -469,6 +462,12 @@ fn owner_tag(sub: &str) -> String {
     out
 }
 
+/// Handle one request of the concurrent "session" upload protocol.
+///
+/// Data-chunk requests write their body at the ABSOLUTE `x-libfw-offset`
+/// into a shared per-session temp file and do not finalize; the
+/// `x-libfw-final` (commit) request verifies the temp holds exactly
+/// `meta.size` bytes, then atomically renames it into place.
 async fn upload_session(
     state: &ServerState,
     path: &str,
@@ -602,8 +601,8 @@ async fn upload_session(
         // missing MIDDLE chunk extend the temp to `meta.size` with a
         // zero-filled gap, which must never be committed as a complete file.
         // Reject a commit whose received ranges don't fully cover the file.
-        // Sinks that don't track ranges return an empty list; for those we
-        // fall back to the length-only check (backward compatibility).
+        // Sinks that don't track ranges return an empty list; for those the
+        // length-only check above is the strongest available invariant.
         let received = sink.received_ranges().await?;
         if !received.is_empty() {
             let covered: u64 = received.iter().map(|r| r.end.saturating_sub(r.start)).sum();
@@ -665,9 +664,8 @@ pub(crate) async fn upload(
     // Optional per-upload session id. When present the client pipelines many
     // chunks in flight, each carrying its ABSOLUTE `x-libfw-offset` and
     // written into a shared per-session temp file (positional writes); only
-    // the `x-libfw-final` request commits. Absent → legacy sequential
-    // per-request upload (Create/Overwrite/Resume) — fully backward
-    // compatible with older clients.
+    // the `x-libfw-final` request commits. Absent → sequential per-request
+    // upload (Create/Overwrite/Resume).
     if let Some(session) = headers
         .get(HEADER_SESSION)
         .and_then(|v| v.to_str().ok())
@@ -765,8 +763,8 @@ pub(crate) async fn upload(
     // On the final chunk, the committed size must EXACTLY match the
     // client-declared `meta.size` (write_batch already rejects overruns;
     // this rejects undersized/truncated final bodies so a partial file can
-    // never be committed as a complete one). Older clients that omit the
-    // header keep the previous behavior.
+    // never be committed as a complete one). Omitting `x-libfw-final` skips
+    // this check: the declared size is then only an upper bound.
     let final_size = resume_offset.saturating_add(appended);
     if final_chunk && final_size != meta.size {
         let _ = sink.abort().await;
