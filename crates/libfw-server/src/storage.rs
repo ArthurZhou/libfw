@@ -506,12 +506,17 @@ impl StorageBackend for FsStorage {
                     .map(|d| UNIX_EPOCH + d)
                     .unwrap_or(UNIX_EPOCH);
                 if modified < deadline {
-                    let _ = tokio::fs::remove_file(entry.path()).await;
-                    // Remove the parallel range sidecar (`<temp>.blocks`).
+                    // A sidecar is itself a `.libfw-sess-*` entry, so the walk
+                    // reaches it too: it goes with its temp, and an orphaned
+                    // one is still swept on its own pass. Only a temp counts,
+                    // keeping the result a number of sessions.
+                    let is_sidecar = name.ends_with(".blocks");
                     let mut sidecar = entry.path().as_os_str().to_owned();
                     sidecar.push(".blocks");
                     let _ = tokio::fs::remove_file(PathBuf::from(sidecar)).await;
-                    removed += 1;
+                    if tokio::fs::remove_file(entry.path()).await.is_ok() && !is_sidecar {
+                        removed += 1;
+                    }
                 }
             }
         }
@@ -983,6 +988,34 @@ mod tests {
         assert!(!dir.path().join(".libfw-sess-oldid-a.bin.blocks").exists());
         assert!(fresh.exists(), "fresh temp survives");
         assert!(dir.path().join("real.txt").exists(), "user file survives");
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_sessions_sweeps_orphaned_sidecars_without_counting_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path());
+
+        // A sidecar whose temp is already gone (a crash between the two
+        // writes): it must still be swept, or it leaks for the process
+        // lifetime, but it is not a session in its own right.
+        let orphan = dir.path().join(".libfw-sess-goneid-a.bin.blocks");
+        std::fs::write(&orphan, b"[[0,7]]").unwrap();
+        let old = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(7 * 24 * 3600))
+            .unwrap();
+        assert!(filetime_set(&orphan, old).is_ok(), "failed to age the orphan");
+
+        // A fresh orphan must survive until it goes stale.
+        let fresh_orphan = dir.path().join(".libfw-sess-newid-a.bin.blocks");
+        std::fs::write(&fresh_orphan, b"[[0,7]]").unwrap();
+
+        let removed = storage
+            .cleanup_stale_sessions(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(removed, 0, "an orphaned sidecar is not a session");
+        assert!(!orphan.exists(), "the stale orphan is swept");
+        assert!(fresh_orphan.exists(), "fresh orphan survives");
     }
 
     #[tokio::test]
