@@ -1,7 +1,7 @@
 //! Native (non-WASM) client: an async Rust transport for the libfw protocol.
 //!
 //! This is the "Rust crate" half of libfw-client. It speaks the exact same
-//! wire protocol as the browser engine (see [`crate::wasm`]) — resumable
+//! wire protocol as the browser engine (`wasm` module) — resumable
 //! `Range` downloads, the tus-style *session* upload protocol, zrip
 //! compression and `/capabilities` driven adaptive tuning — but over
 //! `tokio` + `reqwest` instead of `fetch`/XHR, so a plain Rust binary,
@@ -11,7 +11,7 @@
 //!
 //! * [`ClientConfig`] — the same knobs (concurrency, windows, chunk size,
 //!   retries, timeouts, `auto_tune`, compression policy).
-//! * [`crate::tune`] — the same adaptive tuning engine, so "good vs. bad
+//! * The same adaptive tuning engine, so "good vs. bad
 //!   network" behaviour is identical to the SDK: it ramps the per-file
 //!   window, cross-file concurrency and chunk size against the server's
 //!   advertised limits and settles where the link saturates. The settle is
@@ -21,13 +21,13 @@
 //! # What differs from the browser engine
 //!
 //! * Resume state lives in a small JSON sidecar next to the destination file
-//!   instead of IndexedDB (see [`download`]'s `resume` helpers).
+//!   instead of IndexedDB.
 //! * Tuning state is **in memory only**, for the lifetime of the client: a
 //!   settle is reused by later transfers of the same client, and a new client
 //!   always re-measures the link from the advertised minimums. The browser
 //!   engine additionally caches its settle in `localStorage` (bounded by
-//!   `tune_ttl_ms`, see [`crate::tune::TuningEngine::set_cache`]); the native
-//!   client installs no store, so `tune_ttl_ms` has no effect here.
+//!   `tune_ttl_ms`); the native client installs no store, so `tune_ttl_ms`
+//!   has no effect here.
 //! * No File System Access API: downloads are written with ordinary file IO.
 //! * **Cancellation is structural**: drop the transfer future (or wrap it in
 //!   `tokio::select!` / `tokio::time::timeout`). Both directions are

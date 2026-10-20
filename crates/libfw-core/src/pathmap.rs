@@ -8,9 +8,9 @@
 //!   bodies, listings, upload echoes).
 //! - [`decode`](PathCodec::decode): shadow → real (inbound; request URLs).
 //!
-//! Codecs operate on **canonical relative paths** (what
-//! [`validate_rel_path`](crate::validate_rel_path) produces): no leading
-//! `/`, no `.`/`..`, no empty segments. The root is `""`.
+//! Codecs operate on **canonical relative paths** (what the server's
+//! `validate_rel_path` produces): no leading `/`, no `.`/`..`, no empty
+//! segments. The root is `""`.
 //!
 //! Authorization is unaffected by translation: the server validates the
 //! *real* path against `allowed_paths` (see the `resolve_client_path`
@@ -21,7 +21,7 @@
 //! it decodes the longest decodable segment prefix and appends the
 //! remainder verbatim, then authorizes the combined real path — a
 //! directory shadow covers its whole subtree, with no per-path shadow
-//! minting. Whole-string codecs such as [`EncryptedPathCodec`] get this
+//! minting. Whole-string codecs such as `EncryptedPathCodec` get this
 //! for free; prefix codecs like [`MountPathCodec`] already behave that
 //! way natively.
 //!
@@ -30,7 +30,7 @@
 //! | Codec | Shadow looks like | Use when |
 //! |---|---|---|
 //! | [`IdentityPathCodec`] | the real path | default; no translation |
-//! | [`EncryptedPathCodec`] | `v1.<base64url>` opaque blob | real paths must be hidden completely |
+//! | `EncryptedPathCodec` | `v1.<base64url>` opaque blob | real paths must be hidden completely |
 //! | [`MountPathCodec`] | a readable alias (`home/alice/…`) | readable, stable shadow namespaces |
 
 #[cfg(feature = "path-encrypt")]
@@ -289,7 +289,7 @@ impl EncryptedPathCodec {
     /// # Panics
     ///
     /// If the host has no usable OS CSPRNG: AES-GCM nonces must be
-    /// unpredictable (see [`random_bytes`]), so the codec refuses to exist
+    /// unpredictable (see `random_bytes`), so the codec refuses to exist
     /// rather than silently emit predictable nonces. Use
     /// [`EncryptedPathCodec::from_hex`] to get this as a recoverable error.
     pub fn new(key: [u8; 32]) -> Self {

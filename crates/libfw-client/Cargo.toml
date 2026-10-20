@@ -8,6 +8,13 @@ description = "libfw client: native Rust client + WASM engine + JS SDK"
 keywords = ["wasm", "browser", "upload", "download", "resumable"]
 categories = ["wasm", "web-programming"]
 
+# docs.rs builds on a native target: it documents the reusable engine and the
+# native client. The `wasm` module is compiled only for `wasm32`, so its
+# JavaScript-facing API is documented in `sdk/README.md` and `sdk/index.d.ts`.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

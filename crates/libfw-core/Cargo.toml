@@ -8,6 +8,10 @@ description = "Shared data structures, traits and protocol constants for libfw"
 keywords = ["transfer", "streaming", "storage", "http", "range"]
 categories = ["network-programming", "compression"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

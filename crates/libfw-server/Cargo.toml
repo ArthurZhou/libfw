@@ -8,6 +8,10 @@ description = "Embeddable libfw server handlers/middleware (axum integration)"
 keywords = ["server", "axum", "http", "streaming", "transfer"]
 categories = ["network-programming", "web-programming"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 default = []
 # Forward the encrypted-shadow-path codec from libfw-core.

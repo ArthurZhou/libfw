@@ -12,9 +12,10 @@
 //!   protocol — resumable `Range` downloads, the session upload protocol,
 //!   zrip compression and the same adaptive tuning engine. Enable it by
 //!   depending on this crate from a normal Rust binary/library.
-//! * **Browser/WASM** ([`LibfwClient`], `wasm32` only): the engine behind the
+//! * **Browser/WASM** (`LibfwClient`, `wasm32` only): the engine behind the
 //!   `sdk/` npm package, which additionally supports the File System Access
-//!   API and IndexedDB resume state.
+//!   API and IndexedDB resume state. Its JavaScript API is documented in
+//!   `sdk/README.md` and `sdk/index.d.ts`.
 #![allow(dead_code)]
 #![recursion_limit = "512"]
 

@@ -83,7 +83,7 @@ pub struct TransferPlan {
 
 impl TransferPlan {
     /// Build a plan for `file` using the protocol default
-    /// [`CHUNK_SIZE`](crate::CHUNK_SIZE).
+    /// [`CHUNK_SIZE`] (bytes)
     pub fn new(file: FileMeta) -> Self {
         TransferPlan::with_chunk_size(file, CHUNK_SIZE)
     }
@@ -152,12 +152,12 @@ pub fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Serialize [`FileMeta`] for the [`HEADER_FILE_META`] header.
+/// Serialize [`FileMeta`] for the [`crate::HEADER_FILE_META`] header.
 pub fn encode_file_meta(meta: &FileMeta) -> String {
     serde_json::to_string(meta).expect("FileMeta serializes")
 }
 
-/// Parse [`FileMeta`] from the [`HEADER_FILE_META`] header.
+/// Parse [`FileMeta`] from the [`crate::HEADER_FILE_META`] header.
 pub fn decode_file_meta(header: &str) -> Result<FileMeta, serde_json::Error> {
     serde_json::from_str(header)
 }
@@ -217,7 +217,7 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Encode [`FileMeta`] as base64 for the [`HEADER_FILE_META`] header.
+/// Encode [`FileMeta`] as base64 for the [`crate::HEADER_FILE_META`] header.
 ///
 /// The raw JSON is base64-encoded so that non-Latin-1 virtual paths (e.g.
 /// CJK filenames) survive HTTP header transport — browsers reject header
@@ -226,7 +226,7 @@ pub fn encode_file_meta_header(meta: &FileMeta) -> String {
     base64_encode(encode_file_meta(meta).as_bytes())
 }
 
-/// Decode base64 [`FileMeta`] from the [`HEADER_FILE_META`] header.
+/// Decode base64 [`FileMeta`] from the [`crate::HEADER_FILE_META`] header.
 pub fn decode_file_meta_header(header: &str) -> Result<FileMeta, serde_json::Error> {
     let raw = base64_decode(header)
         .map_err(|e| serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;

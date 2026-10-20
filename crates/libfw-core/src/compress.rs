@@ -5,7 +5,7 @@
 //! Both [`Compressor`] and [`Decompressor`] are *stream-oriented*: they
 //! accept bounded input chunks and produce bounded output chunks, so the
 //! heap footprint of processing a file does **not** grow with the file
-//! size. The [`STREAM_BUF_SIZE`](crate::STREAM_BUF_SIZE) sliding window
+//! size. The [`STREAM_BUF_SIZE`] sliding window
 //! keeps memory constant (~64 KiB typical, capped well below 4 MiB even
 //! for adversarial frames).
 //!
@@ -30,7 +30,7 @@
 //!   ([`MAX_FRAME_OUTPUT`]) at a time.
 //!
 //! The server should feed [`Compressor::compress`] in
-//! [`STREAM_BUF_SIZE`](crate::STREAM_BUF_SIZE) windows (64 KiB), keeping
+//! [`STREAM_BUF_SIZE`] windows (64 KiB), keeping
 //! frames ~64 KiB and the client's transient buffers small.
 
 use std::io::Write;
@@ -51,7 +51,7 @@ pub enum CompressionFormat {
 
 impl CompressionFormat {
     /// Wire representation used in
-    /// [`HEADER_COMPRESS`](crate::HEADER_COMPRESS) / `Content-Encoding`.
+    /// [`crate::HEADER_COMPRESS`] / `Content-Encoding`.
     pub fn as_str(self) -> &'static str {
         match self {
             CompressionFormat::None => "identity",
@@ -71,13 +71,13 @@ impl CompressionFormat {
 
 /// Safety ceiling for the decompressed size of a single frame.
 ///
-/// The protocol keeps frames ≤ [`CHUNK_SIZE`](crate::CHUNK_SIZE); this
+/// The protocol keeps frames ≤ [`CHUNK_SIZE`]; this
 /// limit is a guard against buggy or hostile peers.
 pub const MAX_FRAME_OUTPUT: usize = CHUNK_SIZE as usize;
 
 /// Maximum compressed bytes buffered while waiting for a frame boundary.
 ///
-/// The worst-case incompressible [`CHUNK_SIZE`](crate::CHUNK_SIZE) chunk
+/// The worst-case incompressible [`CHUNK_SIZE`] chunk
 /// compresses to ≈ chunk size + framing overhead, hence the slack.
 pub const MAX_PENDING_FRAME: usize = CHUNK_SIZE as usize + STREAM_BUF_SIZE;
 
@@ -131,7 +131,7 @@ pub trait Compressor: Send {
 
     /// Compress `input`, appending compressed bytes to `out`.
     ///
-    /// `input` should be kept ≤ [`CHUNK_SIZE`](crate::CHUNK_SIZE) to keep
+    /// `input` should be kept ≤ [`CHUNK_SIZE`] to keep
     /// the output frames small and memory constant. When the next chunk
     /// arrives, the previous chunk's frame is finalized and emitted.
     fn compress(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<(), CompressError>;

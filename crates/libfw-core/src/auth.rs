@@ -2,7 +2,7 @@
 //!
 //! The server-side flow is: extract `Authorization: Bearer <token>` →
 //! verify it (via a [`TokenVerifier`] of your choice) into
-//! [`TokenClaims`](crate::claims::TokenClaims) → ask a [`Validator`]
+//! [`TokenClaims`] → ask a [`Validator`]
 //! whether the claims allow the requested `path` + [`Action`].
 
 use crate::claims::{Permission, TokenClaims};

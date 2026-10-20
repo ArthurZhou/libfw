@@ -463,8 +463,8 @@ async fn validate_protocol(req: Request, next: Next) -> Response {
 /// - `GET  /capabilities` — capability advertisement (JSON, **public**:
 ///   no auth — the payload is a non-sensitive contract for adaptive clients)
 ///
-/// All routes first pass through [`validate_protocol`], which enforces the
-/// `x-libfw-protocol` handshake shared with the WASM client.
+/// All routes first pass through the protocol-version middleware, which
+/// enforces the `x-libfw-protocol` handshake shared with the WASM client.
 pub fn router(state: Arc<ServerState>) -> Router {
     use axum::routing::{get, post};
 

@@ -1,41 +1,47 @@
 # libfw Rust client example
 
-A minimal **native Rust** client for libfw: no browser, no WASM, no npm — just
-`tokio` + `reqwest` talking the same wire protocol as the browser SDK.
-
-It exercises the three things you need when embedding the client in your own
+A minimal **native Rust** client: no browser, no WASM, no npm — just
+`tokio` + `reqwest` speaking the same wire protocol as the browser SDK. It
+exists to show the three things you need when embedding the client in your own
 program:
 
 * building a `ClientConfig` (the same knobs as the SDK options),
-* installing an event sink for progress / adaptive-tuning updates, and
+* installing an event sink for progress and tuning updates,
 * calling the async transfer methods.
+
+Full client reference: [docs/native-client.md](../../docs/native-client.md).
 
 ## Run it
 
-Start any libfw server first — the bundled axum example is the quickest:
+Start a libfw server first — the bundled axum example is the quickest:
 
 ```bash
-# terminal 1 — server on :8080 with the dev token
+# terminal 1 — server on :8080, token `dev-token`
 cargo run -p axum-server -- dev-data 8080
 
-# terminal 2 — this example (flags per call, or export LIBFW_URL/LIBFW_TOKEN)
+# terminal 2 — the CLI
 cargo run -p rust-client -- --url http://127.0.0.1:8080 --token dev-token ls
-cargo run -p rust-client -- --url http://127.0.0.1:8080 --token dev-token upload ./Cargo.toml uploads/Cargo.toml
-cargo run -p rust-client -- --url http://127.0.0.1:8080 --token dev-token download uploads/Cargo.toml ./Cargo.toml.bak
+cargo run -p rust-client -- --url http://127.0.0.1:8080 --token dev-token \
+    upload ./Cargo.toml uploads/Cargo.toml
+cargo run -p rust-client -- --url http://127.0.0.1:8080 --token dev-token \
+    download uploads/Cargo.toml ./Cargo.toml.bak
 cargo run -p rust-client -- --url http://127.0.0.1:8080 --token dev-token capabilities
 ```
 
-The base URL and token are read from `LIBFW_URL` / `LIBFW_TOKEN`, or from
-`--url` / `--token`.
+The base URL and token are read from `LIBFW_URL` / `LIBFW_TOKEN`, or passed
+with `--url` / `--token`.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `ls [DIR]` | List a remote directory (`GET /dir/...`). |
-| `download <REMOTE> <DEST>` | Download one file, or a whole folder tree (`stat` decides: a folder answers 404 to `HEAD`). |
-| `upload <LOCAL> [REMOTE]` | Upload one file, or a whole folder tree (structure is mirrored). Returns the payload bytes actually sent — `0` when the server already held everything. |
-| `capabilities` | Print the server's `/capabilities` payload (the contract the adaptive engine negotiates against). |
+| `ls [DIR]` | list a remote directory (`GET /dir/...`) |
+| `download <REMOTE> <DEST>` | download one file, or a whole folder tree (`HEAD` 404 means folder) |
+| `upload <LOCAL> [REMOTE]` | upload one file or a folder tree; `REMOTE` defaults to the local name |
+| `capabilities` | print `/capabilities` (the contract the tuning engine negotiates) |
+
+`download` and `upload` auto-detect files vs folders. Both print the number of
+bytes moved **by this run** — `0` means everything was already in place.
 
 ## Options
 
@@ -43,7 +49,8 @@ The base URL and token are read from `LIBFW_URL` / `LIBFW_TOKEN`, or from
 --url <URL>                  Server base URL            (env LIBFW_URL)
 --token <TOKEN>              Bearer token               (env LIBFW_TOKEN)
 --concurrency <N>            Max concurrent files       (default 4)
---window <N>                 Per-file in-flight window  (default 8 upload / 4 download)
+--window <N>                 Per-file window, both directions
+                             (default 8 upload / 4 download when unset)
 --chunk-size <BYTES>         Shared chunk size          (default 2 MiB)
 --max-retries <N>            Retries per block          (default 3)
 --timeout-ms <MS>            Stall timeout              (default 60000)
@@ -51,35 +58,35 @@ The base URL and token are read from `LIBFW_URL` / `LIBFW_TOKEN`, or from
 --no-compress                Disable zrip compression
 --auto-tune                  Adapt to the link via /capabilities
 --quiet, -q                  No progress output
+--help, -h                   Usage
 ```
+
+`--window` sets `upload_window` and `download_window` to the same value;
+without it the library defaults apply (8 and 4).
 
 ## What the client does for you
 
-* **Resumable downloads** — a `HEAD` gives the authoritative size + ETag, a
-  JSON sidecar next to the destination remembers how far it got, and only the
-  remaining byte range is fetched. Re-running a completed download is a no-op.
-* **Resumable uploads** — the tus-style *session* protocol: the client probes
-  the server for the ranges it already holds and re-sends only the gaps.
-* **Parallel transfer** — `--window` concurrent `Range` GETs per file and
+* **Resumable downloads** — `HEAD` gives the authoritative size + ETag, a JSON
+  sidecar next to the destination records progress, and only the remaining
+  bytes are fetched. Re-running a finished download is a no-op.
+* **Resumable uploads** — the tus-style session protocol: probe which ranges
+  the server already holds, then send only the gaps.
+* **Parallel transfer** — `--window` concurrent range GETs per file and
   `--concurrency` files in flight, so one file's throughput is bounded by the
-  link rather than by a single connection's `chunkSize / RTT`. Anything over
-  512 KiB is fetched as bounded ranges even at window 1, and the loop re-reads
-  the tuned window / chunk size before every batch — a mid-file ramp applies to
-  the download already in flight (one whole-file `206` could never be resumed,
-  parallelised or tuned).
-* **Compression** — zrip (zstd) frames on both directions; `--compress-level
-  auto` measures a real sample of the first uploaded file against the
-  advertised range and picks the best bytes-saved-vs-CPU trade-off.
-* **Adaptive tuning** — with `--auto-tune` the engine reads the server's
-  advertised limits, probes the link with a minimal configuration first, and
-  then TCP-style ramps the per-file window and cross-file concurrency until it
-  saturates. The chunk size is sized from the measured throughput (about
-  100 ms of it, clamped into the advertised range), so a wider/faster link
-  gets fewer, bigger requests. A settle is reused by later transfers **in the
-  same client** (a folder of many files does not re-ramp per file); the native
-  client persists nothing, so a new process re-measures the link from the
-  advertised minimums (the browser engine caches its settle in `localStorage`,
-  see the SDK's `tuneTtlMs`).
+  link rather than a single connection's `chunkSize / RTT`. Anything over
+  512 KiB is chunked even at window 1, and the tuned window/chunk size is
+  re-read before each batch, so a mid-file ramp applies to the file in
+  flight.
+* **Compression** — zrip (zstd) frames both ways. `--compress-level auto`
+  benchmarks a real sample of the first uploaded file within the advertised
+  range and picks the best bytes-saved-per-CPU level.
+* **Adaptive tuning** — `--auto-tune` reads the server's limits, probes with
+  the minimum configuration, then TCP-style ramps the per-file window and
+  cross-file concurrency. The chunk size follows measured throughput, it is
+  not a ramp dimension. A settle is reused by later transfers in the same
+  client; the native client persists nothing, so a new process re-measures
+  the link (the browser engine caches in `localStorage`; see the SDK's
+  `tuneTtlMs`).
 
 ## Embedding it
 
@@ -109,19 +116,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Notes
 
-* Downloads preserve the **virtual** path structure below `DEST`, exactly like
+* Downloads preserve the **virtual** path structure under `DEST`, exactly like
   the browser SDK: `download tree ./out` writes `./out/tree/...`.
 * A committed upload removes the server-side range sidecar, so uploading the
   same file again re-sends it (positional writes keep that idempotent). Resume
   applies to *interrupted* uploads.
-* Very short transfers may finish before a 1-second measurement window closes,
-  in which case the tuning phase stays `ramping` at the advertised minimums —
-  that is expected, not an error.
-* There is no `pause()`/`cancel()` handle: cancellation is structural, i.e.
-  drop the transfer future (or wrap it in `tokio::select!` /
+* Very short transfers may finish before a 1-second measurement window closes;
+  the tuning phase then stays `ramping` at the advertised minimums. That is
+  expected, not an error.
+* There is no `pause()` / `cancel()` handle: cancellation is structural — drop
+  the transfer future (or wrap it in `tokio::select!` /
   `tokio::time::timeout`). Both directions resume, so abandoning a transfer
-  only costs the blocks that were in flight.
+  costs only the blocks in flight.
+* A directory answers `404` to `HEAD`; that is how `download` distinguishes a
+  folder from a file.
 
-See [`crates/libfw-client/src/native/`](../../crates/libfw-client/src/native/) for the
-implementation and `crates/libfw-client/tests/native_client.rs` for an
-integration suite that runs a real libfw server over TCP.
+Implementation: [`crates/libfw-client/src/native/`](../../crates/libfw-client/src/native/).
+Integration tests: `crates/libfw-client/tests/native_client.rs` (starts a real
+libfw server over TCP).
