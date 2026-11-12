@@ -87,15 +87,25 @@ fn two_mib_frame_decompresses_with_max_frame_output_budget() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_compressed_chunks_then_commit() {
+    // Repeated: this shape used to fail intermittently (32 of 40 runs) because
+    // `write_at` could complete with its bytes still in a user-space buffer
+    // and publish the range anyway, so the commit saw a short file under a
+    // fully-covered range set. One run in ten caught it; thirty do not.
+    for round in 0..30 {
+        concurrent_compressed_chunks_then_commit_once(round).await;
+    }
+}
+
+async fn concurrent_compressed_chunks_then_commit_once(round: usize) {
     let app = app();
     let data: Vec<u8> = (0..(libfw_core::CHUNK_SIZE as usize * 3)).map(|i| (i % 251) as u8).collect();
     let meta = libfw_core::metadata::FileMeta::new("c.bin", data.len() as u64, 0);
-    let session = "conc-sess";
+    let session = format!("conc-sess-{round}");
 
     // Probe creates the shared temp.
     let mut hdr = auth_header();
     hdr.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
-    hdr.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    hdr.insert(HEADER_SESSION, HeaderValue::from_str(&session).unwrap());
     hdr.insert(HEADER_OFFSET, HeaderValue::from_static("0"));
     hdr.insert(HEADER_SESSION_STATUS, HeaderValue::from_static("1"));
     let probe = app.clone().oneshot(request("POST", "/file/c.bin", hdr, Body::empty())).await.unwrap();
@@ -114,7 +124,7 @@ async fn concurrent_compressed_chunks_then_commit() {
 
         let mut hdr = auth_header();
         hdr.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
-        hdr.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+        hdr.insert(HEADER_SESSION, HeaderValue::from_str(&session).unwrap());
         hdr.insert(HEADER_OFFSET, HeaderValue::from_str(&start.to_string()).unwrap());
         hdr.insert(HEADER_COMPRESS, HeaderValue::from_static("zrip"));
         let app = app.clone();
@@ -128,7 +138,7 @@ async fn concurrent_compressed_chunks_then_commit() {
 
     let mut hdr = auth_header();
     hdr.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
-    hdr.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    hdr.insert(HEADER_SESSION, HeaderValue::from_str(&session).unwrap());
     hdr.insert(HEADER_OFFSET, HeaderValue::from_str(&data.len().to_string()).unwrap());
     hdr.insert(HEADER_FINAL, HeaderValue::from_static("1"));
     let commit = app.clone().oneshot(request("POST", "/file/c.bin", hdr, Body::empty())).await.unwrap();
@@ -136,10 +146,6 @@ async fn concurrent_compressed_chunks_then_commit() {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn chunk_larger_than_frame_cap_commits_when_split_into_small_frames() {
-    // A `chunkSize` of 4 MiB (larger than the server's MAX_FRAME_OUTPUT ==
-    // 2 MiB) must still upload: the client splits each chunk into ~64 KiB
-    // frames, so no single frame exceeds the cap and the per-call
-    // decompression budget (MAX_OUTPUT_PER_CALL) is never hit.
     let app = app();
     let data: Vec<u8> = (0..(libfw_core::CHUNK_SIZE as usize * 2 + 12_345))
         .map(|i| (i % 251) as u8)
@@ -158,7 +164,7 @@ async fn chunk_larger_than_frame_cap_commits_when_split_into_small_frames() {
 
     let mut hdr = auth_header();
     hdr.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
-    hdr.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    hdr.insert(HEADER_SESSION, HeaderValue::from_str(&session).unwrap());
     hdr.insert(HEADER_OFFSET, HeaderValue::from_static("0"));
     hdr.insert(HEADER_COMPRESS, HeaderValue::from_static("zrip"));
     let resp = app
@@ -175,7 +181,7 @@ async fn chunk_larger_than_frame_cap_commits_when_split_into_small_frames() {
 
     let mut hdr = auth_header();
     hdr.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
-    hdr.insert(HEADER_SESSION, HeaderValue::from_str(session).unwrap());
+    hdr.insert(HEADER_SESSION, HeaderValue::from_str(&session).unwrap());
     hdr.insert(HEADER_OFFSET, HeaderValue::from_str(&data.len().to_string()).unwrap());
     hdr.insert(HEADER_FINAL, HeaderValue::from_static("1"));
     let commit = app
@@ -194,5 +200,59 @@ async fn chunk_larger_than_frame_cap_commits_when_split_into_small_frames() {
     assert_eq!(resp.status(), StatusCode::OK);
     let got = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(got.to_vec(), data, "downloaded content must match the source");
+}
+
+/// A single request body far larger than the decompressor's per-CALL budget
+/// must still be accepted.
+///
+/// The client may use `chunkSize` up to 64 MiB, and it slices each chunk into
+/// ~64 KiB frames — so one request can legitimately carry ~1000 frames. The
+/// server used to hand the whole body chunk to one `decompress()` call, which
+/// tripped `MAX_OUTPUT_PER_CALL` (16 MiB) and rejected a valid upload with
+/// `400 frame output exceeds safety limit`. The budget protects against a
+/// multi-frame bomb; it must not cap a legitimate body.
+#[tokio::test(flavor = "multi_thread")]
+async fn body_with_many_frames_exceeding_per_call_budget_is_accepted() {
+    let app = app();
+    // 24 MiB of incompressible-ish data: ~384 frames, i.e. well past the
+    // 16 MiB per-call budget while staying a legal chunk size.
+    let data: Vec<u8> = (0..(24 * 1024 * 1024))
+        .map(|i: usize| ((i.wrapping_mul(2654435761)) >> 13) as u8)
+        .collect();
+    let meta = libfw_core::metadata::FileMeta::new("many.bin", data.len() as u64, 0);
+
+    // One frame per 64 KiB slice, exactly like the client's encoder.
+    let mut payload = Vec::new();
+    for w in data.chunks(libfw_core::STREAM_BUF_SIZE) {
+        let mut enc = compressor(CompressionFormat::Zrip).unwrap();
+        enc.compress(w, &mut payload).unwrap();
+        enc.finish(&mut payload).unwrap();
+    }
+
+    let mut hdr = auth_header();
+    hdr.insert(HEADER_FILE_META, HeaderValue::from_str(&encode_file_meta_header(&meta)).unwrap());
+    hdr.insert(HEADER_OFFSET, HeaderValue::from_static("0"));
+    hdr.insert(HEADER_COMPRESS, HeaderValue::from_static("zrip"));
+    hdr.insert(HEADER_FINAL, HeaderValue::from_static("1"));
+    let resp = app
+        .clone()
+        .oneshot(request("POST", "/file/many.bin", hdr, Body::from(payload)))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "a legal multi-frame body must not be rejected: {:?}",
+        resp.into_body().collect().await.unwrap().to_bytes()
+    );
+
+    let resp = app
+        .oneshot(request("GET", "/file/many.bin", auth_header(), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(got.len(), data.len(), "committed size must match");
+    assert_eq!(got.as_ref(), data.as_slice(), "content must round-trip");
 }
 

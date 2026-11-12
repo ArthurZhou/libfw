@@ -913,6 +913,13 @@ impl UploadSink for FsSink {
             .write_all(buf)
             .await
             .map_err(|e| StorageError::write_failed(self.written, e))?;
+        // `tokio::fs::File` buffers in user space, so a completed `write_all`
+        // does not yet mean the bytes reached the kernel — and `len()`, which
+        // the commit path uses to size the file, would under-report them.
+        self.file
+            .flush()
+            .await
+            .map_err(|e| StorageError::write_failed(self.written, e))?;
         self.written += buf.len() as u64;
         Ok(())
     }
@@ -925,6 +932,20 @@ impl UploadSink for FsSink {
             .map_err(|e| StorageError::write_failed(offset, e))?;
         self.file
             .write_all(buf)
+            .await
+            .map_err(|e| StorageError::write_failed(offset, e))?;
+        // Flush BEFORE publishing the range below.
+        //
+        // `tokio::fs::File::write_all` can complete with the bytes still in a
+        // user-space buffer, so a concurrent probe or commit that trusted the
+        // shared range set would see "range covered" while `metadata().len()`
+        // still reported a shorter file. That is exactly how a correct 8-way
+        // concurrent upload got rejected with "commit yields N bytes but the
+        // declared file size is M" (32 of 40 runs). The range is the promise
+        // that these bytes are on disk, so it may only be recorded once they
+        // are.
+        self.file
+            .flush()
             .await
             .map_err(|e| StorageError::write_failed(offset, e))?;
         // Track the highest extent written (used by `len`-style bookkeeping;

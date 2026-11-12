@@ -15,8 +15,8 @@ use libfw_core::auth::{Action, AuthError};
 use libfw_core::capabilities::Capabilities;
 use libfw_core::claims::TokenClaims;
 use libfw_core::compress::{
-    CompressionFormat, Compressor, MAX_OUTPUT_PER_CALL, ZRIP_DEFAULT_LEVEL,
-    compressor_with_level, decompressor_with_limit, negotiate_level,
+    CompressionFormat, Compressor, Decompressor, MAX_OUTPUT_PER_CALL, MAX_PENDING_FRAME,
+    ZRIP_DEFAULT_LEVEL, compressor_with_level, decompressor_with_limit, negotiate_level,
 };
 use libfw_core::metadata::{FileMeta, decode_file_meta_header};
 use libfw_core::storage::{UploadSink, WriteMode};
@@ -443,6 +443,35 @@ async fn write_at_batch(
     Ok(())
 }
 
+/// Feed one body chunk through the decompressor in budget-sized slices.
+///
+/// [`MAX_OUTPUT_PER_CALL`] caps how many bytes ONE `decompress()` call may
+/// append, which is a memory-spike guard against a multi-frame bomb — not a
+/// limit on a legitimate upload body. A body arrives in whatever slices the
+/// HTTP stack chose to surface, and the protocol lets a client put many
+/// independent frames in one request (the client's `chunkSize` may be tens of
+/// MiB, i.e. hundreds of 64 KiB input frames). Handing all of them to the
+/// decoder in one call blows the per-call budget and rejects a perfectly valid
+/// upload with `400 frame output exceeds safety limit`.
+///
+/// Slicing the input keeps every individual call well inside the budget while
+/// `out` is drained after each step, so the peak stays bounded no matter how
+/// large the request body was.
+fn decompress_into(
+    decomp: &mut Box<dyn Decompressor>,
+    chunk: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), ApiError> {
+    // One frame is at most `MAX_PENDING_FRAME` compressed bytes, so a slice of
+    // that size can only ever complete a handful of frames per call.
+    for slice in chunk.chunks(MAX_PENDING_FRAME) {
+        decomp
+            .decompress(slice, out)
+            .map_err(|e| ApiError::BadRequest(format!("compressed stream invalid: {e}")))?;
+    }
+    Ok(())
+}
+
 /// Derive a short, stable owner tag from a token subject.
 ///
 /// The tag is embedded in the session temp filename so that sessions belonging
@@ -563,9 +592,7 @@ async fn upload_session(
                     return Err(ApiError::Io(std::io::Error::other(e)));
                 }
             };
-            decomp
-                .decompress(&chunk, &mut out)
-                .map_err(|e| ApiError::BadRequest(format!("compressed stream invalid: {e}")))?;
+            decompress_into(&mut decomp, &chunk, &mut out)?;
             let data = std::mem::take(&mut out);
             if !data.is_empty() {
                 pending.extend_from_slice(&data);
@@ -742,9 +769,7 @@ pub(crate) async fn upload(
     let write_result: Result<(), ApiError> = async {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| ApiError::Io(std::io::Error::other(e)))?;
-            decomp
-                .decompress(&chunk, &mut out)
-                .map_err(|e| ApiError::BadRequest(format!("compressed stream invalid: {e}")))?;
+            decompress_into(&mut decomp, &chunk, &mut out)?;
             let data = std::mem::take(&mut out);
             if !data.is_empty() {
                 write_batch(
