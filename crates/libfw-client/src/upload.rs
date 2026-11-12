@@ -147,7 +147,7 @@ async fn post_chunk(
     // `on_progress` callback turns the wire ticks into real-time progress.
     let promise = xhr_post(&url, &headers, body, timeout_ms, on_progress)?;
     // Wall-clock duration of the request. XHR exposes no TTFB, so this is the
-    // only latency signal the upload path has; `upload_one_chunk` subtracts
+    // only latency signal the upload path has; `send_block` subtracts
     // the estimated transfer time to recover an RTT for the tuning engine.
     let started = now_ms();
     let status = JsFuture::from(promise)
@@ -313,23 +313,43 @@ pub(crate) fn missing_ranges(start: u64, end: u64, received: &[(u64, u64)]) -> V
     missing
 }
 
-/// Read, compress and POST one chunk with per-chunk retry + backoff.
+/// One chunk's bytes, already read and (when compressing) encoded, ready to
+/// PUT on the wire.
 ///
-/// `level` is the negotiated zrip level (only used when `compress` is true).
-async fn upload_one_chunk(
-    base_url: &str,
-    token: &str,
+/// Splitting preparation from sending is what makes pre-starting possible: the
+/// read and the zstd encode are local work that would otherwise sit *between*
+/// two requests, idling the link. With them in a separate future the scheduler
+/// can have the next block ready before the current one finishes.
+struct PreparedBlock {
+    start: u64,
+    end: u64,
+    len: u64,
+    /// Zero-copy `Blob` view of the range — the uncompressed fast path only.
+    pass_through: Option<web_sys::Blob>,
+    /// Compressed frames. Empty when `pass_through` is used or compression is
+    /// off (in which case the bytes ride in the `Blob`).
+    payload: Vec<u8>,
+}
+
+impl PreparedBlock {
+    fn body(&self) -> XhrBody<'_> {
+        match &self.pass_through {
+            Some(blob) => XhrBody::Blob(blob),
+            None => XhrBody::Bytes(&self.payload),
+        }
+    }
+}
+
+/// Read one chunk and, when compressing, encode it into zstd frames.
+async fn prepare_block(
     file: &FileEntry,
     callbacks: &Callbacks,
     control: &TaskControl,
-    tune: &TuneHandle,
-    config: &ClientConfig,
     start: u64,
     end: u64,
-    session: &str,
     compress: bool,
     level: i32,
-) -> Result<u64, LibfwError> {
+) -> Result<PreparedBlock, LibfwError> {
     control.wait_ready().await?;
     control.check()?;
 
@@ -399,6 +419,34 @@ async fn upload_one_chunk(
         Vec::new()
     };
 
+    Ok(PreparedBlock {
+        start,
+        end,
+        len,
+        pass_through,
+        payload,
+    })
+}
+
+/// POST one prepared chunk with per-chunk retry + backoff, and account for it.
+///
+/// `compress` only decides whether the request advertises `zrip`; the bytes are
+/// already encoded by [`prepare_block`].
+async fn send_block(
+    prepared: PreparedBlock,
+    base_url: &str,
+    token: &str,
+    file: &FileEntry,
+    callbacks: &Callbacks,
+    control: &TaskControl,
+    tune: &TuneHandle,
+    config: &ClientConfig,
+    session: &str,
+    compress: bool,
+) -> Result<u64, LibfwError> {
+    let PreparedBlock {
+        start, end, len, ..
+    } = prepared;
     let mut attempts = 0u32;
     // Wire-level progress accounting for this chunk. `last_loaded` tracks how
     // many bytes of THIS payload have already been counted, and the closure
@@ -432,10 +480,7 @@ async fn upload_one_chunk(
             token,
             file,
             start,
-            match &pass_through {
-                Some(blob) => XhrBody::Blob(blob),
-                None => XhrBody::Bytes(&payload),
-            },
+            prepared.body(),
             len,
             compress,
             config.timeout_ms,
@@ -488,6 +533,26 @@ async fn upload_one_chunk(
         tune_tick(tune, control, control.done_bytes(), None, false);
     }
     Ok(len)
+}
+
+/// How many blocks the scheduler keeps prepared **beyond** the send window.
+pub(crate) const MAX_PREPARE_AHEAD: usize = 2;
+
+/// Ceiling on the extra bytes held by pre-started blocks.
+///
+/// Pre-starting means a block is read and compressed before a send slot frees,
+/// so its chunk sits in memory while it waits. The budget keeps that overhead
+/// fixed instead of scaling with `chunkSize`: 2 blocks for the 1–2 MiB chunks a
+/// ramp actually uses, 1 at 4 MiB, and none at 8 MiB and above (where one
+/// extra chunk would cost more than the latency it hides).
+pub(crate) const PREPARE_AHEAD_BUDGET: u64 = 4 << 20;
+
+/// Pre-started blocks for a given chunk size (see [`PREPARE_AHEAD_BUDGET`]).
+pub(crate) fn prepare_ahead(chunk_size: u64) -> usize {
+    if chunk_size == 0 {
+        return MAX_PREPARE_AHEAD;
+    }
+    (PREPARE_AHEAD_BUDGET / chunk_size).min(MAX_PREPARE_AHEAD as u64) as usize
 }
 
 /// Send the final `x-libfw-final` commit request, with retry + backoff.
@@ -662,27 +727,61 @@ async fn upload_session_resumable(
         //    each block's 201 response is its ack, and a rejected ack only
         //    retries that block.
         //
-        //    The file is walked with a cursor and sliced batch by batch, with
-        //    the chunk size and the window re-read before each batch, so a ramp
-        //    that grew either while this file was uploading takes effect for
-        //    the bytes still to send (minimal start → measure → ramp, within a
-        //    single file). Slicing the whole round up front would freeze it at
-        //    the starting chunk size — the reason a "frequent small requests"
-        //    transfer stayed slow long after the engine had measured a link
-        //    that could take much larger ones.
+        //    The file is walked with a cursor and a continuous pump, NOT batch
+        //    by batch. A batch (`buffer_unordered(window)` over exactly `window`
+        //    blocks) cannot refill: the stream holds `window` items, so when one
+        //    finishes there is nothing left to pull and the slot stays empty
+        //    until the whole batch drains. Measured on a 2-block window with
+        //    unevenly sized blocks: a block finishing while its peer was still
+        //    in flight left the slot empty for 58 ms on average — 30% of the
+        //    window lost — because the next pair could only start once the slow
+        //    one finished. Here a freed slot is refilled on the spot.
+        //
+        //    Two things keep the pump honest across a ramp:
+        //    * the window and chunk size are re-read on every iteration, so a
+        //      ramp that grew mid-file applies to the bytes still to send
+        //      (slicing the whole round up front froze a long upload at its
+        //      starting size);
+        //    * `send_gate` is resized to the new window, so growth lets the
+        //      waiting pre-started blocks go out immediately.
         let mut cursor = 0u64;
         let mut round_errors = 0u32;
-        while cursor < file.size {
-            let window = tune.borrow().params().upload_window.max(1);
-            let chunk_now = tune.borrow().params().chunk_size.max(1);
-            let batch: Vec<(u64, u64)> =
-                next_missing_blocks(file, chunk_now, &received, &mut cursor, window);
-            if batch.is_empty() {
-                // Every block in this span is already on the server; the
-                // cursor advanced, so the loop still makes progress.
-                continue;
-            }
-            let mut stream = futures::stream::iter(batch.into_iter().map(|(start, end)| {
+        // Gaps decided but not yet started. One slice can straddle a covered
+        // span and yield several gaps, so this is a queue rather than a single
+        // pending block. Cursor order is preserved.
+        let mut queue: std::collections::VecDeque<(u64, u64)> = std::collections::VecDeque::new();
+        // Per-file gate on concurrent REQUESTS (the global semaphore inside
+        // `post_chunk` bounds the whole engine). Preparation deliberately does
+        // not take this gate: that is what lets the next block be read and
+        // compressed while the window is still full.
+        let send_gate = Semaphore::new(tune.borrow().params().upload_window.max(1));
+        let mut in_flight = futures::stream::FuturesUnordered::new();
+        loop {
+            let (window, chunk_now) = {
+                let params = tune.borrow().params();
+                (params.upload_window.max(1), params.chunk_size.max(1))
+            };
+            // A window that shrank stops new sends without aborting one that is
+            // already on the wire (an outstanding permit is unaffected).
+            send_gate.set_max(window);
+            let target = window + prepare_ahead(chunk_now);
+            while in_flight.len() < target {
+                if queue.is_empty() {
+                    let batch =
+                        next_missing_blocks(file, chunk_now, &received, &mut cursor, window);
+                    if batch.is_empty() {
+                        // This span is fully covered; the cursor advanced, so
+                        // keep going instead of spinning.
+                        if cursor >= file.size {
+                            break;
+                        }
+                        continue;
+                    }
+                    queue.extend(batch);
+                }
+                let Some((start, end)) = queue.pop_front() else {
+                    break;
+                };
                 let base_url = base_url.to_string();
                 let token = token.to_string();
                 let file = file.clone();
@@ -691,21 +790,28 @@ async fn upload_session_resumable(
                 let config = config.clone();
                 let tune = tune.clone();
                 let session = session.clone();
-                async move {
-                    upload_one_chunk(
-                        &base_url, &token, &file, &callbacks, &control, &tune, &config, start, end,
-                        &session, compress, level,
+                let gate = send_gate.clone();
+                in_flight.push(async move {
+                    // Prepare first, then wait for a send slot: a pre-started
+                    // block is already read and encoded when the slot frees.
+                    let prepared =
+                        prepare_block(&file, &callbacks, &control, start, end, compress, level)
+                            .await?;
+                    let _permit = gate.acquire().await;
+                    send_block(
+                        prepared, &base_url, &token, &file, &callbacks, &control, &tune, &config,
+                        &session, compress,
                     )
                     .await
-                }
-            }))
-            .buffer_unordered(window);
-
-            while let Some(res) = stream.next().await {
-                if let Err(e) = res {
-                    round_errors += 1;
-                    first_error.get_or_insert(e);
-                }
+                });
+            }
+            // Nothing left to start and nothing in flight: the file is done.
+            let Some(res) = in_flight.next().await else {
+                break;
+            };
+            if let Err(e) = res {
+                round_errors += 1;
+                first_error.get_or_insert(e);
             }
         }
 
@@ -995,6 +1101,21 @@ mod tests {
         let batch = next_missing_blocks(&f, 30, &[(0, 100)], &mut cursor, 4);
         assert!(batch.is_empty());
         assert_eq!(cursor, 100, "the cursor must advance past covered bytes");
+    }
+
+    #[test]
+    fn prepare_ahead_is_capped_by_a_byte_budget_not_a_block_count() {
+        // Small chunks (what a ramp actually uses) get the full two blocks …
+        assert_eq!(prepare_ahead(1024 * 1024), 2);
+        assert_eq!(prepare_ahead(2 * 1024 * 1024), 2);
+        // … a 4 MiB chunk fits only one inside the budget …
+        assert_eq!(prepare_ahead(4 * 1024 * 1024), 1);
+        // … and at 8 MiB and above, pre-starting would hold more memory than
+        // the latency it hides, so it is switched off entirely.
+        assert_eq!(prepare_ahead(8 * 1024 * 1024), 0);
+        assert_eq!(prepare_ahead(64 * 1024 * 1024), 0);
+        // Degenerate input still reports the intended maximum.
+        assert_eq!(prepare_ahead(0), MAX_PREPARE_AHEAD);
     }
 
     #[test]
