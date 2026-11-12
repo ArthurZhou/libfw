@@ -139,7 +139,19 @@ export interface LibfwClientOptions {
    * Downloads request the resolved level from the server.
    */
   compressLevel?: number | 'auto' | 'fast' | 'balanced' | 'max';
-  /** Shared chunk size in bytes for uploads and parallel downloads. Default 2 MiB. */
+  /**
+   * Shared chunk size in bytes for uploads and parallel downloads. Default
+   * 2 MiB.
+   *
+   * This is the unit of per-request overhead: raising it is what reduces the
+   * request count, so on a fast link (or behind a proxy that charges a round
+   * trip per request) a larger value is materially faster than many small
+   * ones. It is also the starting point of an `autoTune` ramp — the tuner then
+   * tracks the measured link from there, inside the server's advertised range
+   * (up to 32 MiB by default). Peak memory per transfer is
+   * `concurrency × window × chunkSize`, bounded by the engine; when the product
+   * does not fit, the in-flight window shrinks, not the chunk.
+   */
   chunkSize?: number;
   /** Retries per chunk/file before failing. Default `3`. */
   maxRetries?: number;
@@ -174,10 +186,12 @@ export interface LibfwClientOptions {
    * Enable the adaptive tuning engine: the engine probes the server's
    * `/capabilities` limits and TCP-style ramps the per-file window and
    * cross-file concurrency from the advertised minimums using real transfer
-   * stats. The chunk size follows the measured throughput (~100 ms of it,
-   * clamped into the advertised range) and the zrip level is a client policy
-   * from `compressLevel`, never ramped. When disabled the configured static
-   * values are used as-is. Default `false`.
+   * stats. The chunk size follows the measured throughput (~400 ms of it,
+   * clamped into the advertised range), starting from the configured
+   * `chunkSize` — a chunk is the unit of per-request overhead, so a small
+   * start costs thousands of round trips for the same bytes. The zrip level
+   * is a client policy from `compressLevel`, never ramped. When disabled the
+   * configured static values are used as-is. Default `false`.
    *
    * Tuning state lives in memory for this client instance (a settle is reused
    * by later transfers and dropped on failure) **and** is cached in

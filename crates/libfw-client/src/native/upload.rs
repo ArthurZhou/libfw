@@ -24,7 +24,7 @@ use super::{NativeClient, NativeEvent, compress_chunk, session_id_for, validate_
 use crate::LibfwError;
 use crate::plan::FileEntry;
 use crate::tune::{CompressLevel, LEVEL_SAMPLE_SIZE, TransferKind};
-use crate::upload::aligned_missing;
+use crate::upload::{aligned_missing, next_missing_blocks};
 
 /// File metadata for a local file being uploaded as `remote`.
 fn local_meta(local: &Path, remote: &str) -> Result<FileMeta, LibfwError> {
@@ -151,9 +151,6 @@ impl NativeClient {
             if rounds > 0 {
                 received = self.probe_session(meta, session).await?;
             }
-            let window = self
-                .with_tune(|t| t.params().upload_window.max(1))
-                .unwrap_or(self.config().upload_window.max(1));
             let chunk_size = self
                 .with_tune(|t| t.params().chunk_size.max(1))
                 .unwrap_or(self.config().chunk_size.max(1));
@@ -186,32 +183,52 @@ impl NativeClient {
             }
 
             // Send only the missing blocks, pipelined up to `window`.
-            let local_owned = local.to_path_buf();
-            let meta_owned = meta.clone();
-            let session_owned = session.to_string();
-            let mut stream = futures::stream::iter(missing.into_iter().map(|(start, end)| {
-                let local = local_owned.clone();
-                let meta = meta_owned.clone();
-                let session = session_owned.clone();
-                async move { (start, self.post_block(&local, &meta, &session, start, end, compress, level).await) }
-            }))
-            .buffer_unordered(window);
-
+            //
+            // The file is walked with a cursor and sliced batch by batch with
+            // the *current* chunk size / window, so a ramp that grew either
+            // while this file was uploading applies to the bytes still to send
+            // instead of only to the next round.
+            let mut cursor = 0u64;
             let mut round_errors = 0u32;
-            while let Some((start, result)) = stream.next().await {
-                match result {
-                    Ok(sent_len) => {
-                        sent = sent.saturating_add(sent_len);
-                        self.emit(NativeEvent::Progress {
-                            done: sent,
-                            total: size,
-                        });
-                        self.tune_tick(sent, None, false);
-                    }
-                    Err(e) => {
-                        round_errors += 1;
-                        self.log(format!("block at {start} of `{}` failed: {e}", entry.path));
-                        first_error.get_or_insert(e);
+            while cursor < size {
+                let window = self
+                    .with_tune(|t| t.params().upload_window.max(1))
+                    .unwrap_or(self.config().upload_window.max(1));
+                let chunk_now = self
+                    .with_tune(|t| t.params().chunk_size.max(1))
+                    .unwrap_or(self.config().chunk_size.max(1));
+                let batch = next_missing_blocks(entry, chunk_now, &received, &mut cursor, window);
+                if batch.is_empty() {
+                    // Already covered; the cursor advanced, so progress is made.
+                    continue;
+                }
+
+                let local_owned = local.to_path_buf();
+                let meta_owned = meta.clone();
+                let session_owned = session.to_string();
+                let mut stream = futures::stream::iter(batch.into_iter().map(|(start, end)| {
+                    let local = local_owned.clone();
+                    let meta = meta_owned.clone();
+                    let session = session_owned.clone();
+                    async move { (start, self.post_block(&local, &meta, &session, start, end, compress, level).await) }
+                }))
+                .buffer_unordered(window);
+
+                while let Some((start, result)) = stream.next().await {
+                    match result {
+                        Ok(sent_len) => {
+                            sent = sent.saturating_add(sent_len);
+                            self.emit(NativeEvent::Progress {
+                                done: sent,
+                                total: size,
+                            });
+                            self.tune_tick(sent, None, false);
+                        }
+                        Err(e) => {
+                            round_errors += 1;
+                            self.log(format!("block at {start} of `{}` failed: {e}", entry.path));
+                            first_error.get_or_insert(e);
+                        }
                     }
                 }
             }

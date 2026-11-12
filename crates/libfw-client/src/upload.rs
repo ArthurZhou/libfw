@@ -221,6 +221,38 @@ pub(crate) fn aligned_missing(
     missing
 }
 
+/// Fill a batch with the next up-to-`max_items` missing blocks, advancing
+/// `cursor` over the file.
+///
+/// Unlike [`aligned_missing`], which slices the *whole* file once at the size
+/// the round started with, this slices on demand with the chunk size passed in
+/// **now**. That is what lets a ramp that grew the chunk while a round was in
+/// flight apply to the bytes still to send: slicing up front froze a long
+/// upload at its starting size (256 KiB on a fresh ramp), so the transfer kept
+/// issuing thousands of small requests even though the engine had already
+/// measured a link that wanted 5 MiB ones.
+///
+/// The resulting offsets are not aligned to anything in particular, which is
+/// fine: positional writes are idempotent and the commit only checks coverage.
+/// Shared with the native client ([`crate::native`]).
+pub(crate) fn next_missing_blocks(
+    file: &FileEntry,
+    chunk_size: u64,
+    received: &[(u64, u64)],
+    cursor: &mut u64,
+    max_items: usize,
+) -> Vec<(u64, u64)> {
+    let chunk_size = chunk_size.max(1);
+    let max_items = max_items.max(1);
+    let mut out = Vec::new();
+    while *cursor < file.size && out.len() < max_items {
+        let end = cursor.saturating_add(chunk_size).min(file.size);
+        out.extend(missing_ranges(*cursor, end, received));
+        *cursor = end;
+    }
+    out
+}
+
 /// The sub-ranges of `[start, end)` not covered by any `received` range.
 ///
 /// Used after a probe to compute exactly which bytes are still missing, so
@@ -500,8 +532,8 @@ async fn upload_session_resumable(
         control.check()?;
 
         // Live parameter reads: the tuning engine may have raised/lowered the
-        // chunk size since the last round (the window is re-read per batch in
-        // the send loop below).
+        // chunk size since the last round (both the chunk size and the window
+        // are re-read per batch in the send loop below).
         let chunk_size = tune.borrow().params().chunk_size.max(1);
 
         // 1. Server is the source of truth for what it already holds. Round
@@ -556,15 +588,26 @@ async fn upload_session_resumable(
         //    each block's 201 response is its ack, and a rejected ack only
         //    retries that block.
         //
-        //    The work is consumed in batches and the window is re-read before
-        //    each batch, so a ramp that grew it while this file was uploading
-        //    takes effect for the remaining blocks (minimal start → measure →
-        //    ramp, within a single file).
-        let mut queue: std::collections::VecDeque<(u64, u64)> = missing.into();
+        //    The file is walked with a cursor and sliced batch by batch, with
+        //    the chunk size and the window re-read before each batch, so a ramp
+        //    that grew either while this file was uploading takes effect for
+        //    the bytes still to send (minimal start → measure → ramp, within a
+        //    single file). Slicing the whole round up front would freeze it at
+        //    the starting chunk size — the reason a "frequent small requests"
+        //    transfer stayed slow long after the engine had measured a link
+        //    that could take much larger ones.
+        let mut cursor = 0u64;
         let mut round_errors = 0u32;
-        while !queue.is_empty() {
+        while cursor < file.size {
             let window = tune.borrow().params().upload_window.max(1);
-            let batch: Vec<(u64, u64)> = queue.drain(..queue.len().min(window)).collect();
+            let chunk_now = tune.borrow().params().chunk_size.max(1);
+            let batch: Vec<(u64, u64)> =
+                next_missing_blocks(file, chunk_now, &received, &mut cursor, window);
+            if batch.is_empty() {
+                // Every block in this span is already on the server; the
+                // cursor advanced, so the loop still makes progress.
+                continue;
+            }
             let mut stream = futures::stream::iter(batch.into_iter().map(|(start, end)| {
                 let base_url = base_url.to_string();
                 let token = token.to_string();
@@ -836,6 +879,49 @@ pub async fn upload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_missing_blocks_re_slices_with_the_current_chunk_size() {
+        let f = FileEntry {
+            path: "f.bin".into(),
+            size: 100,
+            mtime: 1,
+        };
+        let mut cursor = 0;
+        // A small chunk at the start of the file …
+        let first = next_missing_blocks(&f, 10, &[], &mut cursor, 2);
+        assert_eq!(first, vec![(0, 10), (10, 20)]);
+        assert_eq!(cursor, 20);
+        // … then a much larger one: the remaining bytes are sliced at the NEW
+        // size, which is what lets a ramp that grew the chunk apply to the
+        // bytes still to send instead of only to the next round.
+        let second = next_missing_blocks(&f, 40, &[], &mut cursor, 1);
+        assert_eq!(second, vec![(20, 60)]);
+        assert_eq!(cursor, 60);
+        // Coverage is honoured: what the server already holds is skipped, and
+        // only the gap is returned.
+        let third = next_missing_blocks(&f, 40, &[(60, 80)], &mut cursor, 1);
+        assert_eq!(third, vec![(80, 100)]);
+        assert_eq!(cursor, 100);
+        // Exhausted → nothing left.
+        assert!(next_missing_blocks(&f, 40, &[], &mut cursor, 4).is_empty());
+    }
+
+    #[test]
+    fn next_missing_blocks_advances_the_cursor_over_covered_spans() {
+        // A fully covered file yields an empty batch but MUST still move the
+        // cursor: the upload loop treats an empty batch as "keep going", so a
+        // cursor that did not advance would spin forever.
+        let f = FileEntry {
+            path: "f.bin".into(),
+            size: 100,
+            mtime: 1,
+        };
+        let mut cursor = 0;
+        let batch = next_missing_blocks(&f, 30, &[(0, 100)], &mut cursor, 4);
+        assert!(batch.is_empty());
+        assert_eq!(cursor, 100, "the cursor must advance past covered bytes");
+    }
 
     #[test]
     fn aligned_missing_covers_full_file_when_nothing_received() {

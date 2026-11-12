@@ -1,8 +1,16 @@
 //! Local filesystem storage backend for `libfw-server`.
 //!
-//! Writes go to a temporary file next to the destination and are
-//! atomically renamed into place on [`UploadSink::commit`], so a failed or
-//! aborted upload never leaves a partial target behind.
+//! Writes go to a temporary file and are atomically renamed into place on
+//! [`UploadSink::commit`], so a failed or aborted upload never leaves a partial
+//! target behind. The temp lives next to the destination by default and can be
+//! moved to a dedicated directory with [`FsStorage::with_temp_dir`].
+//!
+//! Everything the backend creates for its own bookkeeping is named with the
+//! reserved `.libfw-` prefix (`.libfw-sess-*` session temps, `.libfw-tmp-*`
+//! one-shot temps, `.blocks` sidecars and their `.blocks.tmp` staging files).
+//! Those names are rejected by [`FsStorage::resolve`] and hidden from
+//! [`StorageBackend::list_dir`], so an in-flight upload never shows up in a
+//! directory listing (or in a recursive folder download) as a phantom file.
 
 use std::collections::HashMap;
 use std::io::{Read, SeekFrom};
@@ -25,6 +33,14 @@ use libfw_core::StorageError;
 #[derive(Debug, Clone)]
 pub struct FsStorage {
     root: PathBuf,
+    /// Directory holding in-flight (uncommitted) upload temps.
+    ///
+    /// `None` (the default) keeps them next to their target — a same-directory
+    /// rename is the cheapest atomic commit. `Some(dir)` moves every temp out
+    /// of the served tree (see [`FsStorage::with_temp_dir`]), which keeps a
+    /// directory listing, a folder download or an rsync of the root free of
+    /// half-written uploads even if something goes wrong with filtering.
+    temp_dir: Option<PathBuf>,
     /// Per-target locks (keyed by temp/target path). Concurrent chunk
     /// requests for *different* sessions/targets never serialize behind each
     /// other — only writers of the same target (who share a `.blocks`
@@ -39,7 +55,76 @@ impl FsStorage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         FsStorage {
             root: root.into(),
+            temp_dir: None,
             locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Keep in-flight upload temps in `dir` instead of next to their target.
+    ///
+    /// Useful when the storage root is itself served by another process
+    /// (rsync, `ls`, a media scanner) or lives on a filesystem where dotfiles
+    /// are not hidden: nothing half-written ever appears inside it. Temps are
+    /// namespaced by the SHA-free [`path_tag`] of the virtual path, so two
+    /// same-named targets in different directories never collide.
+    ///
+    /// When `dir` is on a different filesystem than the root, `commit` falls
+    /// back to "copy into a hidden sibling, then rename" — the target is still
+    /// replaced atomically, at the cost of one extra copy of the file.
+    ///
+    /// The directory is created on demand; it must not be one of the served
+    /// directories unless it is hidden (any path starting with `.libfw` is
+    /// hidden automatically).
+    pub fn with_temp_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.temp_dir = Some(dir.into());
+        self
+    }
+
+    /// The configured temp directory, if any.
+    pub fn temp_dir(&self) -> Option<&Path> {
+        self.temp_dir.as_deref()
+    }
+
+    /// Directory that holds the temps of `target`.
+    fn scratch_dir(&self, target: &Path) -> PathBuf {
+        match &self.temp_dir {
+            Some(dir) => dir.clone(),
+            None => target
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.root.clone()),
+        }
+    }
+
+    /// Unique temp path for a one-shot (non-session) upload of `target`.
+    fn new_temp_path(&self, target: &Path, rel: &str) -> PathBuf {
+        match &self.temp_dir {
+            None => temp_path_for(target),
+            Some(dir) => dir.join(format!(
+                ".libfw-tmp-{}-{}-{}",
+                path_tag(rel),
+                file_name_of(target),
+                unique_suffix()
+            )),
+        }
+    }
+
+    /// Deterministic temp path for a resumable session writing `target`.
+    ///
+    /// Every chunk of one session must find the *same* temp file, so this name
+    /// is derived only from data the client echoes back on each request
+    /// (`session`, `owner`, `rel`).
+    fn session_temp_path(&self, target: &Path, rel: &str, owner: &str, session: &str) -> PathBuf {
+        match &self.temp_dir {
+            None => target.with_file_name(format!(
+                ".libfw-sess-{owner}-{session}-{}",
+                file_name_of(target)
+            )),
+            Some(dir) => dir.join(format!(
+                ".libfw-sess-{owner}-{session}-{}-{}",
+                path_tag(rel),
+                file_name_of(target)
+            )),
         }
     }
 
@@ -72,6 +157,15 @@ impl FsStorage {
         for component in rel.components() {
             match component {
                 Component::Normal(seg) => {
+                    // The `.libfw-` namespace is the backend's own scratch
+                    // space: hiding it from listings is not enough, a client
+                    // must not be able to stat, download or delete an
+                    // in-flight temp from inside the served tree.
+                    if is_reserved_name(&seg.to_string_lossy()) {
+                        return Err(StorageError::Unsupported(
+                            "path uses the reserved `.libfw-` prefix",
+                        ));
+                    }
                     joined.push(seg);
                 }
                 Component::CurDir => {}
@@ -80,6 +174,15 @@ impl FsStorage {
                         "path must not contain '..' or special components",
                     ))
                 }
+            }
+        }
+        // A user-configured temp directory may sit inside the root; it is
+        // scratch space whatever it is called.
+        if let Some(dir) = &self.temp_dir {
+            if joined.starts_with(dir) {
+                return Err(StorageError::Unsupported(
+                    "path is inside the configured temporary directory",
+                ));
             }
         }
         Ok(joined)
@@ -193,7 +296,10 @@ impl StorageBackend for FsStorage {
                     return Err(StorageError::AlreadyExists(path.to_string()));
                 }
                 // Write to a temp file, rename on commit.
-                let tmp = temp_path_for(&full);
+                tokio::fs::create_dir_all(self.scratch_dir(&full))
+                    .await
+                    .map_err(|e| StorageError::Other(e))?;
+                let tmp = self.new_temp_path(&full, path);
                 let file = tokio::fs::File::create(&tmp)
                     .await
                     .map_err(|e| StorageError::Other(e))?;
@@ -284,11 +390,10 @@ impl StorageBackend for FsStorage {
         // collide on the same temp file.  A short prefix of the owner hash
         // is enough for discrimination without making filenames unwieldy.
         let safe_owner = sanitize(&owner.chars().take(16).collect::<String>());
-        let name = full
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "upload".to_string());
-        let tmp = full.with_file_name(format!(".libfw-sess-{safe_owner}-{safe_session}-{name}"));
+        tokio::fs::create_dir_all(self.scratch_dir(&full))
+            .await
+            .map_err(|e| StorageError::Other(e))?;
+        let tmp = self.session_temp_path(&full, path, &safe_owner, &safe_session);
 
         let exists = tokio::fs::try_exists(&tmp)
             .await
@@ -393,6 +498,21 @@ impl StorageBackend for FsStorage {
             .map_err(|e| StorageError::Other(e))?
         {
             let name = entry.file_name().to_string_lossy().to_string();
+            // Never expose in-flight uploads: a `.libfw-sess-*` temp, its
+            // `.blocks` sidecar or a `.libfw-tmp-*` one-shot temp is internal
+            // bookkeeping, not a user file. Listing them made a directory view
+            // (and a recursive folder download) show phantom entries whose
+            // size changed as the upload progressed.
+            if is_reserved_name(&name) {
+                continue;
+            }
+            // A user-configured temp directory may sit inside the root under
+            // an ordinary name; it is scratch space either way.
+            if let Some(tmp_dir) = &self.temp_dir {
+                if entry.path() == *tmp_dir {
+                    continue;
+                }
+            }
             let rel = if path.is_empty() {
                 name.clone()
             } else {
@@ -461,7 +581,8 @@ impl StorageBackend for FsStorage {
     ) -> Result<usize, StorageError> {
         // tus-style expiry: a client that vanishes mid-upload leaves its
         // `.libfw-sess-<id>-<name>` temp (and `.blocks` sidecar) behind. Walk
-        // the root, removing the ones whose last write is older than
+        // the root — plus the configured temp directory, which may live
+        // outside it — removing the ones whose last write is older than
         // `max_age`. Only session temps are touched — never committed user
         // files — and symlinked directories are never followed.
         let deadline = SystemTime::now()
@@ -469,6 +590,11 @@ impl StorageBackend for FsStorage {
             .unwrap_or(UNIX_EPOCH);
         let mut removed = 0usize;
         let mut stack = vec![self.root.clone()];
+        if let Some(dir) = &self.temp_dir {
+            if !dir.starts_with(&self.root) {
+                stack.push(dir.clone());
+            }
+        }
         while let Some(dir) = stack.pop() {
             let mut rd = match tokio::fs::read_dir(&dir).await {
                 Ok(rd) => rd,
@@ -524,7 +650,50 @@ impl StorageBackend for FsStorage {
     }
 }
 
-/// A temporary path for a target, unique per attempt.
+/// Is `name` (one path segment) part of the backend's private scratch space?
+///
+/// Every temp, sidecar and staging file the backend creates starts with
+/// `.libfw-`; the range sidecars (`.blocks`, `.blocks.tmp`) hang off such a
+/// temp name, so the prefix check covers them too.
+fn is_reserved_name(name: &str) -> bool {
+    name.starts_with(".libfw-")
+}
+
+/// Run of the mill file name of a target path.
+fn file_name_of(target: &Path) -> String {
+    target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "upload".to_string())
+}
+
+/// A unique-per-call suffix (timestamp + process-wide counter).
+fn unique_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let counter = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{nanos}-{counter}")
+}
+
+/// Stable 16-hex tag for a virtual path.
+///
+/// A shared temp directory holds temps for every directory of the root, so the
+/// name alone no longer disambiguates `a/report.zip` from `b/report.zip`.
+/// FNV-1a is tiny, dependency-free and — unlike `DefaultHasher` — stable across
+/// processes and compiler versions, which the resumable-upload temp name
+/// depends on (a resume in a fresh process must compute the same path).
+fn path_tag(rel: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in rel.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// A temporary path for a target, unique per attempt, next to the target.
 ///
 /// Uniqueness combines a monotonic counter with a timestamp so two
 /// concurrent Create-mode uploads to the same target never collide on the
@@ -532,17 +701,56 @@ impl StorageBackend for FsStorage {
 static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn temp_path_for(target: &Path) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let counter = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let file_name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "upload".to_string());
-    let tmp_name = format!(".libfw-tmp-{file_name}-{nanos}-{counter}");
-    target.with_file_name(tmp_name)
+    target.with_file_name(format!(
+        ".libfw-tmp-{}-{}",
+        file_name_of(target),
+        unique_suffix()
+    ))
+}
+
+/// Move `tmp` onto `target`, atomically.
+///
+/// A plain rename is atomic *within* a filesystem and replaces an existing
+/// target in one step. With a temp directory on another device (the point of
+/// [`FsStorage::with_temp_dir`] is often "put the scratch space on the fast
+/// disk") the rename fails with `EXDEV`; then the bytes are copied into a
+/// hidden sibling first and the sibling is renamed into place, so the visible
+/// target still flips in one atomic step and is never observed half-written.
+async fn move_into_place(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    match tokio::fs::rename(tmp, target).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_cross_device(&err) => {
+            let staged = temp_path_for(target);
+            if let Err(copy_err) = tokio::fs::copy(tmp, &staged).await {
+                let _ = tokio::fs::remove_file(&staged).await;
+                return Err(copy_err);
+            }
+            match tokio::fs::rename(&staged, target).await {
+                Ok(()) => {
+                    let _ = tokio::fs::remove_file(tmp).await;
+                    Ok(())
+                }
+                Err(rename_err) => {
+                    let _ = tokio::fs::remove_file(&staged).await;
+                    Err(rename_err)
+                }
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(windows)]
+const CROSS_DEVICE_ERRNO: i32 = 17; // ERROR_NOT_SAME_DEVICE
+#[cfg(not(windows))]
+const CROSS_DEVICE_ERRNO: i32 = 18; // EXDEV
+
+/// Did the rename fail only because the two paths are on different devices?
+///
+/// Matched on the raw code rather than `ErrorKind::CrossesDevices` to stay
+/// within the crate's minimum supported Rust version.
+fn is_cross_device(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(CROSS_DEVICE_ERRNO)
 }
 
 /// Streaming write handle for the filesystem backend.
@@ -683,7 +891,7 @@ impl UploadSink for FsSink {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 return Err(StorageError::AlreadyExists(rel));
             }
-            tokio::fs::rename(&tmp, &target)
+            move_into_place(&tmp, &target)
                 .await
                 .map_err(|e| StorageError::Other(e))?;
             // Durability: fsync the parent directory so the rename itself
@@ -1049,5 +1257,170 @@ mod tests {
         assert!(storage.read_stream("evil/secret.txt", RangeSpec::full(10)).await.is_err());
         assert!(storage.file_meta("evil/secret.txt").await.is_err());
         assert!(storage.write_stream("evil/new.txt", WriteMode::Create).await.is_err());
+    }
+
+    /// An in-flight upload must be invisible: no `.libfw-sess-*` temp, no
+    /// `.blocks` sidecar and no `.libfw-tmp-*` one-shot temp in a listing.
+    #[tokio::test]
+    async fn list_dir_hides_in_flight_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path());
+        std::fs::write(dir.path().join("real.txt"), b"done").unwrap();
+
+        // Ordinary (one-shot) upload in flight.
+        let mut plain = storage.write_stream("a.txt", WriteMode::Create).await.unwrap();
+        plain.write(b"hal").await.unwrap();
+        // Resumable session upload in flight (temp + `.blocks` sidecar).
+        let mut session = storage
+            .write_stream_session("b.txt", "sess-1", "owner-hash", WriteMode::Create)
+            .await
+            .unwrap();
+        session.write_at(0, b"half").await.unwrap();
+
+        let entries = storage.list_dir("").await.unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(names, vec!["real.txt"], "in-flight uploads must not be listed");
+
+        session.abort().await.unwrap();
+        plain.commit().await.unwrap();
+        let names: Vec<_> = storage
+            .list_dir("")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(names, vec!["a.txt", "real.txt"]);
+        // The aborted session left nothing behind either.
+        assert!(!dir.path().join("b.txt").exists());
+    }
+
+    /// The reserved prefix is refused on direct access, not merely hidden.
+    #[tokio::test]
+    async fn reserved_prefix_cannot_be_read_or_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path());
+        std::fs::write(dir.path().join(".libfw-sess-x-y-secret.txt"), b"s").unwrap();
+        std::fs::write(dir.path().join(".libfw-tmp-a-1-2"), b"s").unwrap();
+
+        for path in [".libfw-sess-x-y-secret.txt", ".libfw-tmp-a-1-2"] {
+            assert!(
+                storage.file_meta(path).await.is_err(),
+                "{path} must not be stat-able"
+            );
+            assert!(
+                storage.read_stream(path, RangeSpec::full(1)).await.is_err(),
+                "{path} must not be downloadable"
+            );
+            assert!(
+                storage.remove(path).await.is_err(),
+                "{path} must not be removable through the API"
+            );
+        }
+        // Traversal into such a directory is refused too.
+        assert!(storage.list_dir(".libfw-sess-x").await.is_err());
+    }
+
+    /// With a temp directory the root stays clean for the whole upload, and
+    /// the commit still lands atomically.
+    #[tokio::test]
+    async fn temp_dir_keeps_the_root_clean() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path()).with_temp_dir(scratch.path());
+        std::fs::write(root.path().join("keep.txt"), b"keep").unwrap();
+
+        let mut session = storage
+            .write_stream_session("deep/dir/big.bin", "sess-9", "owner-hash", WriteMode::Create)
+            .await
+            .unwrap();
+        session.write_at(0, b"0123456789").await.unwrap();
+        session.write_at(10, b"abcdefghij").await.unwrap();
+
+        // Nothing in the served tree except the pre-existing file (the
+        // target's parent directories are created eagerly, as before).
+        let names: Vec<String> = storage
+            .list_dir("")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(names, vec!["deep", "keep.txt"]);
+        assert!(
+            storage.list_dir("deep/dir").await.unwrap().is_empty(),
+            "no in-flight temp may leak into the listing"
+        );
+        // The temp (and its sidecar) live in the scratch directory.
+        let staged: Vec<String> = std::fs::read_dir(scratch.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(staged.iter().any(|n| n.starts_with(".libfw-sess-") && !n.ends_with(".blocks")));
+        assert!(staged.iter().any(|n| n.ends_with(".blocks")));
+
+        let meta = session.commit().await.unwrap();
+        assert_eq!(meta.path, "deep/dir/big.bin");
+        assert_eq!(meta.size, 20);
+        assert_eq!(
+            std::fs::read(root.path().join("deep/dir/big.bin")).unwrap(),
+            b"0123456789abcdefghij"
+        );
+        // Scratch is empty again (temp + sidecar consumed by the commit).
+        assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+    }
+
+    /// Two same-named targets in different directories must not share a temp
+    /// once temps live in one flat directory.
+    #[tokio::test]
+    async fn temp_dir_names_are_unique_per_target_path() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path()).with_temp_dir(scratch.path());
+
+        let mut a = storage
+            .write_stream_session("a/same.bin", "sess", "o", WriteMode::Create)
+            .await
+            .unwrap();
+        let mut b = storage
+            .write_stream_session("b/same.bin", "sess", "o", WriteMode::Create)
+            .await
+            .unwrap();
+        a.write_at(0, b"aaaa").await.unwrap();
+        b.write_at(0, b"bbbb").await.unwrap();
+        a.commit().await.unwrap();
+        b.commit().await.unwrap();
+
+        assert_eq!(std::fs::read(root.path().join("a/same.bin")).unwrap(), b"aaaa");
+        assert_eq!(std::fs::read(root.path().join("b/same.bin")).unwrap(), b"bbbb");
+    }
+
+    /// The sweeper must also reach temps parked outside the root.
+    #[tokio::test]
+    async fn cleanup_sweeps_the_configured_temp_dir() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(root.path()).with_temp_dir(scratch.path());
+
+        // `max_age == 0` means "everything written before now", which keeps
+        // the test independent of being able to rewind an mtime.
+        let a = scratch.path().join(".libfw-sess-o-s-a.txt");
+        std::fs::write(&a, b"partial").unwrap();
+        let b = scratch.path().join(".libfw-sess-o-s-b.txt");
+        std::fs::write(&b, b"partial").unwrap();
+        // …and one inside the root, to prove the walk still covers both.
+        std::fs::create_dir_all(root.path().join("sub")).unwrap();
+        let c = root.path().join("sub/.libfw-sess-o-s-c.txt");
+        std::fs::write(&c, b"partial").unwrap();
+        let keep = root.path().join("sub/user.txt");
+        std::fs::write(&keep, b"mine").unwrap();
+
+        let removed = storage
+            .cleanup_stale_sessions(std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(removed, 3, "both trees are swept, sidecars excluded");
+        assert!(!a.exists() && !b.exists() && !c.exists());
+        assert!(keep.exists(), "committed user files are never swept");
     }
 }

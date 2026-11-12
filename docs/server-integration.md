@@ -207,6 +207,17 @@ implementation:
 - Session uploads write positionally into a shared temp plus a `.blocks`
   range sidecar; the first 16 hex chars of `SHA-256(sub)` are embedded in the
   name for per-user isolation.
+- Everything the backend creates for itself is named with the reserved
+  `.libfw-` prefix (`.libfw-sess-*` temps, `.libfw-tmp-*` one-shot temps,
+  `.blocks` sidecars). Those names are refused by the path resolver and hidden
+  from `list_dir`, so an in-flight upload never shows up as a phantom file in
+  a directory view or a recursive folder download.
+- `FsStorage::new(root).with_temp_dir(dir)` moves the temps out of the served
+  tree entirely — the bare root stays clean for `rsync`, media scanners or a
+  second process watching it. Temp names embed a stable tag of the virtual
+  path, so same-named files in different directories never share a temp. When
+  `dir` is on another filesystem the commit copies into a hidden sibling and
+  renames it, so the target still flips atomically (at the cost of one copy).
 - Range reads (`.blocks` parsing, `received_ranges`) are serialized per
   target with an internal lock registry, so concurrent chunks of different
   files never block each other while writers of the same file take turns.
@@ -422,6 +433,7 @@ The axum example reads these environment variables:
 | `LIBFW_PATH_KEY` | unset | 64-hex-char key → enable `EncryptedPathCodec` |
 | `LIBFW_CLEANUP_INTERVAL` | `3600` | sweep period (`30s`, `5m`, `2h`, `1d`) |
 | `LIBFW_SESSION_TTL` | `24h` | max age of an abandoned session temp |
+| `LIBFW_TEMP_DIR` | unset | keep in-flight temps in this directory instead of the served tree |
 
 It also serves `GET /health` (service name, version, protocol, storage root)
 and `GET /sdk/*` from the repository's `sdk/` directory, which is how the web

@@ -299,8 +299,11 @@ Full details, including the session algorithm and status-code table:
 With `autoTune` / `auto_tune`, the client reads `/capabilities`, starts from
 the advertised minimums and ramps the per-file window, then cross-file
 concurrency, using 1-second EWMA RTT and throughput samples. The chunk size
-follows the measured throughput (~100 ms of data, clamped into the advertised
-range) rather than being a ramp dimension; the zrip level is a client policy.
+follows the measured throughput (~400 ms of data, clamped into the advertised
+range) rather than being a ramp dimension, and a fresh ramp is seeded with the
+configured `chunkSize` — a chunk is the unit of per-request overhead, so
+starting at the advertised minimum meant thousands of tiny requests for a file
+the link could have moved in far fewer ones. The zrip level is a client policy.
 Errors halve the parameters and require stable windows before settling.
 
 The browser engine caches a settle in `localStorage` per origin and direction

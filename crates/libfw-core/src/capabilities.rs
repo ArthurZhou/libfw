@@ -160,8 +160,14 @@ impl Default for Limits {
                 min: 1,
             },
             chunk_size: IntRange {
+                // 32 MiB ceiling: a chunk is the unit of request overhead, so
+                // the advertised ceiling is what bounds how few requests a
+                // client can get away with on a fast link. The client still
+                // picks its own value inside the range (and the transport
+                // streams the body, so a large chunk is not buffered whole by
+                // the server).
                 default: 2 * 1024 * 1024,
-                max: 8 * 1024 * 1024,
+                max: 32 * 1024 * 1024,
                 min: 256 * 1024,
             },
             max_upload_size: 20 * 1024 * 1024 * 1024,

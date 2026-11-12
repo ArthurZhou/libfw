@@ -96,7 +96,10 @@ into `./out` writes `./out/tree/...`; uploading `./src` to `backup` writes
   size before every batch — a mid-file ramp applies to the file in flight.
 - A `200`/`416` response while resuming means the remote changed or shrank;
   the client logs it and restarts from byte 0.
-- Uploads probe the session, send only missing gaps, then commit.
+- Uploads probe the session, send only missing gaps, then commit. The gaps are
+  sliced with the *current* chunk size batch by batch (not once for the whole
+  file), so a ramp that grows the chunk mid-file applies to the bytes still to
+  send.
 
 ## Configuration
 
@@ -223,9 +226,12 @@ advertised minimums, and ramps:
 2. cross-file concurrency,
 
 using 1-second EWMA RTT/throughput windows. The chunk size is **not**
-ramped: it follows the measured throughput (~100 ms of it, rounded down to
-64 KiB and clamped into the advertised range plus hard client caps). The zrip
-level is a client policy from `compress_level`, never a ramp dimension.
+ramped: it follows the measured throughput (~400 ms of it, rounded down to
+64 KiB and clamped into the advertised range plus hard client caps), and a
+fresh ramp starts from the configured `chunk_size` rather than the advertised
+minimum — a chunk is the unit of per-request overhead, so starting at 256 KiB
+means thousands of round trips for bytes a few big requests could carry. The
+zrip level is a client policy from `compress_level`, never a ramp dimension.
 Errors halve the parameters (`degraded`), which then hold for two stable
 windows before settling.
 

@@ -621,9 +621,19 @@ async fn main() -> std::io::Result<()> {
     let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8081);
     std::fs::create_dir_all(&root)?;
 
+    // `LIBFW_TEMP_DIR` keeps in-flight upload temps out of the served tree
+    // (useful when the root is rsynced, indexed or served by something else).
+    let mut storage = FsStorage::new(&root);
+    if let Some(dir) = std::env::var_os("LIBFW_TEMP_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir)?;
+        println!("upload temps: {} (outside the served tree)", dir.display());
+        storage = storage.with_temp_dir(dir);
+    }
+
     let state = Arc::new(
         ServerState::builder()
-            .storage(FsStorage::new(&root))
+            .storage(storage)
             .verifier(DevTokenVerifier)
             .validator(PathValidator::new())
             .build(),

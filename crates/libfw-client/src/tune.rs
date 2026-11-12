@@ -11,13 +11,22 @@
 //! The **chunk size** is not ramped: it follows the measured link
 //! ([`chunk_for_link`]) — about [`TARGET_CHUNK_SPAN_MS`] of the current
 //! throughput, clamped into the server's advertised range and the client's
-//! in-flight budget. That gives a wider/faster link fewer, bigger requests and
-//! a narrow link the advertised minimum, and it applies for the whole
+//! per-request budget. That gives a wider/faster link fewer, bigger requests
+//! and a narrow link the advertised minimum, and it applies for the whole
 //! transfer (including after the ramp settles). Sizing it from the link instead
 //! of ramping it is what makes it useful at all: the BDP saturation rule
 //! settles the ramp on the window and concurrency dimensions, so a chunk
 //! dimension in the ramp order would never be reached and the chunk would stay
 //! pinned at the advertised minimum (256 KiB) on every link.
+//!
+//! A fresh ramp is *seeded* with the client's configured chunk
+//! (`ClientConfig::chunk_size`), not with the advertised minimum: the first
+//! round of an upload slices the remaining file with whatever size the table
+//! holds when it starts, so seeding at 256 KiB meant a single request per
+//! 256 KiB for the whole file — the measured symptom being that a faster link
+//! got *slower*, because per-request overhead (a round trip, an auth check, a
+//! fresh compression context, a positional write) dominated the payload. The
+//! link-derived size then corrects the seed on the first measurement window.
 //!
 //! # Lifetime of a tuning result
 //!
@@ -77,13 +86,30 @@ pub const HARD_MAX_CONCURRENCY: i64 = 64;
 /// Absolute cap on either per-file in-flight window.
 pub const HARD_MAX_WINDOW: i64 = 64;
 /// Absolute cap on the tuned chunk size (bytes).
-pub const HARD_MAX_CHUNK_SIZE: i64 = 16 * 1024 * 1024;
+///
+/// 64 MiB — deliberately far above the libfw default advertisement (32 MiB),
+/// because the chunk size is the only knob that reduces *request count*, and
+/// request count is what dominates a high-latency or proxy-fronted link. The
+/// memory cost is bounded by [`HARD_MAX_IN_FLIGHT_BYTES`] instead (one chunk
+/// per in-flight file), not by this ceiling.
+pub const HARD_MAX_CHUNK_SIZE: i64 = 64 * 1024 * 1024;
 /// Absolute cap on tuned in-flight bytes per direction
 /// (`concurrency × window × chunk_size`); the download path must hold the
 /// whole window in its reorder buffer, so this bounds peak memory too.
-/// 256 MiB is high enough to let the built-in caps (4 × 8 × 8 MiB) settle
-/// while still stopping an absurd advertisement from exhausting the tab.
+///
+/// 256 MiB. When `concurrency × window × chunk` exceeds it, the **window**
+/// gives way, not the chunk: shrinking a chunk multiplies request count,
+/// while shrinking a window only costs a little parallelism — and a few big
+/// chunks fill a bandwidth-delay product just as well as many small ones.
 pub const HARD_MAX_IN_FLIGHT_BYTES: u64 = 256 * 1024 * 1024;
+/// Requests per file the byte budget must still be able to keep in flight.
+///
+/// The budget is enforced by shrinking the *window* (see
+/// `TuningEngine::enforce_in_flight_budget`), because a smaller chunk would mean
+/// more requests, not less work. One request in flight cannot hide latency
+/// though, so the window never drops below this: a chunk too large for two
+/// in-flight requests per file is shrunk instead.
+pub const MIN_IN_FLIGHT_WINDOW: u64 = 2;
 /// Absolute cap on concurrent in-flight HTTP requests.
 ///
 /// The in-flight pool is sized `concurrency × per-file window` so it bounds
@@ -282,13 +308,26 @@ impl TuneParams {
         request_budget(self.concurrency, self.upload_window.max(self.download_window))
     }
 
-    /// The parameter table at the server's advertised minimums (ramp start).
-    pub fn from_caps_mins(caps: &Capabilities) -> TuneParams {
+    /// The parameter table a fresh ramp starts from.
+    ///
+    /// The window / concurrency dimensions start at the server's advertised
+    /// **minimums** (the conservative probe start), but the chunk size starts
+    /// at `seed_chunk` — the client's configured value — because the chunk is
+    /// a request granularity, not a parallelism knob: starting it at the
+    /// advertised minimum (256 KiB) slices the first upload round of a large
+    /// file into thousands of requests, and the ramp could only correct that
+    /// on a *later* round. Seeing 256 KiB requests on a link that can carry
+    /// 5 MiB ones is exactly the "frequent requests are slower" failure.
+    pub fn from_caps_mins(caps: &Capabilities, seed_chunk: u64) -> TuneParams {
         TuneParams {
             concurrency: floor_of(&caps.limits.concurrency, HARD_MAX_CONCURRENCY) as usize,
             upload_window: floor_of(&caps.limits.upload_window, HARD_MAX_WINDOW) as usize,
             download_window: floor_of(&caps.limits.download_window, HARD_MAX_WINDOW) as usize,
-            chunk_size: floor_of(&caps.limits.chunk_size, HARD_MAX_CHUNK_SIZE) as u64,
+            chunk_size: bounded(
+                seed_chunk.max(1) as i64,
+                &caps.limits.chunk_size,
+                HARD_MAX_CHUNK_SIZE,
+            ) as u64,
             compress_level: caps.compression.zrip_levels.min,
         }
     }
@@ -418,13 +457,24 @@ pub fn bdp_bytes(mbps: f64, rtt_ms: f64) -> u64 {
 /// One chunk should carry about this much of the link's throughput, so a
 /// wide/faster link gets few big requests (less per-request overhead, better
 /// per-request compression) while a narrow link keeps the advertised minimum
-/// (fine granularity, bounded memory) — 256 KiB even on a 30 Mb/s link.
+/// (fine granularity, bounded memory).
+///
+/// 400 ms, not 100 ms: a request is not free. Each chunk costs a round trip,
+/// an auth check, a fresh zstd context on both ends, a positional write and a
+/// range-bookkeeping update on the server, so a 100 ms payload does not
+/// amortize it. That is not theoretical — on a real LAN/NAS link the
+/// 100 ms profile issued several times more requests for the same bytes and
+/// finished *slower* than a large-chunk profile, i.e. the transport was
+/// throughput-limited by its own request rate rather than by the link. 400 ms
+/// amortizes the overhead while still giving ~2.5 requests per second per
+/// in-flight slot, far more resolution than a window of 2–8 needs to keep a
+/// pipe full.
 ///
 /// Deliberately *throughput-only*: an RTT term would make a single chunk as
 /// big as the whole bandwidth-delay product, which immediately satisfies the
 /// ramp's BDP rule and freezes cross-file concurrency at 1 — and uploads
 /// cannot sample an RTT at all (XHR exposes no TTFB).
-pub const TARGET_CHUNK_SPAN_MS: f64 = 100.0;
+pub const TARGET_CHUNK_SPAN_MS: f64 = 400.0;
 
 /// Boundary the derived chunk size is rounded down to (bytes).
 ///
@@ -435,8 +485,8 @@ pub const TARGET_CHUNK_SPAN_MS: f64 = 100.0;
 const CHUNK_ALIGN: u64 = 64 * 1024;
 
 /// The chunk size a link of this throughput can use, clamped into the
-/// server's advertised range, the client's hard ceiling and the in-flight
-/// memory budget (`budget_max`).
+/// server's advertised range, the client's hard ceiling and the per-request
+/// byte budget (`budget_max`, see `TuningEngine::max_chunk_for_request`).
 ///
 /// `mbps` is the engine's measured throughput for the current window.
 pub fn chunk_for_link(mbps: f64, range: &IntRange, budget_max: u64) -> u64 {
@@ -951,7 +1001,9 @@ impl TuningEngine {
     /// 2. a *cached* settle for this origin + direction that is still inside
     ///    its TTL and was measured against the same capabilities — so a page
     ///    refresh (or a later visit) skips the ramp;
-    /// 3. otherwise the advertised minimums (a fresh ramp).
+    /// 3. otherwise the advertised minimums for the window / concurrency
+    ///    dimensions and the configured chunk size for the chunk dimension (a
+    ///    fresh ramp).
     ///
     /// Returns the parameters the transfer should start with. With tuning
     /// disabled this is the static config-derived table, so callers can
@@ -1012,7 +1064,7 @@ impl TuningEngine {
                 self.phase = TunePhase::Settled;
             }
             None => {
-                self.params = TuneParams::from_caps_mins(caps);
+                self.params = TuneParams::from_caps_mins(caps, static_params.chunk_size);
                 self.params.compress_level = policy_level;
                 self.stats = TuneStats::default();
                 self.phase = TunePhase::Ramping;
@@ -1271,42 +1323,86 @@ impl TuningEngine {
         advertised.min(hard).max(1)
     }
 
-    /// Largest chunk size that keeps `concurrency × window × chunk` inside
-    /// [`HARD_MAX_IN_FLIGHT_BYTES`] for the widest direction.
-    fn max_chunk_for_budget(&self) -> u64 {
-        let widest = self.params.upload_window.max(self.params.download_window).max(1) as u64;
-        let divisor = (self.params.concurrency.max(1) as u64) * widest;
-        (HARD_MAX_IN_FLIGHT_BYTES / divisor).max(1)
+    /// Largest chunk size one *request* may use.
+    ///
+    /// The old rule divided [`HARD_MAX_IN_FLIGHT_BYTES`] by
+    /// `concurrency × widest window`, which made the chunk size a hostage of
+    /// the parallelism knobs: the built-in 4 × 8 table capped it at 8 MiB, and
+    /// every window raise *shrank* the maximum chunk further — so a link that
+    /// was keeping up got smaller requests, i.e. more of the overhead the chunk
+    /// size exists to amortize.
+    ///
+    /// A chunk is a request granularity, not a concurrency knob. The cap is now
+    /// "one chunk must fit the budget for every in-flight file"
+    /// (`HARD_MAX_IN_FLIGHT_BYTES / concurrency`, itself capped by
+    /// [`HARD_MAX_CHUNK_SIZE`]), and [`Self::enforce_in_flight_budget`] trades
+    /// the *window* down when the product no longer fits.
+    fn max_chunk_for_request(&self) -> u64 {
+        let per_file = HARD_MAX_IN_FLIGHT_BYTES / self.params.concurrency.max(1) as u64;
+        per_file
+            .max(1)
+            .min(HARD_MAX_CHUNK_SIZE as u64)
     }
 
     /// Point the chunk size at the measured link (see [`chunk_for_link`]).
     ///
-    /// A ±50 % deadband (hysteresis) keeps a link that hovers around a size
-    /// boundary from flipping the chunk back and forth every window — each
-    /// flip also re-aligns the remaining upload blocks / download batches, so
-    /// stability matters more than tracking the estimate exactly.
+    /// Growth is capped at 1.5× per window; shrinking needs the estimate to
+    /// drop by half. Both exist for the same reason: every move re-aligns the
+    /// remaining upload blocks / download batches, and a link that hovers
+    /// around a size boundary must not flip the size every window. Measured on
+    /// a throttled 300 ms-RTT link, letting the chunk jump straight to the
+    /// estimate changed nothing (15.1 s vs 15.3 s for 96 MiB) — the transfer is
+    /// bounded by per-byte cost there, not by how fast the size converges — so
+    /// the damped version is kept: it is the one with a proven behaviour.
     fn retune_chunk_size(&mut self, mbps: f64, caps: &Capabilities) {
-        let target = chunk_for_link(mbps, &caps.limits.chunk_size, self.max_chunk_for_budget());
+        let target = chunk_for_link(mbps, &caps.limits.chunk_size, self.max_chunk_for_request());
         let current = self.params.chunk_size.max(1);
         let grow = current.saturating_mul(3) / 2;
         let shrink = (current / 2).max(1);
         if target > grow || target < shrink {
             self.params.chunk_size = target;
             // A bigger chunk can push `concurrency × window × chunk` past the
-            // memory budget (it divides by the *widest* direction's window, so
-            // the mix matters); keep the table inside it.
+            // memory budget; the windows are what give way (see
+            // `enforce_in_flight_budget`).
             self.enforce_in_flight_budget();
         }
     }
 
-    /// Shrink the tuned chunk size into the in-flight byte budget.
+    /// Keep `concurrency × window × chunk` inside the in-flight byte budget.
     ///
-    /// Applied to the ramp-start table (whose values come straight from the
-    /// advertised minimums) and after every raise, so no sequence of
-    /// server-advertised values can push the engine past its memory budget.
+    /// Applied to the ramp-start table and after every raise / chunk re-size,
+    /// so no sequence of server-advertised values can push the engine past its
+    /// memory budget.
+    ///
+    /// The **window** is the dimension that gives way first. Clamping the chunk
+    /// size instead (the old behaviour) is the opposite trade: it reduces bytes
+    /// per request and therefore *increases* request count — the exact cost the
+    /// chunk size exists to avoid — while a smaller window merely means fewer
+    /// concurrent requests, and a handful of large chunks fills a
+    /// bandwidth-delay product as well as many small ones. The window has a
+    /// floor of two, though: one request in flight cannot hide latency, so a
+    /// table that not even that fits shrinks the chunk back down instead.
     fn enforce_in_flight_budget(&mut self) {
-        let max_chunk = self.max_chunk_for_budget();
+        let concurrency = self.params.concurrency.max(1) as u64;
+        let max_chunk = self.max_chunk_for_request();
         self.params.chunk_size = self.params.chunk_size.clamp(1, max_chunk);
+
+        // Total in-flight chunks the budget can hold, split across the files
+        // that may be transferring at once.
+        let per_file = |chunk: u64| (HARD_MAX_IN_FLIGHT_BYTES / chunk.max(1) / concurrency).max(1);
+        let mut window_cap = per_file(self.params.chunk_size);
+        if window_cap < MIN_IN_FLIGHT_WINDOW {
+            // The chunk is too big to keep two requests per file in flight.
+            // Give it back down to what the window floor needs — the last
+            // resort, because it costs requests.
+            let chunk_cap =
+                (HARD_MAX_IN_FLIGHT_BYTES / (concurrency * MIN_IN_FLIGHT_WINDOW)).max(1);
+            self.params.chunk_size = self.params.chunk_size.min(chunk_cap);
+            window_cap = per_file(self.params.chunk_size);
+        }
+        let window_cap = window_cap as usize;
+        self.params.upload_window = self.params.upload_window.clamp(1, window_cap);
+        self.params.download_window = self.params.download_window.clamp(1, window_cap);
     }
 
     fn dim_at_cap(&self, caps: &Capabilities) -> bool {
@@ -1741,14 +1837,18 @@ mod tests {
     // --- engine behaviour ---------------------------------------------------
 
     #[test]
-    fn begin_transfer_miss_ramps_from_mins() {
+    fn begin_transfer_miss_ramps_from_mins_but_seeds_the_chunk() {
         let mut e = TuningEngine::new(true, CompressLevel::Balanced);
         e.set_direction(TransferKind::Upload);
         let p = e.begin_transfer(&caps(), 0.0, &static_params());
         assert_eq!(e.phase(), TunePhase::Ramping);
+        // Window / concurrency still probe from the advertised minimums…
         assert_eq!(p.concurrency, 1);
         assert_eq!(p.upload_window, 1);
-        assert_eq!(p.chunk_size, 262_144);
+        // …but the chunk starts at the configured size: starting a ramp at the
+        // advertised minimum (256 KiB) sliced the first upload round of a big
+        // file into thousands of requests before the tuner could react.
+        assert_eq!(p.chunk_size, 2 * 1024 * 1024);
     }
 
     #[test]
@@ -1859,6 +1959,52 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_budget_shrinks_the_window_not_the_chunk() {
+        let mut e = engine();
+        // A table whose product is over the budget: 4 files × 8 in flight ×
+        // 32 MiB. The chunk must survive — shrinking it would multiply the
+        // request count, which is the cost the chunk size exists to avoid —
+        // and the window is what comes down.
+        e.params.concurrency = 4;
+        e.params.upload_window = 8;
+        e.params.download_window = 4;
+        e.params.chunk_size = 32 * 1024 * 1024;
+        e.enforce_in_flight_budget();
+
+        let p = e.params();
+        assert_eq!(
+            p.chunk_size,
+            32 * 1024 * 1024,
+            "the chunk is a request granularity, not the dimension that gives way"
+        );
+        assert_eq!(p.upload_window, 2, "256 MiB / (4 files × 32 MiB) = 2");
+        assert_eq!(p.download_window, 2);
+        assert!(p.upload_in_flight() <= HARD_MAX_IN_FLIGHT_BYTES);
+        assert!(p.download_in_flight() <= HARD_MAX_IN_FLIGHT_BYTES);
+    }
+
+    #[test]
+    fn a_configured_chunk_larger_than_the_old_budget_is_honoured() {
+        // The old cap was `budget / (concurrency × window)` = 8 MiB for the
+        // default 4 × 8 table, so a client that asked for 16 MiB silently got
+        // 8 MiB — the "the chunk never grows" half of the slow-transfer
+        // report. One chunk per in-flight file is the rule now.
+        let mut caps_wide = caps();
+        caps_wide.limits.concurrency = IntRange {
+            default: 4,
+            max: 4,
+            min: 4,
+        };
+        caps_wide.limits.chunk_size.max = 64 * 1024 * 1024;
+        let mut e = TuningEngine::new(true, CompressLevel::Balanced);
+        e.set_direction(TransferKind::Upload);
+        let mut sp = static_params();
+        sp.chunk_size = 16 * 1024 * 1024;
+        let p = e.begin_transfer(&caps_wide, 0.0, &sp);
+        assert_eq!(p.chunk_size, 16 * 1024 * 1024);
+    }
+
+    #[test]
     fn inverted_advertised_range_does_not_panic() {
         let mut broken = caps();
         broken.limits.concurrency = IntRange {
@@ -1888,6 +2034,20 @@ mod tests {
         // High-latency profile (400 ms RTT): BDP ≈ 5 MB at 100 Mbps, so the
         // ramp can climb the whole window dimension before saturating.
         // Deltas double every window (12.5 → 25 → 50 MB/s) → +100% gain.
+        //
+        // The advertised chunk ceiling is held at 1 MiB here: with a
+        // multi-MiB chunk the in-flight window alone covers the BDP, which
+        // (correctly) settles the ramp before cross-file concurrency is ever
+        // raised — a different path, covered by the chunk-size and budget
+        // tests below.
+        let mut narrow_chunks = caps();
+        narrow_chunks.limits.chunk_size = IntRange {
+            default: 262_144,
+            max: 1024 * 1024,
+            min: 262_144,
+        };
+        e.begin_transfer(&narrow_chunks, 0.0, &static_params());
+
         let mut t = 1_000.0;
         let mut done = 12_500_000u64;
         let mut delta = 12_500_000u64;
@@ -1900,6 +2060,7 @@ mod tests {
         }
         // Window: 1 → 2 → 4 → 8 (max). Next raise hits the cap → advance.
         assert_eq!(e.params().upload_window, 8);
+        assert_eq!(e.params().chunk_size, 1024 * 1024, "capped by the advertisement");
         let ev = e.tick(t, done, Some(400.0), false).unwrap();
         assert_eq!(ev.params.upload_window, 8); // capped
         t += 1_000.0;
@@ -1912,6 +2073,7 @@ mod tests {
         let ev = e.tick(t + 1_000.0, done + delta * 2, Some(400.0), false).unwrap();
         assert_eq!(ev.params.concurrency, 4);
         assert_eq!(ev.params.upload_window, 8);
+        assert_eq!(ev.params.chunk_size, 1024 * 1024);
     }
 
     #[test]
@@ -1948,17 +2110,25 @@ mod tests {
         // 2 flat windows and the ramp then moves on to the next one instead of
         // settling. The chunk size is not a ramp dimension — it follows the
         // measured link (see the `chunk_for_link` tests).
+        //
+        // 1 s RTT on purpose: the chunk is 400 ms of the link (~5 MB) and the
+        // window is 2, so ~10 MB is in flight. A 400 ms RTT would put the BDP
+        // at 5 MB, i.e. the BDP rule would (correctly) settle on the
+        // concurrency dimension after one step — that path is covered by
+        // `ramp_raises_window_then_concurrency_until_cap`. The flat-gain
+        // exploration is only observable while in-flight < BDP.
+        let rtt = Some(1_000.0);
         let step = 12_500_000u64;
         let mut done = step;
         let mut t = 1_000.0;
 
         // Window: one pseudo-gain raise, then 2 flat windows → explore.
-        let ev = e.tick(t, done, Some(400.0), false).unwrap();
+        let ev = e.tick(t, done, rtt, false).unwrap();
         assert_eq!(ev.params.upload_window, 2);
         for _ in 0..2 {
             t += 1_000.0;
             done += step;
-            e.tick(t, done, Some(400.0), false);
+            e.tick(t, done, rtt, false);
         }
         assert_eq!(
             e.phase(),
@@ -1969,11 +2139,11 @@ mod tests {
         // Cross-file concurrency is the last dimension → 2 flat windows settle.
         t += 1_000.0;
         done += step;
-        let ev = e.tick(t, done, Some(400.0), false).unwrap();
+        let ev = e.tick(t, done, rtt, false).unwrap();
         assert_eq!(ev.phase, TunePhase::Ramping);
         t += 1_000.0;
         done += step;
-        let ev = e.tick(t, done, Some(400.0), false).unwrap();
+        let ev = e.tick(t, done, rtt, false).unwrap();
         assert_eq!(ev.phase, TunePhase::Settled);
         assert_eq!(ev.params.upload_window, 2);
         e.transfer_end(true);
@@ -1982,11 +2152,11 @@ mod tests {
     #[test]
     fn chunk_size_tracks_the_link_and_ignores_jitter() {
         let mut e = engine();
-        // First window ≈100 Mb/s → 100 ms of it, 64 KiB-aligned.
+        // First window ≈100 Mb/s → 400 ms of it, 64 KiB-aligned.
         let mut done = 12_500_000u64;
         let ev = e.tick(1_000.0, done, Some(400.0), false).unwrap();
         let first = ev.params.chunk_size;
-        assert_eq!(first, 1_245_184, "the chunk must follow the measured link");
+        assert_eq!(first, 4_980_736, "the chunk must follow the measured link");
 
         // ±10 % jitter must not move it (the deadband absorbs it, and every
         // move re-aligns the in-flight block list).
@@ -2015,14 +2185,15 @@ mod tests {
         let budget = 8 * 1024 * 1024;
         // Unknown link → the advertised minimum (never a guess).
         assert_eq!(chunk_for_link(0.0, &range, budget), 262_144);
-        // Narrow/slow link: still the min (100 ms of 10 Mb/s < 256 KiB).
-        assert_eq!(chunk_for_link(10.0, &range, budget), 262_144);
-        // Wider band → bigger chunk (100 ms of the link, 64 KiB-aligned).
-        assert_eq!(chunk_for_link(30.0, &range, budget), 327_680);
-        assert_eq!(chunk_for_link(100.0, &range, budget), 1_245_184);
+        // 400 ms of the link, 64 KiB-aligned (≈448 KiB at 10 Mb/s — the extra
+        // payload per request is the whole point: at 400 ms the per-request
+        // overhead is amortized instead of dominating).
+        assert_eq!(chunk_for_link(10.0, &range, budget), 458_752);
+        assert_eq!(chunk_for_link(30.0, &range, budget), 1_441_792);
+        assert_eq!(chunk_for_link(100.0, &range, budget), 4_980_736);
         // …capped by the advertised max…
         assert_eq!(chunk_for_link(1_000.0, &range, budget), 8 * 1024 * 1024);
-        // …and by the in-flight byte budget.
+        // …and by the per-request byte budget.
         assert_eq!(chunk_for_link(1_000.0, &range, 1_500_000), 1_500_000);
         // Monotonic in bandwidth, and never below the advertised minimum.
         let mut last = 0;
@@ -2071,7 +2242,9 @@ mod tests {
         let fresh = engine();
         assert_eq!(fresh.phase(), TunePhase::Ramping);
         assert_eq!(fresh.params().upload_window, 1);
-        assert_eq!(fresh.params().chunk_size, 262_144);
+        // The window re-probes from the advertised minimum; the chunk starts
+        // from the configured size (see `from_caps_mins`).
+        assert_eq!(fresh.params().chunk_size, 2 * 1024 * 1024);
     }
 
     // --- persisted (browser) tuning cache -----------------------------------

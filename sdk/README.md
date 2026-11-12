@@ -101,9 +101,14 @@ Notes:
   in-flight request budget as `concurrency × max(uploadWindow,
   downloadWindow)`, so raising a window actually increases parallelism (it
   used to be capped by `concurrency` alone).
-- `chunkSize` is used by both directions. The download path buffers in-flight
-  chunks for reordering, so peak memory is roughly
-  `downloadWindow × chunkSize`.
+- `chunkSize` is used by both directions and is the unit of per-request
+  overhead — a bigger chunk means fewer requests, which on a fast link beats
+  more parallelism. It is also the starting point of an `autoTune` ramp (the
+  tuner tracks the measured link from there, inside the advertised range).
+  The download path buffers in-flight chunks for reordering, so peak memory is
+  roughly `downloadWindow × chunkSize`; when `concurrency × window × chunkSize`
+  exceeds the engine budget the in-flight window shrinks first (down to two
+  requests per file), not the chunk.
 - `compressLevel` is a client *policy*, resolved against the server's
   advertised range. `'auto'` additionally micro-benchmarks the range on a
   real sample of the first uploaded file; downloads request the resolved
@@ -262,9 +267,12 @@ are sanitized; `..` and drive-like segments are rejected.
 With `autoTune: true` the engine fetches `/capabilities`, starts at the
 advertised minimums and ramps the per-file window, then cross-file
 concurrency, from 1-second EWMA measurements. The chunk size follows the
-measured throughput (~100 ms of data, clamped into the advertised range); the
-zrip level is a policy, never ramped. Errors halve the parameters and require
-two stable windows before settling.
+measured throughput (~400 ms of data, clamped into the advertised range), and a
+fresh ramp starts from the configured `chunkSize` rather than the advertised
+minimum: a chunk is the unit of per-request overhead, so starting small means
+thousands of round trips for bytes the link could have carried in a few big
+requests. The zrip level is a policy, never ramped. Errors halve the parameters
+and require two stable windows before settling.
 
 A settle is reused by later transfers in the same client **and** cached in
 `localStorage`:

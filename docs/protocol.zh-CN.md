@@ -254,7 +254,7 @@ Authorization: Bearer <token>
     "concurrency":    { "default": 4, "max": 4, "min": 1 },
     "uploadWindow":   { "default": 8, "max": 8, "min": 1 },
     "downloadWindow": { "default": 4, "max": 4, "min": 1 },
-    "chunkSize":      { "default": 2097152, "max": 8388608, "min": 262144 },
+    "chunkSize":      { "default": 2097152, "max": 33554432, "min": 262144 },
     "maxUploadSize": 21474836480,
     "maxRetries": 3,
     "timeoutMs": 60000

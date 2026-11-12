@@ -57,7 +57,11 @@ fn request(method: &str, uri: &str, headers: HeaderMap, body: Body) -> Request<B
 
 async fn status(resp: axum::response::Response) -> StatusCode {
     let code = resp.status();
-    let _ = resp.into_body().collect().await;
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    if !code.is_success() {
+        eprintln!("  !! {code}: {}", String::from_utf8_lossy(&body));
+    }
+    let _ = body;
     code
 }
 

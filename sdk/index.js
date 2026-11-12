@@ -224,7 +224,11 @@ export class LibfwClient {
    * @param {number} [options.chunkSize=2097152] shared chunk size in bytes for
    *        both upload chunks and parallel download ranges. The same value is
    *        used on both paths, and any value works as long as the server and
-   *        memory budget permit it (larger = fewer, bigger requests).
+   *        memory budget permit it (larger = fewer, bigger requests — the
+   *        per-request overhead is what makes a small chunk slow on a fast
+   *        link, so raise this on a LAN/fast link or behind a proxy that
+   *        charges a round trip per request). It is also the starting point of
+   *        an `autoTune` ramp.
    * @param {number} [options.maxRetries=3] retries per chunk/file before failing
    * @param {number} [options.baseRetryDelayMs=500] initial backoff (ms)
    * @param {number} [options.maxRetryDelayMs=30000] backoff ceiling (ms)
@@ -247,8 +251,9 @@ export class LibfwClient {
    *        engine: the engine probes the server's `/capabilities` limits and
    *        TCP-style ramps the per-file window and cross-file concurrency from
    *        the advertised minimums using real transfer stats; the chunk size
-   *        follows the measured throughput (~100 ms of it, clamped into the
-   *        advertised range) and the zrip level is a client policy from
+   *        follows the measured throughput (~400 ms of it, clamped into the
+   *        advertised range) starting from the configured `chunkSize`, and the
+   *        zrip level is a client policy from
    *        `compressLevel`, never ramped. When disabled the configured static
    *        values are used as-is. A settled result is kept in memory for this
    *        client instance (reused by later transfers, dropped on failure)

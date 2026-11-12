@@ -42,6 +42,7 @@ wasm-pack build crates/libfw-client --target web --out-dir ../../sdk/pkg --relea
 | `LIBFW_PATH_KEY` | 未设置 | 64 个十六进制字符 → 启用 `EncryptedPathCodec`（AES-256-GCM 影子路径） |
 | `LIBFW_CLEANUP_INTERVAL` | `3600` | 陈旧会话临时文件清理周期（`30s`、`15m`、`2h`、`1d`） |
 | `LIBFW_SESSION_TTL` | `24h` | 被放弃的 `.libfw-sess-*` 临时文件最大存活时间 |
+| `LIBFW_TEMP_DIR` | 未设置 | 上传中的临时文件放到该目录，不落在存储根目录里 |
 
 ```bash
 # 加密影子路径
@@ -49,6 +50,9 @@ LIBFW_PATH_KEY=$(openssl rand -hex 32) cargo run -p axum-server -- data 8080
 
 # 开发时更快的清理
 LIBFW_CLEANUP_INTERVAL=60s LIBFW_SESSION_TTL=10m cargo run -p axum-server -- data 8080
+
+# 换盘做暂存：被服务的目录里永远不会出现半成品文件
+LIBFW_TEMP_DIR=/var/tmp/libfw-staging cargo run -p axum-server -- data 8080
 ```
 
 ## 试试 API

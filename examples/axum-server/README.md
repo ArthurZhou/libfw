@@ -45,6 +45,7 @@ wire contract.
 | `LIBFW_PATH_KEY` | unset | 64 hex chars → enable `EncryptedPathCodec` (AES-256-GCM shadow paths) |
 | `LIBFW_CLEANUP_INTERVAL` | `3600` | stale session-temp sweep period (`30s`, `15m`, `2h`, `1d`) |
 | `LIBFW_SESSION_TTL` | `24h` | max age of an abandoned `.libfw-sess-*` temp |
+| `LIBFW_TEMP_DIR` | unset | keep in-flight upload temps here instead of inside the storage root |
 
 ```bash
 # encrypted shadow paths
@@ -52,6 +53,9 @@ LIBFW_PATH_KEY=$(openssl rand -hex 32) cargo run -p axum-server -- data 8080
 
 # faster dev cleanup
 LIBFW_CLEANUP_INTERVAL=60s LIBFW_SESSION_TTL=10m cargo run -p axum-server -- data 8080
+
+# staging on another disk: the served tree never holds a half-written file
+LIBFW_TEMP_DIR=/var/tmp/libfw-staging cargo run -p axum-server -- data 8080
 ```
 
 ## Try the API

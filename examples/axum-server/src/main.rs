@@ -137,8 +137,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(libfw_core::DEFAULT_SESSION_TTL);
 
     let state = Arc::new({
+        let mut storage = FsStorage::new(&root);
+        //   LIBFW_TEMP_DIR — keep in-flight upload temps out of the served
+        //                    tree (e.g. when the root is rsynced or scanned).
+        if let Some(dir) = std::env::var_os("LIBFW_TEMP_DIR") {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir)?;
+            tracing::info!("upload temps: {} (outside the served tree)", dir.display());
+            storage = storage.with_temp_dir(dir);
+        }
         let mut builder = ServerState::builder()
-            .storage(FsStorage::new(&root))
+            .storage(storage)
             .verifier(DevTokenVerifier)
             .validator(PathValidator::new())
             .cleanup_interval(cleanup_interval)
