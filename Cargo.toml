@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.6"
+version = "0.4.7"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/ArthurZhou/libfw"
@@ -21,9 +21,9 @@ authors = ["ArthurZhou <az@d2lib.com>"]
 # NB: `version` is required so `cargo publish` can rewrite the path to a
 # crates.io dependency when publishing libfw-server / libfw-client.
 # Keep these in sync with [workspace.package] version above.
-libfw-core = { path = "crates/libfw-core", version = "0.4.6" }
-libfw-server = { path = "crates/libfw-server", version = "0.4.6" }
-libfw-client = { path = "crates/libfw-client", version = "0.4.6" }
+libfw-core = { path = "crates/libfw-core", version = "0.4.7" }
+libfw-server = { path = "crates/libfw-server", version = "0.4.7" }
+libfw-client = { path = "crates/libfw-client", version = "0.4.7" }
 
 # Core / shared
 serde = { version = "1", features = ["derive"] }

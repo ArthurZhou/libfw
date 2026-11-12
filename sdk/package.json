@@ -1,6 +1,6 @@
 {
   "name": "libfw-client",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "libfw client for browsers, providing high performance file transfer capabilities using WebAssembly.",
   "license": "MIT",
   "type": "module",
