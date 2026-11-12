@@ -130,23 +130,36 @@ const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
     { timeout: 180000 },
   );
   const resent = postOffsets.slice(killedPosts);
-  const coveredEnd = Math.max(
-    0,
-    ...probes
-      .filter((p) => p.status === 200)
-      .map((p) => {
-        try {
-          return Math.max(0, ...JSON.parse(p.body).ranges.map((r) => r[1]));
-        } catch {
-          return 0;
-        }
-      }),
-  );
+  // What the server actually holds is a range SET, not a prefix: a killed
+  // concurrent upload leaves holes (the chunks still in flight never landed),
+  // e.g. `[[0,7340032],[8388608,9437184]]`. So "only the missing bytes" means
+  // every re-sent offset falls OUTSIDE the received set, and the frontier that
+  // matters is the covered end nearest the cursor — not the max end of the
+  // whole set. Asserting `min(resent) >= max(range ends)` would demand that a
+  // hole be left unfilled, i.e. it would demand a corrupt file.
+  const receivedRanges = probes
+    .filter((p) => p.status === 200)
+    .flatMap((p) => {
+      try {
+        return JSON.parse(p.body).ranges;
+      } catch {
+        return [];
+      }
+    });
+  const coveredEnd = receivedRanges.reduce((m, r) => Math.max(m, r[1]), 0);
+  const coveredBytes = receivedRanges.reduce((n, r) => n + (r[1] - r[0]), 0);
+  const inReceived = (off) => receivedRanges.some(([s, e]) => s <= off && off < e);
+  const overlapping = resent.filter(inReceived);
   check('upload: the reloaded page probed and saw the partial', coveredEnd > 0, `coveredEnd=${coveredEnd}`);
   check(
-    'upload: only the missing tail was re-sent',
-    resent.length > 0 && Math.min(...resent) >= coveredEnd,
-    `min=${Math.min(...resent)} coveredEnd=${coveredEnd} blocks=${resent.length}`,
+    'upload: no byte the server already held was re-sent',
+    resent.length > 0 && overlapping.length === 0,
+    `${resent.length} blocks, ${overlapping.length} overlapping the received set (${JSON.stringify(receivedRanges)})`,
+  );
+  check(
+    'upload: the re-sent bytes cover exactly the holes',
+    resent.length > 0 && resent.length <= receivedRanges.length + 8,
+    `blocks=${resent.length} holes=${receivedRanges.length} coveredBytes=${coveredBytes} coveredEnd=${coveredEnd}`,
   );
   const upGot = await page.evaluate(
     async ({ base, token, name }) => {
