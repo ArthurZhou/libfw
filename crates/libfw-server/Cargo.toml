@@ -38,3 +38,5 @@ tempfile = "3"
 tower.workspace = true
 http-body-util = "0.1"
 futures.workspace = true
+# Only for the sweeper tests, which have to backdate a temp's mtime.
+libc = "0.2"

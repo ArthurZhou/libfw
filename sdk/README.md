@@ -78,7 +78,7 @@ directory picker, so they must run from a user gesture (a click handler).
 | `concurrency` | `4` | max files transferred in parallel |
 | `uploadWindow` | `8` | in-flight chunks per single-file upload |
 | `downloadWindow` | `4` | in-flight `Range` GETs per single-file download (`1` = sequential) |
-| `compress` | `true` | request/send zrip (zstd) compression |
+| `compress` | `true` | request/send zrip (zstd) compression — costs CPU per byte; on a link faster than the compressor (LAN, ≥30 MiB/s) `false` is several times faster, and uploads then take a zero-copy `Blob` path |
 | `compressLevel` | `'balanced'` | `'auto'` \| `'fast'` \| `'balanced'` \| `'max'` \| number; `'auto'` benchmarks uploads |
 | `chunkSize` | `2097152` (2 MiB) | shared chunk size for uploads and download ranges |
 | `maxRetries` | `3` | retries per chunk/file |
@@ -218,11 +218,13 @@ try {
   disk in order. Each range retries independently; `Range`/`If-Range`/`416`
   give resume against the server ETag. Files at or below 512 KiB stay on the
   sequential path.
-- **Uploads** — slice each file, compress each chunk into zrip frames, probe
-  the server's received ranges (`x-libfw-session-status`), POST only the
-  missing chunks with their absolute offset (out of order), then commit with
-  `x-libfw-final: 1`. A commit that fails re-probes and refills rather than
-  failing the task.
+- **Uploads** — slice each file, probe the server's received ranges
+  (`x-libfw-session-status`), POST only the missing chunks with their absolute
+  offset (out of order), then commit with `x-libfw-final: 1`. Chunks are
+  compressed into zrip frames when `compress` is on; when it is off the engine
+  hands the browser a `Blob` of the chunk instead, so the bytes are streamed
+  straight from the file and never enter JS or WASM memory. A commit that fails
+  re-probes and refills rather than failing the task.
 - **State machine** — `idle → downloading/uploading → paused → resumed →
   completed/failed`. `pause()` stops scheduling new work; in-flight requests
   are allowed to finish.

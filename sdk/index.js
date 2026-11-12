@@ -461,6 +461,7 @@ export class LibfwClient {
       },
       getFileList: () => this._getFileList(),
       readFile: (path, offset, length) => this._readFile(path, offset, length),
+      readFileBlob: (path, offset, length) => this._readFileBlob(path, offset, length),
       log: (msg) => {
         if (typeof console !== 'undefined') console.debug(`[libfw] ${msg}`);
       },
@@ -1325,6 +1326,28 @@ export class LibfwClient {
     const blob = file.slice(offset, offset + length);
     const buffer = await blob.arrayBuffer();
     return new Uint8Array(buffer);
+  }
+
+  /**
+   * Engine callback: a `Blob` view of `length` bytes of an upload file.
+   *
+   * Used by the pass-through path (`compress: false`): the engine hands this
+   * `Blob` straight to `XMLHttpRequest`, so the browser streams the range out
+   * of the file and no byte is read into JS or copied into WASM. Keeps the
+   * promise shape of {@link LibfwClient#_readFile} because the engine awaits
+   * every file callback.
+   * @param {string} path
+   * @param {number} offset
+   * @param {number} length
+   * @returns {Promise<Blob>}
+   * @private
+   */
+  async _readFileBlob(path, offset, length) {
+    const file = this._uploadFiles.get(path);
+    if (!file) {
+      throw new LibfwError(`upload source not found: ${path}`, 'storage');
+    }
+    return file.slice(offset, offset + length);
   }
 
   // ------------------------------------------------------------- controls

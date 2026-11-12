@@ -832,22 +832,18 @@ impl UploadSink for FsSink {
         // sidecar so a later probe / resume knows this part is already on
         // disk and only missing gaps need to be re-sent.
         //
-        // The read-merge-write is serialized by the per-target guard this
-        // sink holds for its whole lifetime: concurrent chunks of the SAME
-        // session each hold a *stale* in-memory `ranges` copy loaded when
-        // their sink was opened, so a bare `persist_ranges` would clobber
-        // other chunks' ranges (lost update) and make the commit coverage
-        // check reject a fully-written file. Re-reading under the guard
-        // keeps every writer's merge based on the latest on-disk state.
+        // No re-read of the sidecar is needed: the per-target guard is held for
+        // this sink's whole lifetime, and `ranges` was loaded under it when the
+        // sink opened, so it is the authoritative set for this temp the entire
+        // time. (The old read-merge-write-per-write paid a JSON parse on every
+        // frame on top of the write itself.)
         if let Some(blocks) = self.blocks_path.clone() {
             let _guard = self.target_guard.as_ref().expect("session sink holds a guard");
-            let mut current = read_ranges(&blocks).await?;
-            merge_range(&mut current, ChunkRange {
+            merge_range(&mut self.ranges, ChunkRange {
                 start: offset,
                 end: offset.saturating_add(buf.len() as u64),
             });
-            persist_ranges(&blocks, &current).await?;
-            self.ranges = current;
+            persist_ranges(&blocks, &self.ranges).await?;
         }
         Ok(())
     }
@@ -989,7 +985,46 @@ mod tests {
         // Open writable: on Windows, setting file times through a read-only
         // handle is refused.
         let file = std::fs::OpenOptions::new().write(true).open(path)?;
-        file.set_times(std::fs::FileTimes::new().set_modified(time))
+        let res = file.set_times(std::fs::FileTimes::new().set_modified(time));
+        if res.is_ok() {
+            return res;
+        }
+        // `File::set_times` goes through futimens(fd); hardened sandboxes
+        // (seccomp filters that only allow the path-based form) reject it with
+        // EPERM while utimensat(path) still works. Backdate by path instead so
+        // the sweeper tests also run in those environments.
+        path_utime(path, time).map_err(|_| res.unwrap_err())
+    }
+
+    /// Path-based `utimensat`: the fallback for [`filetime_set`].
+    #[cfg(unix)]
+    fn path_utime(path: &Path, time: std::time::SystemTime) -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let since_epoch = time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| std::io::Error::other(e))?;
+        let ts = libc::timespec {
+            tv_sec: since_epoch.as_secs() as libc::time_t,
+            tv_nsec: since_epoch.subsec_nanos() as libc::c_long,
+        };
+        let times = [ts, ts]; // atime, mtime
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::other(e))?;
+        // SAFETY: `c_path` is a valid NUL-terminated path and `times` is a
+        // two-element array, which is exactly what utimensat expects.
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// Non-Unix platforms never need the fallback.
+    #[cfg(not(unix))]
+    fn path_utime(_path: &Path, _time: std::time::SystemTime) -> std::io::Result<()> {
+        Err(std::io::Error::other("no path-based utime on this platform"))
     }
 
     #[tokio::test]

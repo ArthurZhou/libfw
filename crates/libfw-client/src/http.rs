@@ -227,12 +227,40 @@ where
 /// object). When `on_progress` is set it is invoked on every upload progress
 /// tick with `(loaded, total)` bytes, so the engine can report **wire-level**
 /// progress in real time instead of jumping per completed chunk. The promise
-/// resolves with the HTTP status (u16 as f64) and rejects on network error
-/// or no-progress timeout.
+/// The body of an upload request.
+///
+/// A chunk that needs compressing must exist in WASM memory, but a chunk that
+/// is sent as-is does not: the JS layer can hand over a `Blob` view of the
+/// `File` itself, which the browser streams straight from disk. That avoids
+/// every intermediate copy (`Blob` → `ArrayBuffer` → WASM `Vec<u8>` → a fresh
+/// `Uint8Array` for XHR) *and* is measurably faster on the wire: the same bytes
+/// uploaded as a `Blob` ran at ~46 MiB/s against ~22 MiB/s as a `Uint8Array`
+/// (8 MiB bodies, loopback, sequential XHR).
+pub enum XhrBody<'a> {
+    /// Bytes living in WASM linear memory (compressed payloads, empty bodies).
+    Bytes(&'a [u8]),
+    /// A JS `Blob` (typically a `File.slice`) sent as-is, without ever being
+    /// materialized in JS or WASM.
+    Blob(&'a web_sys::Blob),
+}
+
+/// Send `body` once the request is set up, accepting either representation.
+fn xhr_send(xhr: &XmlHttpRequest, body: &XhrBody<'_>) -> Result<(), JsValue> {
+    match body {
+        XhrBody::Bytes(bytes) => xhr.send_with_opt_u8_array(Some(bytes)),
+        // `send_with_opt_blob` keeps the browser in charge of reading the file
+        // (and of setting Content-Length from the Blob's size).
+        XhrBody::Blob(blob) => xhr.send_with_opt_blob(Some(blob)),
+    }
+}
+
+/// `XMLHttpRequest`-based POST that only fails after `timeout_ms` without
+/// progress; resolves with the HTTP status (u16 as f64) and rejects on network
+/// error or no-progress timeout.
 pub fn xhr_post(
     url: &str,
     header_pairs: &[(String, String)],
-    body: &[u8],
+    body: XhrBody<'_>,
     timeout_ms: u32,
     on_progress: Option<Rc<dyn Fn(u64, u64)>>,
 ) -> Result<js_sys::Promise, LibfwError> {
@@ -264,6 +292,40 @@ pub fn xhr_post(
     let progress_holder: Rc<RefCell<Option<Closure<dyn FnMut(web_sys::ProgressEvent)>>>> =
         Rc::new(RefCell::new(None));
 
+    // Tear the request down when it settles.
+    //
+    // Two steps, in this order, and neither is optional:
+    //  1. detach every handler, so a `progress` / `readystatechange` event that
+    //     is already queued can no longer reach a closure;
+    //  2. drop the closures on a later task, never from inside one of them —
+    //     freeing a closure while its own JS function is on the stack makes the
+    //     next dispatch land on freed memory, which surfaces as
+    //     "closure invoked recursively or after being dropped" (seen under a
+    //     slow link where upload-progress events queue up behind the settle).
+    let release: Rc<dyn Fn()> = {
+        let xhr = xhr.clone();
+        let upload = upload.clone();
+        let window = window.clone();
+        let holders = holders.clone();
+        let progress_holder = progress_holder.clone();
+        Rc::new(move || {
+            xhr.set_onreadystatechange(None);
+            let target: &XmlHttpRequestEventTarget = xhr.unchecked_ref();
+            target.set_onerror(None);
+            target.set_onabort(None);
+            let up: &XmlHttpRequestEventTarget = upload.unchecked_ref();
+            up.set_onprogress(None);
+            let holders = holders.clone();
+            let progress_holder = progress_holder.clone();
+            let drop_handlers = Closure::once_into_js(move || {
+                holders.borrow_mut().clear();
+                progress_holder.borrow_mut().take();
+            });
+            let cb: &js_sys::Function = drop_handlers.unchecked_ref();
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(cb, 0);
+        })
+    };
+
     let promise = js_sys::Promise::new(&mut |resolve, reject| {
         let xhr = xhr.clone();
         let window = window.clone();
@@ -286,8 +348,7 @@ pub fn xhr_post(
             let finished = finished.clone();
             let watchdog_id = watchdog_id.clone();
             let reject = reject.clone();
-            let holders = holders.clone();
-            let progress_holder = progress_holder.clone();
+            let release = release.clone();
             Closure::wrap(Box::new(move || {
                 if finished.get() {
                     return;
@@ -295,6 +356,7 @@ pub fn xhr_post(
                 if js_sys::Date::now() - deadline.get() > timeout_ms as f64 {
                     finished.set(true);
                     window.clear_interval_with_handle(watchdog_id.get());
+                    release();
                     let _ = xhr.abort();
                     let _ = reject.call1(
                         &JsValue::NULL,
@@ -302,8 +364,6 @@ pub fn xhr_post(
                             "libfw upload stalled for {timeout_ms}ms (no progress)"
                         )),
                     );
-                    holders.borrow_mut().clear();
-                    progress_holder.borrow_mut().take();
                 }
             }) as Box<dyn FnMut()>)
         };
@@ -350,8 +410,7 @@ pub fn xhr_post(
             let watchdog_id = watchdog_id.clone();
             let resolve = resolve.clone();
             let reject = reject.clone();
-            let holders = holders.clone();
-            let progress_holder = progress_holder.clone();
+            let release = release.clone();
             Closure::wrap(Box::new(move || {
                 if finished.get() {
                     return;
@@ -363,6 +422,9 @@ pub fn xhr_post(
                 if state == 4 {
                     finished.set(true);
                     window.clear_interval_with_handle(watchdog_id.get());
+                    // Detach before reporting: the status is already known, and
+                    // a queued progress event must not run a dropped closure.
+                    release();
                     let status = xhr.status().unwrap_or(0);
                     if status > 0 {
                         let _ = resolve.call1(&JsValue::NULL, &JsValue::from_f64(status as f64));
@@ -372,8 +434,6 @@ pub fn xhr_post(
                             &JsValue::from_str("libfw upload network error (empty status)"),
                         );
                     }
-                    holders.borrow_mut().clear();
-                    progress_holder.borrow_mut().take();
                 }
             }) as Box<dyn FnMut()>)
         };
@@ -386,17 +446,15 @@ pub fn xhr_post(
             let finished = finished.clone();
             let watchdog_id = watchdog_id.clone();
             let reject = reject.clone();
-            let holders = holders.clone();
-            let progress_holder = progress_holder.clone();
+            let release = release.clone();
             Closure::wrap(Box::new(move || {
                 if finished.get() {
                     return;
                 }
                 finished.set(true);
                 window.clear_interval_with_handle(watchdog_id.get());
+                release();
                 let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("libfw upload network error"));
-                holders.borrow_mut().clear();
-                progress_holder.borrow_mut().take();
             }) as Box<dyn FnMut()>)
         };
         let xhr_target: &XmlHttpRequestEventTarget = xhr.unchecked_ref();
@@ -410,30 +468,28 @@ pub fn xhr_post(
             let finished = finished.clone();
             let watchdog_id = watchdog_id.clone();
             let reject = reject.clone();
-            let holders = holders.clone();
-            let progress_holder = progress_holder.clone();
+            let release = release.clone();
             Closure::wrap(Box::new(move || {
                 if finished.get() {
                     return;
                 }
                 finished.set(true);
                 window.clear_interval_with_handle(watchdog_id.get());
+                release();
                 let _ = reject.call1(&JsValue::NULL, &JsValue::from_str("libfw upload aborted"));
-                holders.borrow_mut().clear();
-                progress_holder.borrow_mut().take();
             }) as Box<dyn FnMut()>)
         };
         xhr_target.set_onabort(Some(on_abort.as_ref().unchecked_ref()));
         holders.borrow_mut().push(on_abort);
 
-        // Fire the request (web-sys accepts the raw byte slice directly).
-        if let Err(e) = xhr.send_with_opt_u8_array(Some(body)) {
+        // Fire the request: either the WASM-side bytes (compressed payloads)
+        // or a Blob the browser streams straight out of the file.
+        if let Err(e) = xhr_send(&xhr, &body) {
+            release();
             let _ = reject.call1(
                 &JsValue::NULL,
                 &JsValue::from_str(&format!("libfw xhr.send failed: {e:?}")),
             );
-            holders.borrow_mut().clear();
-            progress_holder.borrow_mut().take();
         }
     });
 

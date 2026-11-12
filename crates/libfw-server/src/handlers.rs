@@ -540,6 +540,20 @@ async fn upload_session(
     // error handling below).
     let mut disconnected = false;
 
+    // The client slices each upload chunk into ~64 KiB zstd frames (so no frame
+    // can exceed the server's per-frame cap), so the decompressor hands us data
+    // one small frame at a time. Writing every frame on its own costs a
+    // positional write *plus* a `.blocks` read-merge-write each time — 1536
+    // sidecar passes for a 96 MiB file, which measured as half the achievable
+    // throughput (93 → 48 MiB/s). Coalesce into ~1 MiB writes: identical bytes
+    // and identical range bookkeeping, 16× fewer syscalls and sidecar passes.
+    //
+    // A disconnect drops whatever is still buffered, which is exactly right:
+    // those bytes were never written, so the recorded ranges never claim them
+    // and the client re-sends them.
+    const WRITE_COALESCE_BYTES: usize = 1024 * 1024;
+    let mut pending: Vec<u8> = Vec::with_capacity(WRITE_COALESCE_BYTES);
+
     let write_result: Result<(), ApiError> = async {
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -554,15 +568,23 @@ async fn upload_session(
                 .map_err(|e| ApiError::BadRequest(format!("compressed stream invalid: {e}")))?;
             let data = std::mem::take(&mut out);
             if !data.is_empty() {
-                write_at_batch(&mut sink, state, base_offset, meta.size, &mut written, &data)
-                    .await?;
+                pending.extend_from_slice(&data);
+                if pending.len() >= WRITE_COALESCE_BYTES {
+                    write_at_batch(&mut sink, state, base_offset, meta.size, &mut written, &pending)
+                        .await?;
+                    pending.clear();
+                }
             }
         }
         decomp
             .finish(&mut out)
             .map_err(|e| ApiError::BadRequest(format!("compressed stream truncated: {e}")))?;
         if !out.is_empty() {
-            write_at_batch(&mut sink, state, base_offset, meta.size, &mut written, &out).await?;
+            pending.extend_from_slice(&out);
+        }
+        if !pending.is_empty() {
+            write_at_batch(&mut sink, state, base_offset, meta.size, &mut written, &pending).await?;
+            pending.clear();
         }
         Ok(())
     }

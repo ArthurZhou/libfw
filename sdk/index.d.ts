@@ -125,7 +125,17 @@ export interface LibfwClientOptions {
    * parallelism (sequential downloads). Default `4`.
    */
   downloadWindow?: number;
-  /** Negotiate zrip compression. Default `true`. */
+  /**
+   * Negotiate zrip compression. Default `true`.
+   *
+   * Compression runs in WASM, so it costs CPU per byte: on a fast link
+   * (LAN/loopback, or anything above roughly 30 MiB/s) turning it off is
+   * several times faster end to end — the same 32 MiB file uploaded at
+   * ~19 MiB/s compressed and ~125 MiB/s uncompressed in Chromium. It pays for
+   * itself only when the link is slower than the compressor (WAN, mobile).
+   * With `false`, uploads also take the zero-copy path: the engine hands the
+   * browser a `Blob` of the chunk and never touches the bytes itself.
+   */
   compress?: boolean;
   /**
    * zrip level policy when `compress` is on. `'fast'` = advertised minimum
