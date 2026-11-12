@@ -19,6 +19,10 @@ pub enum AuthRejection {
     #[error("{0}")]
     Unauthorized(String),
     /// `403 Forbidden` — valid token but insufficient rights.
+    ///
+    /// The embedded `path` is echoed into the response body, so it must be
+    /// the **client-visible** (shadow) path — never a server-side storage
+    /// path, which a translating codec is meant to hide.
     #[error("permission denied: {action} on `{path}`")]
     Forbidden { path: String, action: String },
 }

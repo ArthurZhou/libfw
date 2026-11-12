@@ -82,11 +82,28 @@ impl IntoResponse for ApiError {
                 *r.status_mut() = StatusCode::NOT_MODIFIED;
                 return r;
             }
-            ApiError::Storage(StorageError::NotFound(p)) => {
-                return (StatusCode::NOT_FOUND, p).into_response();
+            ApiError::Storage(StorageError::NotFound(_)) => {
+                // Never echo the server-resolved path back: with a
+                // translating codec (Mount/Encrypted) the storage path is
+                // exactly what the server must hide, and even the identity
+                // codec leaks server-side layout. The client already knows
+                // the shadow path it requested.
+                return (StatusCode::NOT_FOUND, "file not found".to_string()).into_response();
             }
-            ApiError::Storage(StorageError::AlreadyExists(p)) => {
-                return (StatusCode::CONFLICT, p).into_response();
+            ApiError::Storage(StorageError::AlreadyExists(_)) => {
+                return (
+                    StatusCode::CONFLICT,
+                    "a file already exists at this path".to_string(),
+                )
+                    .into_response();
+            }
+            ApiError::Storage(StorageError::TooManySessions) => {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many concurrent upload sessions; finish or wait for the sweeper"
+                        .to_string(),
+                )
+                    .into_response();
             }
             ApiError::Storage(StorageError::TooLarge(_)) => {
                 return (
@@ -118,8 +135,15 @@ impl IntoResponse for ApiError {
                 StatusCode::BAD_REQUEST,
                 "malformed range header".to_string(),
             ),
-            ApiError::Storage(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-            ApiError::Io(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+            ApiError::Storage(_) => {
+                // Deliberately generic: the error's text may embed a
+                // server-side filesystem path (io::Error messages do).
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal storage error".to_string())
+            }
+            ApiError::Io(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal server error".to_string(),
+            ),
         }
         .into_response()
     }
@@ -156,18 +180,23 @@ pub(crate) async fn capabilities(
 
 /// Map a [`PathResolveError`] to HTTP: malformed/tampered shadows are
 /// `400`, authorization failures keep their usual `401`/`403` shape.
-fn resolve_error(err: PathResolveError) -> ApiError {
+///
+/// `shadow` is the client-supplied path. Authorization failures are
+/// reported **in terms of the shadow**, never the decoded real path: the
+/// real path is exactly what a translating codec hides, and an
+/// unauthorized client must not learn it from a 403 body.
+fn resolve_error(err: PathResolveError, shadow: &str) -> ApiError {
     match err {
         PathResolveError::Invalid(msg) => ApiError::BadRequest(msg.to_string()),
         PathResolveError::Codec(e) => ApiError::BadRequest(e.to_string()),
-        PathResolveError::Auth(auth) => authorize_request_error(auth),
+        PathResolveError::Auth(auth) => authorize_request_error(auth, shadow),
     }
 }
 
-fn authorize_request_error(err: AuthError) -> ApiError {
+fn authorize_request_error(err: AuthError, shadow: &str) -> ApiError {
     match err {
-        AuthError::Forbidden { path, action } => ApiError::Auth(AuthRejection::Forbidden {
-            path,
+        AuthError::Forbidden { action, .. } => ApiError::Auth(AuthRejection::Forbidden {
+            path: shadow.to_string(),
             action: action.to_string(),
         }),
         other => ApiError::Auth(AuthRejection::Unauthorized(other.to_string())),
@@ -185,7 +214,7 @@ async fn plan_download(
         .storage
         .file_meta(&path)
         .await?
-        .ok_or_else(|| ApiError::NotFound(path.clone()))?;
+        .ok_or_else(|| ApiError::NotFound("file not found".to_string()))?;
 
     // If-None-Match → 304.
     if let Some(v) = req_headers
@@ -337,7 +366,7 @@ pub(crate) async fn download(
 ) -> Result<Response, ApiError> {
     let path = state
         .resolve_client_path(&claims, &path, Action::Read)
-        .map_err(resolve_error)?;
+        .map_err(|e| resolve_error(e, &path))?;
     let plan = plan_download(&state, &path, &req_headers, true).await?;
 
     let reader = plan.reader.expect("reader requested");
@@ -359,7 +388,7 @@ pub(crate) async fn head_file(
 ) -> Result<Response, ApiError> {
     let path = state
         .resolve_client_path(&claims, &path, Action::Read)
-        .map_err(resolve_error)?;
+        .map_err(|e| resolve_error(e, &path))?;
     let plan = plan_download(&state, &path, &req_headers, false).await?;
     let mut builder = Response::builder().status(plan.status);
     for (name, value) in plan.headers {
@@ -684,7 +713,7 @@ pub(crate) async fn upload(
     // Shadow → real, with authorization against the real path.
     let path = state
         .resolve_client_path(&claims, &path, Action::Write)
-        .map_err(resolve_error)?;
+        .map_err(|e| resolve_error(e, &path))?;
 
     let meta_header = headers
         .get(HEADER_FILE_META)
@@ -856,7 +885,7 @@ async fn list_dir_impl(
     // Shadow → real, with authorization against the real path.
     let path = state
         .resolve_client_path(claims, path, Action::Read)
-        .map_err(resolve_error)?;
+        .map_err(|e| resolve_error(e, path))?;
     let mut entries = state.storage.list_dir(&path).await?;
     // Outbound: every entry path must be a shadow path the client can use
     // directly in a follow-up download/upload URL.

@@ -328,3 +328,50 @@ struct DirList(Vec<DirEntry>);
 struct DirEntry {
     path: String,
 }
+
+// ---------------------------------------------------------------------------
+// Error-body sanitization: no server-side path may reach a client
+// ---------------------------------------------------------------------------
+
+/// A 403 must describe the denial in terms of the client-visible shadow —
+/// never the decoded real path, which is exactly what a translating codec
+/// is meant to hide from unauthorized clients.
+#[tokio::test]
+async fn forbidden_body_never_echoes_real_path() {
+    let app = router(restricted_state());
+    let codec = EncryptedPathCodec::new(KEY);
+
+    // Valid shadow of an unauthorized real path → 403.
+    let out_shadow = codec.encode("etc/passwd");
+    let resp = app
+        .oneshot(request("GET", &format!("/file/{out_shadow}"), auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = body_string(resp).await;
+    assert!(
+        !body.contains("etc/passwd"),
+        "403 body must not leak the real path: {body}"
+    );
+}
+
+/// A 404 for a valid shadow of a missing file must be generic — no real
+/// path, no server-side layout hint.
+#[tokio::test]
+async fn not_found_body_is_generic() {
+    let app = router(state());
+    let codec = EncryptedPathCodec::new(KEY);
+
+    let missing = codec.encode("docs/definitely-missing.txt");
+    let resp = app
+        .oneshot(request("GET", &format!("/file/{missing}"), auth_header("tok"), Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_string(resp).await;
+    assert_eq!(body, "file not found", "404 body must be generic");
+    assert!(
+        !body.contains("definitely-missing"),
+        "404 body must not leak the decoded real path: {body}"
+    );
+}

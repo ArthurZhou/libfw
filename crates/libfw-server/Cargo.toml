@@ -33,6 +33,10 @@ sha2.workspace = true
 tracing.workspace = true
 tokio-stream = "0.1"
 
+# O_NOFOLLOW for the symlink-TOCTOU hardening in `storage.rs`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 tower.workspace = true

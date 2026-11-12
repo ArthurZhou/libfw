@@ -255,12 +255,19 @@ impl FsStorage {
     /// Called asynchronously by the I/O methods that open existing paths so
     /// the symlink check never blocks a tokio worker thread. New (not yet
     /// existing) path tails are skipped — they cannot be symlinks.
+    ///
+    /// This is a *pre-open* check: a local attacker who can write inside the
+    /// storage root can swap in a symlink between this check and the actual
+    /// open (TOCTOU). [`FsStorage::open_nofollow`] and
+    /// [`FsStorage::verify_opened_file`] close the remaining window for the
+    /// opens that matter.
     async fn check_symlinks(&self, full: &Path) -> Result<(), StorageError> {
         // Strip the root prefix to iterate only the virtual path components.
-        let rel = match full.strip_prefix(&self.root) {
-            Ok(r) => r,
-            Err(_) => return Ok(()), // shouldn't happen; treat as safe
-        };
+        // Fail CLOSED: an unexpected prefix means the path escaped the root
+        // somehow, which must be an error, never "treat as safe".
+        let rel = full.strip_prefix(&self.root).map_err(|_| {
+            StorageError::Unsupported("internal error: path escaped the storage root")
+        })?;
         let mut probe = self.root.clone();
         for component in rel.components() {
             probe.push(component);
@@ -275,6 +282,81 @@ impl FsStorage {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(StorageError::Other(e)),
             }
+        }
+        Ok(())
+    }
+
+    /// Open options that refuse to follow a symlink at the final path
+    /// component (Unix; a no-op elsewhere).
+    ///
+    /// Closes the final-component half of the check-then-open TOCTOU window:
+    /// a symlink planted at the leaf between [`FsStorage::check_symlinks`]
+    /// and the open fails the open itself instead of being traversed.
+    fn open_nofollow() -> tokio::fs::OpenOptions {
+        let mut opts = tokio::fs::OpenOptions::new();
+        #[cfg(unix)]
+        {
+            // `tokio::fs::OpenOptions` implements `OpenOptionsExt` on Unix.
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        opts
+    }
+
+    /// Verify that the file just opened at `path` is still inside the
+    /// containment `base` and is the very file the pre-open symlink check
+    /// approved.
+    ///
+    /// Two independent post-open probes narrow the TOCTOU window that
+    /// [`FsStorage::check_symlinks`] alone cannot close:
+    ///
+    /// 1. **Containment** — fully resolve every symlink component
+    ///    (`canonicalize`); if the canonical location falls outside `base`,
+    ///    the open traversed a symlink that appeared after the pre-check.
+    /// 2. **Identity** (Unix) — the opened fd and the path's *lstat* must
+    ///    agree on `(dev, ino)`. This catches the swap-back trick (symlink
+    ///    swapped in for the open, then removed before the containment
+    ///    probe): the fd then refers to a different inode than the path.
+    ///
+    /// Residual gap: an intermediate component swapped to a symlink that
+    /// stays *inside* the root passes both probes (the target is contained
+    /// and both stats agree). That redirects an open to another file within
+    /// the root — a within-root integrity hazard, never an escape.
+    async fn verify_opened_file(
+        &self,
+        file: &tokio::fs::File,
+        path: &Path,
+        base: &Path,
+    ) -> Result<(), StorageError> {
+        let base = tokio::fs::canonicalize(base)
+            .await
+            .map_err(StorageError::Other)?;
+        let canon = tokio::fs::canonicalize(path)
+            .await
+            .map_err(StorageError::Other)?;
+        if !canon.starts_with(&base) {
+            return Err(StorageError::Unsupported(
+                "path must not traverse a symlink",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let fd = file
+                .metadata()
+                .await
+                .map_err(StorageError::Other)?;
+            let on_disk = tokio::fs::symlink_metadata(path)
+                .await
+                .map_err(StorageError::Other)?;
+            if (fd.dev(), fd.ino()) != (on_disk.dev(), on_disk.ino()) {
+                return Err(StorageError::Unsupported(
+                    "path changed under the symlink check",
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = file;
         }
         Ok(())
     }
@@ -318,9 +400,12 @@ impl StorageBackend for FsStorage {
     ) -> Result<Box<dyn Read + Send>, StorageError> {
         let full = self.resolve(path)?;
         self.check_symlinks(&full).await?;
-        let mut file = tokio::fs::File::open(&full)
+        let mut file = Self::open_nofollow()
+            .read(true)
+            .open(&full)
             .await
-            .map_err(|e| StorageError::Other(e))?;
+            .map_err(StorageError::Other)?;
+        self.verify_opened_file(&file, &full, &self.root).await?;
         if range.start > 0 {
             tokio::io::AsyncSeekExt::seek(&mut file, SeekFrom::Start(range.start))
                 .await
@@ -361,9 +446,15 @@ impl StorageBackend for FsStorage {
                     .await
                     .map_err(|e| StorageError::Other(e))?;
                 let tmp = self.new_temp_path(&full, path);
-                let file = tokio::fs::File::create(&tmp)
+                let file = Self::open_nofollow()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp)
                     .await
-                    .map_err(|e| StorageError::Other(e))?;
+                    .map_err(StorageError::Other)?;
+                self.verify_opened_file(&file, &tmp, &self.scratch_dir(&full))
+                    .await?;
                 Ok(Box::new(FsSink {
                     file,
                     tmp: Some(tmp),
@@ -383,12 +474,13 @@ impl StorageBackend for FsStorage {
                 // lifetime so they take turns (the loser re-checks the
                 // length only after the winner's commit/rejection).
                 let target_guard = Some(self.lock_for(&full).lock_owned().await);
-                let file = tokio::fs::OpenOptions::new()
+                let file = Self::open_nofollow()
                     .write(true)
                     .append(true)
                     .open(&full)
                     .await
-                    .map_err(|e| StorageError::Other(e))?;
+                    .map_err(StorageError::Other)?;
+                self.verify_opened_file(&file, &full, &self.root).await?;
                 let current = file
                     .metadata()
                     .await
@@ -464,12 +556,20 @@ impl StorageBackend for FsStorage {
             // shared temp for positional (seek + write) access. `mode` is
             // ignored; the already-received ranges are reloaded from the
             // sidecar so the client can resume only the missing parts.
-            tokio::fs::OpenOptions::new()
+            //
+            // The session temp name is deterministic, so a local attacker
+            // who can write into the scratch dir could plant a symlink at
+            // exactly this path; O_NOFOLLOW makes such an open fail instead
+            // of following the link outside the root.
+            let file = Self::open_nofollow()
                 .read(true)
                 .write(true)
                 .open(&tmp)
                 .await
-                .map_err(|e| StorageError::Other(e))?
+                .map_err(StorageError::Other)?;
+            self.verify_opened_file(&file, &tmp, &self.scratch_dir(&full))
+                .await?;
+            file
         } else {
             // First request for this session: create the shared temp.
             match mode {
@@ -481,12 +581,26 @@ impl StorageBackend for FsStorage {
                     {
                         return Err(StorageError::AlreadyExists(path.to_string()));
                     }
-                    tokio::fs::OpenOptions::new()
+                    // Bound the number of live session temps this owner can
+                    // accumulate in the scratch directory: otherwise a
+                    // client could cycle arbitrary session ids and create an
+                    // unbounded number of `.libfw-sess-*` temps + `.blocks`
+                    // sidecars (disk/inode exhaustion until the — default
+                    // 24 h — sweeper collects them). Counting real files
+                    // means commit/abort/sweep each free capacity again.
+                    let live = count_live_sessions(&self.scratch_dir(&full), &safe_owner).await?;
+                    if live >= MAX_SESSIONS_PER_DIR {
+                        return Err(StorageError::TooManySessions);
+                    }
+                    let file = Self::open_nofollow()
                         .write(true)
                         .create_new(true)
                         .open(&tmp)
                         .await
-                        .map_err(|e| StorageError::Other(e))?
+                        .map_err(StorageError::Other)?;
+                    self.verify_opened_file(&file, &tmp, &self.scratch_dir(&full))
+                        .await?;
+                    file
                 }
                 // Resumable sessions are driven by the per-block probe (the
                 // client asks "what ranges do you have?" and sends only the
@@ -752,6 +866,42 @@ impl StorageBackend for FsStorage {
 /// temp name, so the prefix check covers them too.
 fn is_reserved_name(name: &str) -> bool {
     name.starts_with(".libfw-")
+}
+
+/// Cap on live session-upload temps one owner may hold in a scratch
+/// directory (see [`count_live_sessions`]).
+///
+/// Generous for any real client — the SDK keeps at most a handful of
+/// concurrent uploads per server — while an attacker cycling session ids
+/// hits the wall after 64 temps instead of unbounded disk growth.
+const MAX_SESSIONS_PER_DIR: usize = 64;
+
+/// Number of live session temps `owner` has in `dir` (sidecars excluded).
+///
+/// Both temp layouts — next-to-target (`.libfw-sess-{owner}-{session}-{name}`)
+/// and shared scratch dir (`.libfw-sess-{owner}-{session}-{tag}-{name}`) —
+/// share the `.libfw-sess-{owner}-` prefix, so a prefix scan finds them
+/// regardless of layout. Sidecars are named `{temp}.blocks` /
+/// `{temp}.blocks.tmp` and are excluded so the count is a number of
+/// *sessions*, matching [`MAX_SESSIONS_PER_DIR`].
+async fn count_live_sessions(dir: &Path, owner: &str) -> Result<usize, StorageError> {
+    let prefix = format!(".libfw-sess-{owner}-");
+    let mut n = 0usize;
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(StorageError::Other(e)),
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(&prefix)
+            && !name.ends_with(".blocks")
+            && !name.ends_with(".blocks.tmp")
+        {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Run of the mill file name of a target path.
@@ -1296,6 +1446,95 @@ mod tests {
 
         storage.remove("sub").await.unwrap();
         assert!(!dir.path().join("sub").exists());
+    }
+
+    /// Cycling session ids must stop at [`MAX_SESSIONS_PER_DIR`] temps per
+    /// owner; another owner is unaffected, and aborted sessions free the
+    /// capacity again.
+    #[tokio::test]
+    async fn session_temp_quota_is_enforced_per_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path());
+
+        let mut sinks = Vec::new();
+        for i in 0..MAX_SESSIONS_PER_DIR {
+            let sink = storage
+                .write_stream_session(
+                    "f.txt",
+                    &format!("s{i}"),
+                    "owner-a",
+                    WriteMode::Overwrite,
+                )
+                .await
+                .unwrap();
+            sinks.push(sink);
+        }
+        // One more session for the same owner hits the cap …
+        let res = storage
+            .write_stream_session("f.txt", "overflow", "owner-a", WriteMode::Overwrite)
+            .await;
+        assert!(
+            matches!(res, Err(StorageError::TooManySessions)),
+            "expected TooManySessions for a 65th live session of the same owner"
+        );
+        // … while a different owner is unaffected (owner tag isolates temps).
+        storage
+            .write_stream_session("f.txt", "s0", "owner-b", WriteMode::Overwrite)
+            .await
+            .unwrap();
+
+        // Aborting removes the temps, freeing capacity for new sessions.
+        for sink in sinks {
+            sink.abort().await.unwrap();
+        }
+        storage
+            .write_stream_session("f.txt", "fresh", "owner-a", WriteMode::Overwrite)
+            .await
+            .unwrap();
+    }
+
+    /// A symlink planted at the (deterministic) session temp path must fail
+    /// the open instead of being followed outside the root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_temp_symlink_is_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path());
+
+        let planted = dir.path().join(".libfw-sess-ownertag-s1-f.txt");
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, b"do not touch").unwrap();
+        symlink(&victim, &planted).unwrap();
+
+        let res = storage
+            .write_stream_session("f.txt", "s1", "ownertag", WriteMode::Overwrite)
+            .await;
+        assert!(res.is_err(), "open through a planted symlink must fail");
+        // The link target was never written through.
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+    }
+
+    /// A symlink planted at a download target must never be followed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_through_symlink_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let storage = FsStorage::new(dir.path());
+
+        let victim = outside.path().join("secret.txt");
+        std::fs::write(&victim, b"secret").unwrap();
+        symlink(&victim, dir.path().join("link.txt")).unwrap();
+
+        let res = storage
+            .read_stream("link.txt", RangeSpec::full(6))
+            .await;
+        assert!(res.is_err(), "reading through a symlink must be refused");
     }
 
     #[tokio::test]

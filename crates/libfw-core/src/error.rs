@@ -61,6 +61,12 @@ pub enum StorageError {
     /// through a read-only handle).
     #[error("operation not supported: {0}")]
     Unsupported(&'static str),
+    /// Too many in-progress upload sessions: the backend refuses to create
+    /// another session temp until existing ones are committed, aborted or
+    /// swept. Guards against a client exhausting disk/inodes with
+    /// unbounded session ids.
+    #[error("too many concurrent upload sessions")]
+    TooManySessions,
     /// Any other backend failure.
     #[error("storage error: {0}")]
     Other(#[from] io::Error),
