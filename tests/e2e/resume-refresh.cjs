@@ -62,8 +62,16 @@ const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
   const probes = [];
   const rangeGets = [];
   page.on('request', (r) => {
-    if (r.method() === 'POST' && r.url().includes('/file/') && r.postData()?.length) {
-      postOffsets.push(Number(r.headers()['x-libfw-offset']));
+    // Data chunks are POSTed as `Blob`s (see `XhrBody::Bytes` in http.rs), and
+    // Playwright cannot read a Blob-backed XHR's body, so `postData()` is
+    // empty. Identify a DATA chunk by its offset header, skipping the session
+    // probe / commit — both of which also carry `x-libfw-offset`.
+    if (r.method() === 'POST' && r.url().includes('/file/')) {
+      const h = r.headers();
+      const off = h['x-libfw-offset'];
+      if (!off || off === '') return;
+      if (h['x-libfw-session-status'] || h['x-libfw-final']) return;
+      postOffsets.push(Number(off));
     }
     if (r.method() === 'GET' && r.url().includes('/file/') && r.headers()['range']) {
       rangeGets.push(r.headers()['range']);

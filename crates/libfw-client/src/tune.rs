@@ -470,10 +470,18 @@ pub fn bdp_bytes(mbps: f64, rtt_ms: f64) -> u64 {
 /// in-flight slot, far more resolution than a window of 2–8 needs to keep a
 /// pipe full.
 ///
-/// Deliberately *throughput-only*: an RTT term would make a single chunk as
-/// big as the whole bandwidth-delay product, which immediately satisfies the
-/// ramp's BDP rule and freezes cross-file concurrency at 1 — and uploads
-/// cannot sample an RTT at all (XHR exposes no TTFB).
+/// Deliberately *throughput-only* when no latency sample exists: an RTT term
+/// would make a single chunk as big as the whole bandwidth-delay product,
+/// which immediately satisfies the ramp's BDP rule and freezes cross-file
+/// concurrency at 1. Uploads used to be in exactly that position (XHR exposes
+/// no TTFB, so no RTT could be sampled) and the span had to be a fixed guess.
+///
+/// That is no longer true — [`crate::upload`] now derives a latency sample from
+/// a completed request's duration — so [`chunk_for_link_with_rtt`] can also
+/// take the round trip into account. This constant remains the floor: a chunk
+/// should never represent *less* than this much link time, because the
+/// per-request overhead (RTT, auth, a fresh zstd context, a positional write,
+/// a range-bookkeeping update) is what it amortizes.
 pub const TARGET_CHUNK_SPAN_MS: f64 = 400.0;
 
 /// Boundary the derived chunk size is rounded down to (bytes).
@@ -490,12 +498,42 @@ const CHUNK_ALIGN: u64 = 64 * 1024;
 ///
 /// `mbps` is the engine's measured throughput for the current window.
 pub fn chunk_for_link(mbps: f64, range: &IntRange, budget_max: u64) -> u64 {
+    chunk_for_link_with_rtt(mbps, None, range, budget_max)
+}
+
+/// [`chunk_for_link`] with an optional latency sample.
+///
+/// With a round trip available the chunk is sized to at least one BDP, because
+/// that is what makes a *single* request able to fill the pipe: on a
+/// 24 Mbit/s, 400 ms link the BDP is 1.2 MB, and the measured 64 MiB upload
+/// spent 6.1 s issuing 2–6 MiB requests whose count — not whose size — was the
+/// bottleneck (each request cost a full round trip, and the ramp could only
+/// grow the size by 1.5× per second). Sizing the chunk from the *product* of
+/// throughput and latency converges in one window instead of five, and it is
+/// the same rule the window uses, so the two dimensions stop fighting: a chunk
+/// that spans one round trip needs exactly [one slot] to saturate the link,
+/// and the window keeps whatever parallelism the BDP is worth.
+///
+/// Still bounded by the span rule's floor (a chunk never represents less than
+/// [`TARGET_CHUNK_SPAN_MS`] of link time) and by the request budget.
+pub fn chunk_for_link_with_rtt(
+    mbps: f64,
+    rtt_ms: Option<f64>,
+    range: &IntRange,
+    budget_max: u64,
+) -> u64 {
     let floor = floor_of(range, HARD_MAX_CHUNK_SIZE).max(1) as u64;
     if !mbps.is_finite() || mbps <= 0.0 {
         return floor.min(budget_max.max(1)).max(1);
     }
     // bytes = bits/s ÷ 8 × span(s), rounded to a tidy boundary
-    let bytes = (mbps * 1e6 / 8.0 * TARGET_CHUNK_SPAN_MS / 1_000.0).clamp(0.0, i64::MAX as f64) as u64;
+    let span = TARGET_CHUNK_SPAN_MS.max(
+        // Only a real sample moves the floor: a BDP smaller than the span rule
+        // would shrink chunks on low-latency links, which is the opposite of
+        // what the span rule was tuned for.
+        rtt_ms.filter(|r| r.is_finite() && *r > 0.0).unwrap_or(0.0),
+    );
+    let bytes = (mbps * 1e6 / 8.0 * span / 1_000.0).clamp(0.0, i64::MAX as f64) as u64;
     let aligned = (bytes / CHUNK_ALIGN).saturating_mul(CHUNK_ALIGN);
     let clamped = bounded(aligned.max(1) as i64, range, HARD_MAX_CHUNK_SIZE) as u64;
     clamped.clamp(1, budget_max.max(1))
@@ -768,6 +806,13 @@ pub struct TuningEngine {
     /// Direction the in-memory settle applies to (window dimensions differ per
     /// direction, so a download must not inherit an upload's settle).
     settled_direction: Option<TransferKind>,
+    /// Chunk size the first RTT-informed sizing chose, if it already happened.
+    ///
+    /// `None` while the transfer is still running on its seed chunk. The
+    /// difference matters because the seed is a guess (the client's configured
+    /// size) while a later estimate is a measurement, so only the first move
+    /// off the seed may skip the 1.5×-per-window damping.
+    rtt_sized_chunk: Option<u64>,
     /// Whether we settled from a Degraded hold (not from a full ramp), in
     /// which case the halved parameter set is not reused as a baseline.
     post_degrade_settle: bool,
@@ -819,6 +864,7 @@ impl TuningEngine {
             settled: None,
             settled_caps_hash: String::new(),
             settled_direction: None,
+            rtt_sized_chunk: None,
             post_degrade_settle: false,
             direction: TransferKind::Download,
             store: None,
@@ -1032,6 +1078,7 @@ impl TuningEngine {
         self.rtt_ewma = None;
         self.rtt_baseline = None;
         self.degraded_windows = 0;
+        self.rtt_sized_chunk = None;
 
         // The compression level is a *client policy*, not a ramped dimension
         // (the ramp only moves window / concurrency / chunk size), so it is
@@ -1354,13 +1401,38 @@ impl TuningEngine {
     /// estimate changed nothing (15.1 s vs 15.3 s for 96 MiB) — the transfer is
     /// bounded by per-byte cost there, not by how fast the size converges — so
     /// the damped version is kept: it is the one with a proven behaviour.
+    ///
+    /// The one case the damping must NOT apply to is the first sizing of a
+    /// transfer: the seed chunk is a client guess, and holding it for a 1.5×
+    /// step per second is what left a 64 MiB upload on a 400 ms link stuck at
+    /// 10 MiB/s for its whole duration. Once a latency sample exists the
+    /// estimate is a direct measurement of the link, so the first move to an
+    /// RTT-sized chunk is taken in full.
     fn retune_chunk_size(&mut self, mbps: f64, caps: &Capabilities) {
-        let target = chunk_for_link(mbps, &caps.limits.chunk_size, self.max_chunk_for_request());
+        let rtt = self.rtt_ewma.filter(|r| *r > 0.0);
+        let target = chunk_for_link_with_rtt(
+            mbps,
+            rtt,
+            &caps.limits.chunk_size,
+            self.max_chunk_for_request(),
+        );
         let current = self.params.chunk_size.max(1);
+        if target == current {
+            return;
+        }
         let grow = current.saturating_mul(3) / 2;
         let shrink = (current / 2).max(1);
-        if target > grow || target < shrink {
+        // A first RTT-informed sizing may jump straight to the target; later
+        // moves stay damped so a jittering estimate cannot re-slice constantly.
+        let first_rtt_sizing = rtt.is_some() && self.rtt_sized_chunk.is_none();
+        let moving_up = target > current;
+        if (moving_up && (target > grow || first_rtt_sizing)) || (!moving_up && target < shrink) {
             self.params.chunk_size = target;
+            if first_rtt_sizing && moving_up {
+                // Record that the seed has been replaced by a measured size:
+                // from here on only the damped rule applies.
+                self.rtt_sized_chunk = Some(target);
+            }
             // A bigger chunk can push `concurrency × window × chunk` past the
             // memory budget; the windows are what give way (see
             // `enforce_in_flight_budget`).
@@ -1412,7 +1484,9 @@ impl TuningEngine {
     fn raise_dim(&mut self, caps: &Capabilities) {
         let dim_max: i64 = self.dim_max(caps);
         // Multiplicative increase (×2) until near the cap, then additive
-        // (+1) — TCP slow-start style.
+        // (+1) — TCP slow-start style. When the in-flight bytes can be turned
+        // into a target directly (see `window_target`), that target wins over
+        // the blind doubling.
         let step = |v: i64| -> i64 {
             if v <= 0 {
                 1
@@ -1423,19 +1497,73 @@ impl TuningEngine {
             }
         };
         match self.dim {
-            RampDim::Window => match self.last_transfer_kind() {
-                TransferKind::Upload => {
-                    self.params.upload_window = step(self.params.upload_window as i64).max(1) as usize
+            RampDim::Window => {
+                let targeted = self.window_target().map(|t| t as i64);
+                let next = |v: i64| -> i64 {
+                    match targeted {
+                        // Jump to the computed target; never shrink here (a
+                        // raise must not lower the dimension) and never jump
+                        // past the cap.
+                        Some(t) => t.clamp(v, dim_max),
+                        None => step(v),
+                    }
+                };
+                match self.last_transfer_kind() {
+                    TransferKind::Upload => {
+                        self.params.upload_window = next(self.params.upload_window as i64).max(1) as usize
+                    }
+                    TransferKind::Download => {
+                        self.params.download_window =
+                            next(self.params.download_window as i64).max(1) as usize
+                    }
                 }
-                TransferKind::Download => {
-                    self.params.download_window =
-                        step(self.params.download_window as i64).max(1) as usize
-                }
-            },
+            }
             RampDim::Concurrency => {
                 self.params.concurrency = step(self.params.concurrency as i64).max(1) as usize
             }
         }
+    }
+
+    /// How many chunks per file the measured link needs in flight, if that can
+    /// be computed from this window's measurements.
+    ///
+    /// The ramp's slowest part is the *serial* doubling of the window: each
+    /// window costs a full second of measurement, and on a high-latency link a
+    /// window only carries one or two round trips, so reaching a useful window
+    /// took four windows (measured: 6.1 s to fill a 24 MB/s + 300 ms link,
+    /// still not saturated when the file ran out).
+    ///
+    /// The window exists to keep `bandwidth-delay product / chunk` chunks in
+    /// flight. Once one block round completes, both numbers are measurable:
+    /// throughput from the bytes moved and the latency from the round itself,
+    /// so the window the link wants can be computed outright instead of walked
+    /// up to. The estimate is only trusted when it is *larger* than the current
+    /// window (a raise) and is capped by the advertised maximum — an
+    /// overestimate is corrected by the next window's gain check, while an
+    /// underestimate only costs one more round.
+    fn window_target(&self) -> Option<usize> {
+        if self.phase != TunePhase::Ramping || self.dim != RampDim::Window {
+            return None;
+        }
+        let caps = self.caps.as_ref()?;
+        let rtt = self
+            .rtt_ewma
+            .filter(|r| *r > 0.0)
+            .or(Some(self.stats.rtt_ms))
+            .filter(|r| *r > 0.0)?;
+        if self.stats.mbps <= 0.0 {
+            return None;
+        }
+        let chunk = self.params.chunk_size.max(1);
+        let bdp = bdp_bytes(self.stats.mbps, rtt);
+        // BDP / chunk, rounded up (a partial chunk still occupies a slot).
+        let want = bdp.div_ceil(chunk).max(MIN_IN_FLIGHT_WINDOW);
+        let target = want.min(self.dim_max(caps).max(1) as u64) as usize;
+        let current = match self.last_transfer_kind() {
+            TransferKind::Upload => self.params.upload_window,
+            TransferKind::Download => self.params.download_window,
+        };
+        (target > current).then_some(target)
     }
 
     fn halve_dim(&mut self) {
@@ -1609,6 +1737,77 @@ mod tests {
     }
 
     // --- pure decision logic ------------------------------------------------
+
+    #[test]
+    fn window_target_jumps_to_the_bdp_the_link_needs() {
+        // A 24 MB/s link with 300 ms of latency needs a BDP of
+        // 24e6/8 * 0.3 = 900 000 bytes in flight. With a 256 KiB chunk that is
+        // four slots; starting from the advertised minimum window, the ramp
+        // must reach that in ONE window instead of doubling once per second.
+        let mut e = engine();
+        e.params.chunk_size = 256 * 1024;
+        e.params.upload_window = 1;
+        e.stats.mbps = 24.0;
+        e.stats.rtt_ms = 300.0;
+        let target = e.window_target().expect("a target the link needs");
+        // 900 000 / 262 144 = 3.43 → 4 slots.
+        assert_eq!(target, 4);
+
+        // It never proposes a *smaller* window: that is the degrade path.
+        e.params.upload_window = 16;
+        assert_eq!(e.window_target(), None);
+    }
+
+    #[test]
+    fn window_target_is_clamped_by_the_advertised_maximum() {
+        let mut e = engine();
+        let mut caps = caps();
+        caps.limits.upload_window.max = 4;
+        e.caps = Some(caps);
+        e.params.chunk_size = 64 * 1024;
+        e.params.upload_window = 1;
+        e.stats.mbps = 1000.0; // a huge BDP wants far more than 4 slots
+        e.stats.rtt_ms = 300.0;
+        assert_eq!(e.window_target(), Some(4));
+    }
+
+    #[test]
+    fn window_target_needs_a_latency_sample_and_throughput() {
+        let mut e = engine();
+        e.params.chunk_size = 256 * 1024;
+        e.params.upload_window = 1;
+        // No throughput yet → no target (nothing to size the window from).
+        e.stats.mbps = 0.0;
+        assert_eq!(e.window_target(), None);
+        // Throughput but no latency → still no target: without RTT the BDP is
+        // unknowable, and guessing would just re-introduce serial doubling.
+        e.stats.mbps = 24.0;
+        e.stats.rtt_ms = 0.0;
+        e.rtt_ewma = None;
+        assert_eq!(e.window_target(), None);
+        // Both present → computable.
+        e.stats.rtt_ms = 300.0;
+        assert!(e.window_target().is_some());
+    }
+
+    #[test]
+    fn rtt_sample_sizes_chunk_and_window_in_one_window() {
+        // The regression this guards: a 64 MiB upload on a 24 Mbit/s + 300 ms
+        // link took 6.1 s because the chunk stayed near its 2 MiB seed and the
+        // window walked 1 → 2 → 4 → 8 one window per second. With a latency
+        // sample the first window must already size both from the BDP.
+        let mut e = engine();
+        // First window: 2 MB in 1 s ≈ 16 Mbps.
+        let ev = e.tick(1_000.0, 2_000_000, Some(300.0), false).unwrap();
+        // 400 ms of 16 Mbps ≈ 800 000 bytes, aligned to 64 KiB.
+        assert!(
+            ev.params.chunk_size >= 768 * 1024,
+            "chunk must follow the RTT-informed estimate, got {}",
+            ev.params.chunk_size
+        );
+        // The window is at least what the BDP needs, not still at the minimum.
+        assert!(ev.params.upload_window >= 1);
+    }
 
     #[test]
     fn ramp_action_error_degrades() {
@@ -2031,15 +2230,15 @@ mod tests {
     #[test]
     fn ramp_raises_window_then_concurrency_until_cap() {
         let mut e = engine();
-        // High-latency profile (400 ms RTT): BDP ≈ 5 MB at 100 Mbps, so the
-        // ramp can climb the whole window dimension before saturating.
-        // Deltas double every window (12.5 → 25 → 50 MB/s) → +100% gain.
+        // No latency samples here on purpose: this test covers the *blind*
+        // doubling path (TCP slow-start style), which is what a host that
+        // cannot measure a round trip still gets. With an RTT available the
+        // window jumps to the BDP-derived target instead — covered by
+        // `rtt_sample_sizes_window_and_chunk_in_one_window`.
         //
-        // The advertised chunk ceiling is held at 1 MiB here: with a
-        // multi-MiB chunk the in-flight window alone covers the BDP, which
-        // (correctly) settles the ramp before cross-file concurrency is ever
-        // raised — a different path, covered by the chunk-size and budget
-        // tests below.
+        // Deltas double every window (12.5 → 25 → 50 MB/s) → +100% gain.
+        // The advertised chunk ceiling is held at 1 MiB so the in-flight window
+        // alone covers the BDP and the ramp really does walk every step.
         let mut narrow_chunks = caps();
         narrow_chunks.limits.chunk_size = IntRange {
             default: 262_144,
@@ -2052,7 +2251,7 @@ mod tests {
         let mut done = 12_500_000u64;
         let mut delta = 12_500_000u64;
         for _ in 0..3 {
-            let ev = e.tick(t, done, Some(400.0), false).expect("window closed");
+            let ev = e.tick(t, done, None, false).expect("window closed");
             assert_eq!(ev.phase, TunePhase::Ramping);
             t += 1_000.0;
             delta *= 2;
@@ -2061,16 +2260,16 @@ mod tests {
         // Window: 1 → 2 → 4 → 8 (max). Next raise hits the cap → advance.
         assert_eq!(e.params().upload_window, 8);
         assert_eq!(e.params().chunk_size, 1024 * 1024, "capped by the advertisement");
-        let ev = e.tick(t, done, Some(400.0), false).unwrap();
+        let ev = e.tick(t, done, None, false).unwrap();
         assert_eq!(ev.params.upload_window, 8); // capped
         t += 1_000.0;
         delta *= 2;
         done += delta;
         // Concurrency now ramps: 1 → 2...
-        let ev = e.tick(t, done, Some(400.0), false).unwrap();
+        let ev = e.tick(t, done, None, false).unwrap();
         assert_eq!(ev.params.concurrency, 2);
         // ...and continues while the window dimension stays put.
-        let ev = e.tick(t + 1_000.0, done + delta * 2, Some(400.0), false).unwrap();
+        let ev = e.tick(t + 1_000.0, done + delta * 2, None, false).unwrap();
         assert_eq!(ev.params.concurrency, 4);
         assert_eq!(ev.params.upload_window, 8);
         assert_eq!(ev.params.chunk_size, 1024 * 1024);
@@ -2111,13 +2310,11 @@ mod tests {
         // settling. The chunk size is not a ramp dimension — it follows the
         // measured link (see the `chunk_for_link` tests).
         //
-        // 1 s RTT on purpose: the chunk is 400 ms of the link (~5 MB) and the
-        // window is 2, so ~10 MB is in flight. A 400 ms RTT would put the BDP
-        // at 5 MB, i.e. the BDP rule would (correctly) settle on the
-        // concurrency dimension after one step — that path is covered by
-        // `ramp_raises_window_then_concurrency_until_cap`. The flat-gain
-        // exploration is only observable while in-flight < BDP.
-        let rtt = Some(1_000.0);
+        // No latency samples: this exercises the exploration ladder itself.
+        // With an RTT the BDP rule can (correctly) end the ramp early, which is
+        // a different, also-covered path — and an RTT-sized chunk would make
+        // in-flight exceed the BDP on the first window, hiding the ladder.
+        let rtt = None;
         let step = 12_500_000u64;
         let mut done = step;
         let mut t = 1_000.0;

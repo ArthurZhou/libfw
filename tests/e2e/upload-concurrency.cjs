@@ -39,8 +39,13 @@ const TOKEN = process.env.TOKEN || 'dev-token';
   page.on('request', (r) => {
     if (r.method() !== 'POST' || !r.url().includes('/file/')) return;
     const h = r.headers();
-    if (h['x-libfw-final'] || !r.postData()) return;
-    blocks.set(r, { offset: Number(h['x-libfw-offset']), bytes: r.postData().length, start: Date.now() });
+    // Chunks go out as `Blob`s (see `XhrBody::Bytes` in http.rs), whose body
+    // Playwright cannot read, so `postData()` is empty for every chunk. Use
+    // the offset header to recognise a DATA chunk and skip the session probe
+    // and the commit (both also carry `x-libfw-offset`).
+    const off = h['x-libfw-offset'];
+    if (!off || off === '' || h['x-libfw-final'] || h['x-libfw-session-status']) return;
+    blocks.set(r, { offset: Number(off), bytes: 0, start: Date.now() });
   });
   page.on('requestfinished', (r) => {
     const b = blocks.get(r);
@@ -97,7 +102,12 @@ const TOKEN = process.env.TOKEN || 'dev-token';
   }
   const durs = [...blocks.values()].filter((b) => b.end).map((b) => b.end - b.start).sort((a, b) => a - b);
   const median = durs.length ? durs[Math.floor(durs.length / 2)] : 0;
-  const wire = [...blocks.values()].reduce((n, b) => n + b.bytes, 0);
+  // Per-chunk body sizes are unavailable (Blob-backed XHR), so derive the wire
+  // figure from the offsets: the gaps between consecutive starts plus the tail.
+  const offs = [...blocks.values()].map((b) => b.offset).sort((a, b) => a - b);
+  let wire = 0;
+  for (let i = 1; i < offs.length; i++) wire += offs[i] - offs[i - 1];
+  if (offs.length) wire += MIB * 1024 * 1024 - offs[offs.length - 1];
 
   console.log('=== tuning events ===');
   console.log(tune.join('\n') || '(none)');

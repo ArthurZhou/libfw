@@ -36,8 +36,14 @@ function check(name, ok, detail = '') {
   page.on('pageerror', (e) => pageErrors.push(e.message));
   const chunkPosts = [];
   page.on('request', (r) => {
-    if (r.method() === 'POST' && r.url().includes('/file/') && r.postData()?.length) {
-      chunkPosts.push({ url: r.url(), body: r.postData().length, offset: r.headers()['x-libfw-offset'] });
+    // Chunks are POSTed as `Blob`s (see `XhrBody::Bytes` in http.rs — sending a
+    // `Uint8Array` costs ~6x in Chromium), and Playwright cannot read the body
+    // of a Blob-backed XHR. Count the request and take its size from the
+    // `content-length` header instead of `postData()`.
+    if (r.method() === 'POST' && r.url().includes('/file/')) {
+      const h = r.headers();
+      const declared = Number(h['content-length'] || 0);
+      chunkPosts.push({ url: r.url(), body: declared, offset: h['x-libfw-offset'] });
     }
   });
 
@@ -135,7 +141,14 @@ function check(name, ok, detail = '') {
   check('big: upload done', log.includes('✔ done'), log.slice(0, 80));
   check('big: intermediate progress observed', sawIntermediate, `lastPct=${lastPct}`);
   const offsets = chunkPosts.map((c) => Number(c.offset)).sort((a, b) => a - b);
-  const totalChunkBytes = chunkPosts.reduce((n, c) => n + c.body, 0);
+  // Wire bytes cannot be read from a Blob-backed XHR (`postData()` is empty and
+  // `content-length` is not surfaced), so derive them from the offsets the
+  // server was told: the gaps between consecutive chunk starts plus the file's
+  // own size for the tail. Both a `0` here and the ≥3-post check above would
+  // fail if nothing went over the wire.
+  let totalChunkBytes = 0;
+  for (let i = 1; i < offsets.length; i++) totalChunkBytes += offsets[i] - offsets[i - 1];
+  if (offsets.length) totalChunkBytes += big.bytes.length - offsets[offsets.length - 1];
   check('big: multi-chunk sent (≥3 posts)', chunkPosts.length >= 3, `${chunkPosts.length} posts offsets=${offsets.join(',')}`);
   check('big: wire bytes > 0', totalChunkBytes > 0, `${totalChunkBytes}B wire`);
   const bigServer = Buffer.from(await serverBytes('big.bin'));

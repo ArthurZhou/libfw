@@ -48,6 +48,66 @@ pub struct FsStorage {
     /// read-merge-write of the shared sidecar loses updates (making the
     /// commit coverage check reject a fully-written file).
     locks: Arc<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Shared receive state per session temp.
+    ///
+    /// One entry per temp that has an open (or recently open) session sink.
+    /// Every concurrent chunk request of the same session gets the *same*
+    /// [`SessionState`], which is what lets those requests run in parallel
+    /// while still agreeing on the received-range set: the ranges live here,
+    /// behind a short critical section, instead of being loaded into each
+    /// sink at open time.
+    sessions: SessionRegistry,
+}
+
+/// The session registry type (also handed to [`FsSink`] so a finishing sink
+/// can retire its own entry).
+type SessionRegistry = Arc<std::sync::Mutex<HashMap<PathBuf, Arc<SessionState>>>>;
+
+/// Receive bookkeeping shared by every concurrent request of one session.
+///
+/// Held behind an `Arc` in [`FsStorage::sessions`], so all chunk requests for a
+/// temp see one authoritative range list.
+pub(crate) struct SessionState {    /// The ranges received so far, guarded by a short-lived async mutex.
+    ///
+    /// The lock is taken only to merge a range and persist the sidecar —
+    /// never for the duration of a request's body write, which is what used to
+    /// serialize a whole upload to one block at a time.
+    ranges: tokio::sync::Mutex<SessionRanges>,
+}
+
+/// The mutable half of [`SessionState`]: the range list plus its sidecar path.
+struct SessionRanges {
+    blocks_path: Option<PathBuf>,
+    ranges: Vec<ChunkRange>,
+}
+
+impl std::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionState").finish_non_exhaustive()
+    }
+}
+
+impl SessionState {
+    /// Record `range` as received and persist the sidecar, in one short
+    /// critical section.
+    async fn record(&self, range: ChunkRange) -> Result<(), StorageError> {
+        let mut guard = self.ranges.lock().await;
+        merge_range(&mut guard.ranges, range);
+        if let Some(blocks) = guard.blocks_path.clone() {
+            persist_ranges(&blocks, &guard.ranges).await?;
+        }
+        Ok(())
+    }
+
+    /// A snapshot of the received ranges.
+    async fn snapshot(&self) -> Vec<ChunkRange> {
+        self.ranges.lock().await.ranges.clone()
+    }
+
+    /// The sidecar path this session persists to (`None` once retired).
+    async fn blocks_path(&self) -> Option<PathBuf> {
+        self.ranges.lock().await.blocks_path.clone()
+    }
 }
 
 impl FsStorage {
@@ -57,6 +117,7 @@ impl FsStorage {
             root: root.into(),
             temp_dir: None,
             locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -310,9 +371,9 @@ impl StorageBackend for FsStorage {
                     rel: path.to_string(),
                     mode,
                     written: 0,
-                    blocks_path: None,
-                    ranges: Vec::new(),
+                    shared: None,
                     target_guard: None,
+                    registry: self.sessions.clone(),
                 }))
             }
             WriteMode::Resume { offset } => {
@@ -348,9 +409,9 @@ impl StorageBackend for FsStorage {
                     rel: path.to_string(),
                     mode,
                     written: offset,
-                    blocks_path: None,
-                    ranges: Vec::new(),
+                    shared: None,
                     target_guard,
+                    registry: self.sessions.clone(),
                 }))
             }
         }
@@ -438,29 +499,63 @@ impl StorageBackend for FsStorage {
                 }
             }
         };
-        // Chunks of the same session share the temp + sidecar, so they
-        // serialize on the temp's per-target lock (different sessions stay
-        // fully parallel). The guard is held for the sink's whole lifetime:
-        // concurrent first requests would otherwise both load the (missing)
-        // sidecar, then each chunk write's read-merge-write would clobber the
-        // other's received-range bookkeeping.
-        let lock = self.lock_for(&tmp);
-        let target_guard = Some(lock.clone().lock_owned().await);
-
-        // Load any already-received byte ranges from the sidecar so a pause /
-        // resume only re-sends the missing blocks.
+        // Chunks of the same session share the temp and its sidecar. They no
+        // longer serialize: every request gets the *same* [`SessionState`]
+        // (found or created under the short per-target lock, which is released
+        // before the body is written), and that shared state — not a
+        // request-lifetime guard — keeps the received-range set coherent.
+        //
+        // Holding the per-target guard for the sink's whole lifetime (the
+        // previous behaviour) made every concurrent block of one file queue
+        // behind the others, so the client's in-flight window had no effect at
+        // all: measured on a 24 MB/s + 300 ms link, 8 concurrent 2 MiB blocks
+        // were delivered strictly one after another, 470 ms each.
         let blocks_path = blocks_path_for(&tmp);
-        // A freshly-created temp means nothing has been received yet: a stale
-        // `.blocks` sidecar left behind by an earlier aborted attempt must not
-        // make the probe report phantom ranges (the client would then skip
-        // chunks and commit an empty / zero-filled file).
-        if !exists {
-            let _ = tokio::fs::remove_file(&blocks_path).await;
-        }
-        let ranges = if exists {
-            read_ranges(&blocks_path).await?
-        } else {
-            Vec::new()
+        let session_state = {
+            // The per-target lock serializes *creation* of a session's state
+            // (two concurrent first requests must not each load the sidecar and
+            // then overwrite the other's entry). It is released before the body
+            // of this request is written, which is what keeps chunk writes
+            // parallel.
+            let _guard = self.lock_for(&tmp).lock_owned().await;
+            // Fast path: an existing entry, found without any await.
+            let existing = {
+                let map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                map.get(&tmp).cloned()
+            };
+            match existing {
+                Some(state) => state,
+                None => {
+                    // First request of this session: load whatever an earlier
+                    // (interrupted) attempt left behind.
+                    //
+                    // A freshly-created temp means nothing has been received
+                    // yet: a stale `.blocks` sidecar from an aborted attempt
+                    // must not make the probe report phantom ranges (the client
+                    // would then skip chunks and commit a zero-filled file).
+                    if !exists {
+                        let _ = tokio::fs::remove_file(&blocks_path).await;
+                    }
+                    let ranges = if exists {
+                        read_ranges(&blocks_path).await?
+                    } else {
+                        Vec::new()
+                    };
+                    let state = Arc::new(SessionState {
+                        ranges: tokio::sync::Mutex::new(SessionRanges {
+                            blocks_path: Some(blocks_path),
+                            ranges,
+                        }),
+                    });
+                    // Insert only if nobody won the race while we read the
+                    // sidecar (the per-target lock makes that impossible, but
+                    // re-checking keeps the invariant local and cheap).
+                    let mut map = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                    map.entry(tmp.clone())
+                        .or_insert_with(|| state.clone())
+                        .clone()
+                }
+            }
         };
         Ok(Box::new(FsSink {
             file,
@@ -469,9 +564,9 @@ impl StorageBackend for FsStorage {
             rel: path.to_string(),
             mode,
             written: 0,
-            blocks_path: Some(blocks_path),
-            ranges,
-            target_guard,
+            shared: Some(session_state),
+            target_guard: None,
+            registry: self.sessions.clone(),
         }))
     }
 
@@ -764,19 +859,26 @@ pub struct FsSink {
     /// check at commit time).
     mode: WriteMode,
     written: u64,
-    /// Optional sidecar path tracking received byte ranges for a resumable
-    /// "session" upload (parallel to the session temp file). `None` for
+    /// Shared receive state for a resumable "session" upload. `None` for
     /// ordinary (non-session) sinks.
-    blocks_path: Option<PathBuf>,
-    /// In-memory copy of the received ranges (kept in sync with
-    /// `blocks_path`).
-    ranges: Vec<ChunkRange>,
+    ///
+    /// Shared with every other request of the same session, so concurrent
+    /// chunk writes stay coherent WITHOUT serializing: each sink only takes
+    /// the state's short lock to record its own range.
+    shared: Option<Arc<SessionState>>,
     /// Per-target guard held for the sink's whole lifetime. `Some` only for
-    /// session sinks (serializing sidecar read-merge-write per target) and
-    /// for `WriteMode::Resume` (serializing concurrent appends to the same
-    /// target). `None` for plain Create/Overwrite sinks, which write to a
-    /// unique temp and rename on commit — no shared state to guard.
+    /// `WriteMode::Resume`, which serializes concurrent appends to the same
+    /// target (they share one file whose length they must agree on). `None`
+    /// for session sinks (see `shared`) and for plain Create/Overwrite sinks,
+    /// which write to a unique temp and rename on commit.
+    ///
+    /// Never read: the field exists to keep the guard (and therefore the lock)
+    /// alive for the sink's lifetime, so it is released when the sink drops.
+    #[allow(dead_code)]
     target_guard: Option<OwnedMutexGuard<()>>,
+    /// The storage's session registry, so a finishing sink can retire its
+    /// entry (see [`FsSink::forget_session`]).
+    registry: SessionRegistry,
 }
 
 /// Merge `new` (a `[start, end)` half-open range) into a sorted, disjoint
@@ -829,27 +931,31 @@ impl UploadSink for FsSink {
         // the real size for commit validation comes from file metadata).
         self.written = self.written.max(offset.saturating_add(buf.len() as u64));
         // For a resumable session sink, record the received byte range in the
-        // sidecar so a later probe / resume knows this part is already on
-        // disk and only missing gaps need to be re-sent.
+        // shared session state (which also persists the sidecar) so a later
+        // probe / resume knows this part is already on disk and only missing
+        // gaps need to be re-sent.
         //
-        // No re-read of the sidecar is needed: the per-target guard is held for
-        // this sink's whole lifetime, and `ranges` was loaded under it when the
-        // sink opened, so it is the authoritative set for this temp the entire
-        // time. (The old read-merge-write-per-write paid a JSON parse on every
-        // frame on top of the write itself.)
-        if let Some(blocks) = self.blocks_path.clone() {
-            let _guard = self.target_guard.as_ref().expect("session sink holds a guard");
-            merge_range(&mut self.ranges, ChunkRange {
-                start: offset,
-                end: offset.saturating_add(buf.len() as u64),
-            });
-            persist_ranges(&blocks, &self.ranges).await?;
+        // The lock covers only the merge + sidecar write, not this request's
+        // body: that is what lets concurrent blocks of one file proceed in
+        // parallel while still agreeing on one range list.
+        if let Some(session) = &self.shared {
+            session
+                .record(ChunkRange {
+                    start: offset,
+                    end: offset.saturating_add(buf.len() as u64),
+                })
+                .await?;
         }
         Ok(())
     }
 
     async fn received_ranges(&mut self) -> Result<Vec<ChunkRange>, StorageError> {
-        Ok(self.ranges.clone())
+        match &self.shared {
+            // Read from the *shared* state, not a per-sink snapshot: a probe
+            // must report every range received by any concurrent request.
+            Some(session) => Ok(session.snapshot().await),
+            None => Ok(Vec::new()),
+        }
     }
 
     async fn len(&self) -> Result<u64, StorageError> {
@@ -868,10 +974,10 @@ impl UploadSink for FsSink {
             target,
             rel,
             mode,
-            blocks_path,
+            shared,
+            registry,
             ..
         } = *self;
-        let _ = remove_blocks_sidecar(blocks_path.as_deref()).await;
         file.flush().await.map_err(|e| StorageError::Other(e))?;
         file.sync_all().await.map_err(|e| StorageError::Other(e))?;
         drop(file);
@@ -885,6 +991,7 @@ impl UploadSink for FsSink {
                     .map_err(|e| StorageError::Other(e))?
             {
                 let _ = tokio::fs::remove_file(&tmp).await;
+                FsSink::forget_session(shared, &registry).await;
                 return Err(StorageError::AlreadyExists(rel));
             }
             move_into_place(&tmp, &target)
@@ -897,6 +1004,9 @@ impl UploadSink for FsSink {
                     let _ = d.sync_all().await;
                 }
             }
+            // The temp is gone, so the session's bookkeeping is meaningless:
+            // dropping it also removes the sidecar.
+            FsSink::forget_session(shared, &registry).await;
         }
         let meta = tokio::fs::metadata(&target)
             .await
@@ -908,15 +1018,48 @@ impl UploadSink for FsSink {
         let FsSink {
             file,
             tmp,
-            blocks_path,
+            shared,
+            registry,
             ..
         } = *self;
         drop(file);
         if let Some(tmp) = tmp {
             let _ = tokio::fs::remove_file(&tmp).await;
+            // An abort removes the shared temp, so the session cannot be
+            // resumed: drop its state and sidecar too. Leaving the entry in
+            // `FsStorage::sessions` would both leak memory and let a later
+            // request see ranges for a file that no longer exists.
+            FsSink::forget_session(shared, &registry).await;
         }
-        let _ = remove_blocks_sidecar(blocks_path.as_deref()).await;
         Ok(())
+    }
+}
+
+impl FsSink {
+    /// Drop a session's shared state (and its sidecar) after the temp is gone.
+    ///
+    /// The registry entry is removed only if no other request still holds the
+    /// state: an in-flight sibling sink must keep reporting the ranges it has
+    /// already recorded, and it will call this itself when it finishes. The
+    /// sidecar is deleted unconditionally (the temp it describes is gone), so a
+    /// stale `.blocks` can never make a later probe report phantom ranges.
+    async fn forget_session(state: Option<Arc<SessionState>>, registry: &SessionRegistry) {
+        let Some(state) = state else { return };
+        if let Some(blocks) = state.blocks_path().await {
+            let _ = remove_blocks_sidecar(Some(&blocks)).await;
+        }
+        let mut map = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let path = map
+            .iter()
+            .find(|(_, v)| Arc::ptr_eq(v, &state))
+            .map(|(k, _)| k.clone());
+        if let Some(path) = path {
+            // 1 = the map's own reference; anything more means a live request,
+            // which will retire the entry itself when it finishes.
+            if Arc::strong_count(&state) <= 2 {
+                map.remove(&path);
+            }
+        }
     }
 }
 

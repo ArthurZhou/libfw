@@ -42,8 +42,18 @@ function check(name, ok, detail = '') {
     }
   });
   page.on('request', (r) => {
-    if (r.method() === 'POST' && r.url().includes('/file/') && r.postData()?.length) {
-      chunkOffsets.push(Number(r.headers()['x-libfw-offset']));
+    // Chunks are POSTed as `Blob`s (see `XhrBody::Bytes` in http.rs — sending a
+    // `Uint8Array` costs ~6x in Chromium), and Playwright cannot read the body
+    // of a Blob-backed XHR, so `postData()` is empty. A DATA chunk is instead
+    // identified by its offset header, and distinguished from the session
+    // probe / meta request — which also carries `x-libfw-offset: 0` — by the
+    // absence of the session-status header.
+    if (r.method() === 'POST' && r.url().includes('/file/')) {
+      const h = r.headers();
+      const off = h['x-libfw-offset'];
+      if (!off || off === '') return;
+      if (h['x-libfw-session-status'] || h['x-libfw-final']) return; // probe / commit
+      chunkOffsets.push(Number(off));
     }
   });
 

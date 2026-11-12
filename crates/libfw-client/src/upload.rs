@@ -43,6 +43,28 @@ pub(crate) fn tune_tick(
     event
 }
 
+/// Derive a round-trip latency from one completed chunk request.
+///
+/// XHR exposes no time-to-first-byte, so the only upload-side signal is the
+/// whole request's wall clock. Subtracting the transfer time implied by the
+/// link's current throughput leaves the part that is latency (connect + TTFB
+/// + response). A request that finished faster than its own transfer estimate
+/// is all latency; a nonsensical sample is dropped rather than fed to the
+/// engine.
+fn rtt_from_request(request_ms: f64, len: u64, mbps: f64) -> Option<f64> {
+    if !request_ms.is_finite() || request_ms <= 0.0 {
+        return None;
+    }
+    // bytes/ms for a throughput expressed in megabits per second.
+    let bytes_per_ms = if mbps > 0.0 { mbps * 1e6 / 8.0 / 1_000.0 } else { 0.0 };
+    if bytes_per_ms <= 0.0 {
+        return Some(request_ms);
+    }
+    let transfer_ms = len as f64 / bytes_per_ms;
+    let latency = request_ms - transfer_ms;
+    (latency > 0.0).then_some(latency)
+}
+
 /// Sleep for `ms` milliseconds on the JS event loop (shared with download).
 pub(crate) async fn sleep_ms(ms: u32) {
     if ms == 0 {
@@ -90,7 +112,7 @@ async fn post_chunk(
     session: &str,
     semaphore: &Semaphore,
     on_progress: Option<Rc<dyn Fn(u64, u64)>>,
-) -> Result<(), LibfwError> {
+) -> Result<f64, LibfwError> {
     // Header pairs for the XHR upload path (XHR cannot consume a `Headers`).
     let mut headers: Vec<(String, String)> = vec![
         ("Authorization".to_string(), format!("Bearer {token}")),
@@ -124,13 +146,17 @@ async fn post_chunk(
     // path only aborts when nothing has moved for `timeout_ms`; the optional
     // `on_progress` callback turns the wire ticks into real-time progress.
     let promise = xhr_post(&url, &headers, body, timeout_ms, on_progress)?;
+    // Wall-clock duration of the request. XHR exposes no TTFB, so this is the
+    // only latency signal the upload path has; `upload_one_chunk` subtracts
+    // the estimated transfer time to recover an RTT for the tuning engine.
+    let started = now_ms();
     let status = JsFuture::from(promise)
         .await
         .map_err(|e| LibfwError::Network(format!("upload request failed: {e:?}")))?
         .as_f64()
         .unwrap_or(0.0) as u16;
     if status == 201 {
-        Ok(())
+        Ok(now_ms() - started)
     } else {
         Err(LibfwError::Http { status, url })
     }
@@ -420,7 +446,15 @@ async fn upload_one_chunk(
         )
         .await
         {
-            Ok(()) => break,
+            // Duration of the successful attempt (set exactly once, below).
+            Ok(ms) => {
+                if tune.borrow().enabled() {
+                    let mbps = tune.borrow().stats().mbps;
+                    let rtt = rtt_from_request(ms, len, mbps);
+                    tune_tick(tune, control, control.done_bytes(), rtt, false);
+                }
+                break;
+            }
             Err(e) => {
                 if attempts >= config.max_retries {
                     return Err(e);
@@ -486,7 +520,7 @@ async fn commit_upload(
         )
         .await
         {
-            Ok(()) => return Ok(()),
+            Ok(_) => return Ok(()),
             Err(e) => {
                 if attempts >= config.max_retries {
                     return Err(e);

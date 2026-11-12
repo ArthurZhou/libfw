@@ -238,6 +238,15 @@ where
 /// (8 MiB bodies, loopback, sequential XHR).
 pub enum XhrBody<'a> {
     /// Bytes living in WASM linear memory (compressed payloads, empty bodies).
+    ///
+    /// Sent **through a `Blob`**, not as a `Uint8Array`. `send(u8_array)` makes
+    /// Chromium copy the bytes into blob storage on *every* request, and that
+    /// copy — not compression — is what dominated a compressed upload:
+    /// measured on loopback with identical 4 MiB bodies, `send(Uint8Array)` ran
+    /// at **21.9 MiB/s** against **135.8 MiB/s** for the same bytes wrapped in
+    /// a `Blob` (8 sequential XHRs, same server, same request count). Wrapping
+    /// is one allocation that owns the bytes, so the per-request copy
+    /// disappears; `Content-Length` still comes from the blob size.
     Bytes(&'a [u8]),
     /// A JS `Blob` (typically a `File.slice`) sent as-is, without ever being
     /// materialized in JS or WASM.
@@ -247,7 +256,18 @@ pub enum XhrBody<'a> {
 /// Send `body` once the request is set up, accepting either representation.
 fn xhr_send(xhr: &XmlHttpRequest, body: &XhrBody<'_>) -> Result<(), JsValue> {
     match body {
-        XhrBody::Bytes(bytes) => xhr.send_with_opt_u8_array(Some(bytes)),
+        XhrBody::Bytes(bytes) => {
+            // Wrap the slice in a `Blob` instead of handing XHR a
+            // `Uint8Array`. The copy into JS memory below is unavoidable (the
+            // bytes come from WASM and XHR is asynchronous, so a `view` could
+            // outlive its allocation), but it happens **once**; sending the
+            // array directly makes Chromium copy it again into blob storage per
+            // request, which is the cost being removed.
+            let arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+            arr.copy_from(bytes);
+            let blob = web_sys::Blob::new_with_u8_array_sequence(&js_sys::Array::of1(&arr))?;
+            xhr.send_with_opt_blob(Some(&blob))
+        }
         // `send_with_opt_blob` keeps the browser in charge of reading the file
         // (and of setting Content-Length from the Blob's size).
         XhrBody::Blob(blob) => xhr.send_with_opt_blob(Some(blob)),
