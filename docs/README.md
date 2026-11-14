@@ -9,6 +9,7 @@ start, then dive into the guide that matches your task.
 | Server integration | [server-integration.md](./server-integration.md) | [server-integration.zh-CN.md](./server-integration.zh-CN.md) | axum and other frameworks, `ServerState` reference, storage backends, shadow paths, cleanup, deployment |
 | Protocol | [protocol.md](./protocol.md) | [protocol.zh-CN.md](./protocol.zh-CN.md) | routes, headers, download/upload algorithms, capabilities JSON, status codes, curl |
 | Native Rust client | [native-client.md](./native-client.md) | [native-client.zh-CN.md](./native-client.zh-CN.md) | `NativeClient` API, configuration, events, resume, cancellation, tuning |
+| Releasing | [releasing.md](./releasing.md) | [releasing.zh-CN.md](./releasing.zh-CN.md) | crates.io + npm release workflow, one-time npm OIDC trusted-publisher setup, troubleshooting |
 
 Also see:
 
