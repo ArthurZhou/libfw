@@ -94,6 +94,25 @@ jobs:
         run: |
           rm -rf sdk/pkg
           wasm-pack build crates/libfw-client --target web --out-dir ../../sdk/pkg --release
+          # wasm-pack drops sdk/pkg/.gitignore containing '*'. Since npm 12 a
+          # nested .gitignore overrides the package.json `files` array, so the
+          # whole pkg/ directory is silently dropped from the tarball — this is
+          # exactly how libfw-client@0.4.7 shipped without its wasm payload.
+          rm -f sdk/pkg/.gitignore
+
+      # 0.4.7 shipped to npm without pkg/ while every step above stayed green.
+      # Verify the actual tarball contents, not just the files on disk.
+      - name: Verify WASM payload survives npm pack
+        working-directory: sdk
+        run: |
+          echo "sdk/pkg contents:"
+          ls -la pkg
+          PACK_OUT="$(npm pack --dry-run 2>&1)"
+          echo "$PACK_OUT"
+          echo "$PACK_OUT" | grep -q "pkg/libfw_client_bg.wasm" || {
+            echo "::error::npm pack output lacks pkg/libfw_client_bg.wasm; publishing would ship a broken package."
+            exit 1
+          }
 
       - name: Sync package version with release tag
         env:
